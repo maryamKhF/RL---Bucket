@@ -1,32 +1,150 @@
+# ======================================================
+# Global
+# ======================================================
+
 seed: 42
-n_transactions: 10000
+
 train_ratio: 0.70
 test_ratio: 0.30
-failure_rates: [0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
+
+n_transactions: 10000
+
+failure_rates:
+  - 0.01
+  - 0.02
+  - 0.03
+  - 0.04
+  - 0.05
+  - 0.06
+
+# ======================================================
+# Graph / Network
+# ======================================================
 
 graph:
   synthetic_nodes: 250
+
   synthetic_extra_edges: 500
+
   max_hops: 12
+
   top_k_paths: 5
+
   neighborhood_k: 15
+
   neighborhood_m: 5
+
   ego_radius: 2
 
-rl:
-  total_timesteps: 20000
-  learning_rate: 0.0003
-  n_steps: 256
-  batch_size: 64
-  n_epochs: 10
-  gamma: 0.99
-  gae_lambda: 0.95
-  clip_range: 0.2
-  ent_coef: 0.01
-  hidden_layers: [128, 128]
+# ======================================================
+# Channel Parameters
+# ======================================================
+
+channel:
+  default_capacity: 1000000
+
+  default_base_fee: 1
+
+  default_fee_rate: 0.000001
+
+  default_cltv_delta: 40
+
+# ======================================================
+# Simulation
+# ======================================================
 
 simulation:
   min_amount: 1000
+
   max_amount: 1000000
+
+  retry_limit: 3
+
+  failure_model: probabilistic
+
   base_reward_scale: 1000.0
+
   carbon_epsilon: 0.001
+
+# ======================================================
+# Reinforcement Learning
+# ======================================================
+
+rl:
+  algorithm: PPO
+
+  device: auto
+
+  seed: 42
+
+  total_timesteps: 20000
+
+  learning_rate: 0.0003
+
+  n_steps: 256
+
+  batch_size: 64
+
+  n_epochs: 10
+
+  gamma: 0.99
+
+  gae_lambda: 0.95
+
+  clip_range: 0.20
+
+  ent_coef: 0.01
+
+  hidden_layers:
+    - 128
+    - 128
+
+# ======================================================
+# Bucket Routing
+# ======================================================
+
+bucket:
+  max_candidates: 5
+
+  selection_strategy: score
+
+  enable_backtracking: true
+
+  max_backtracking_depth: 3
+
+# ======================================================
+# Evaluation
+# ======================================================
+
+evaluation:
+  repetitions: 10
+
+  confidence_interval: 0.95
+
+# ======================================================
+# Visualization
+# ======================================================
+
+plots:
+  dpi: 150
+
+  figure_width: 11
+
+  figure_height: 5
+
+  style: default
+
+  output_directory: results
+
+# ======================================================
+# Output Paths
+# ======================================================
+
+paths:
+  data: data/
+
+  models: models/
+
+  logs: logs/
+
+  results: results/

@@ -91,6 +91,8 @@ class OnionRouter:
             metadata=None
     ):
 
+    
+
         """
         Creates onion packet.
 
@@ -304,3 +306,4 @@ class OnionRouter:
 
 
         return True
+

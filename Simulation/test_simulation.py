@@ -18,6 +18,24 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ==========================================================
+# PATHFINDING IMPORTS
+# ==========================================================
+
+from Pathfinding.top_k_paths import (
+    top_k_paths,
+)
+
+
+# ==========================================================
+# BUCKET IMPORTS
+# ==========================================================
+
+from Bucket.candidate_manager import (
+    CandidateManager,
+)
+
+
+# ==========================================================
 # SIMULATION IMPORTS
 # ==========================================================
 
@@ -46,6 +64,10 @@ from Simulation.router import (
     Router,
 )
 
+from Simulation.backtrack import (
+    PartialBacktracker,
+)
+
 
 # ==========================================================
 # CONFIGURATION
@@ -67,12 +89,30 @@ SEED = 42
 MIN_AMOUNT = 1_000
 MAX_AMOUNT = 1_000_000
 
+# ----------------------------------------------------------
+# Routing configuration
+# ----------------------------------------------------------
+
+TOP_K = 5
+MAX_HOPS = 12
+
+# Current routing heuristic action.
+#
+# This value is the interface through which PPO can later
+# provide its learned action.
+#
+# It is NOT claimed to be a PPO-generated value here.
+ETA = 0.0
+
+LAMBDA_H = 1.0
+
 
 # ==========================================================
 # COMMON PRINT HELPERS
 # ==========================================================
 
 def section(number, title):
+
     print()
     print("=" * 70)
     print(f"{number}. {title}")
@@ -80,6 +120,7 @@ def section(number, title):
 
 
 def fail(message):
+
     raise RuntimeError(message)
 
 
@@ -93,6 +134,7 @@ def find_snapshot():
     """
 
     for path in SNAPSHOT_CANDIDATES:
+
         if path.exists():
             return path
 
@@ -100,7 +142,8 @@ def find_snapshot():
         "\nSnapshot file was not found.\n"
         f"Expected filename: {SNAPSHOT_NAME}\n\n"
         "Searched locations:\n"
-        + "\n".join(
+        +
+        "\n".join(
             f"  {path}"
             for path in SNAPSHOT_CANDIDATES
         )
@@ -109,7 +152,10 @@ def find_snapshot():
 
 def load_gml_snapshot(path):
 
-    section(1, "LOAD REAL GML SNAPSHOT")
+    section(
+        1,
+        "LOAD REAL GML SNAPSHOT",
+    )
 
     print("Loading:")
     print(f"  {path}")
@@ -121,9 +167,21 @@ def load_gml_snapshot(path):
 
     print()
     print("Graph loaded successfully.")
-    print(f"  Graph type : {type(G).__name__}")
-    print(f"  Nodes      : {G.number_of_nodes()}")
-    print(f"  Edges      : {G.number_of_edges()}")
+
+    print(
+        f"  Graph type : "
+        f"{type(G).__name__}"
+    )
+
+    print(
+        f"  Nodes      : "
+        f"{G.number_of_nodes()}"
+    )
+
+    print(
+        f"  Edges      : "
+        f"{G.number_of_edges()}"
+    )
 
     return G
 
@@ -141,11 +199,16 @@ def normalize_graph(G):
     does not explicitly represent directional channels.
     """
 
-    section(2, "NORMALIZE GRAPH")
+    section(
+        2,
+        "NORMALIZE GRAPH",
+    )
 
     if G.is_directed():
 
-        print("Graph is already directed.")
+        print(
+            "Graph is already directed."
+        )
 
         if not G.is_multigraph():
 
@@ -157,12 +220,16 @@ def normalize_graph(G):
             DG = nx.MultiDiGraph()
 
             for node, attrs in G.nodes(data=True):
+
                 DG.add_node(
                     node,
                     **attrs,
                 )
 
-            for u, v, attrs in G.edges(data=True):
+            for u, v, attrs in G.edges(
+                data=True
+            ):
+
                 DG.add_edge(
                     u,
                     v,
@@ -173,35 +240,57 @@ def normalize_graph(G):
 
         return G
 
-    print("GML graph is undirected.")
-    print("Creating directed representation...")
+    print(
+        "GML graph is undirected."
+    )
+
+    print(
+        "Creating directed representation..."
+    )
 
     DG = nx.MultiDiGraph()
 
-    for node, attrs in G.nodes(data=True):
+    for node, attrs in G.nodes(
+        data=True
+    ):
 
         DG.add_node(
             node,
             **attrs,
         )
 
-    for u, v, attrs in G.edges(data=True):
+    for u, v, attrs in G.edges(
+        data=True
+    ):
+
+        attrs_uv = dict(attrs)
+        attrs_vu = dict(attrs)
 
         DG.add_edge(
             u,
             v,
-            **dict(attrs),
+            **attrs_uv,
         )
 
         DG.add_edge(
             v,
             u,
-            **dict(attrs),
+            **attrs_vu,
         )
 
-    print("Directed graph created.")
-    print(f"  Nodes : {DG.number_of_nodes()}")
-    print(f"  Edges : {DG.number_of_edges()}")
+    print(
+        "Directed graph created."
+    )
+
+    print(
+        f"  Nodes : "
+        f"{DG.number_of_nodes()}"
+    )
+
+    print(
+        f"  Edges : "
+        f"{DG.number_of_edges()}"
+    )
 
     return DG
 
@@ -212,7 +301,10 @@ def normalize_graph(G):
 
 def prepare_edge_attributes(G):
 
-    section(3, "PREPARE CHANNEL ATTRIBUTES")
+    section(
+        3,
+        "PREPARE CHANNEL ATTRIBUTES",
+    )
 
     edge_count = 0
 
@@ -230,6 +322,7 @@ def prepare_edge_attributes(G):
             if "capacity_sat" in data:
 
                 try:
+
                     data["capacity"] = float(
                         data["capacity_sat"]
                     )
@@ -439,32 +532,6 @@ def choose_valid_transaction(
 
 
 # ==========================================================
-# BASELINE PATH
-# ==========================================================
-
-def find_simple_path(
-    G,
-    source,
-    destination,
-):
-
-    try:
-
-        return nx.shortest_path(
-            G,
-            source=source,
-            target=destination,
-        )
-
-    except (
-        nx.NetworkXNoPath,
-        nx.NodeNotFound,
-    ):
-
-        return None
-
-
-# ==========================================================
 # PATH -> EXACT EDGES
 # ==========================================================
 
@@ -472,6 +539,21 @@ def path_to_edges(
     G,
     path,
 ):
+    """
+    Convert a node path into exact directed edges.
+
+    For MultiDiGraph:
+
+        (u, v, key)
+
+    The first currently available channel is selected.
+    """
+
+    if not path:
+        return None
+
+    if len(path) < 2:
+        return None
 
     edges = []
 
@@ -480,7 +562,11 @@ def path_to_edges(
         path[1:],
     ):
 
-        if not G.has_edge(u, v):
+        if not G.has_edge(
+            u,
+            v,
+        ):
+
             return None
 
         edge_data = G.get_edge_data(
@@ -493,9 +579,10 @@ def path_to_edges(
 
         if G.is_multigraph():
 
-            # Prefer an available edge.
             selected_key = None
 
+            # Prefer an available channel that can
+            # currently be used.
             for key, data in edge_data.items():
 
                 if data.get(
@@ -506,11 +593,10 @@ def path_to_edges(
                     selected_key = key
                     break
 
+            # If every channel is unavailable,
+            # do not silently invent another channel.
             if selected_key is None:
-
-                selected_key = next(
-                    iter(edge_data.keys())
-                )
+                return None
 
             edges.append(
                 (
@@ -521,6 +607,13 @@ def path_to_edges(
             )
 
         else:
+
+            if not edge_data.get(
+                "available",
+                True,
+            ):
+
+                return None
 
             edges.append(
                 (
@@ -554,18 +647,23 @@ def test_transaction_generator(G):
     )
 
     print()
-    print("Transaction dataset generated.")
-
     print(
-        f"  Total : {dataset.total_count}"
+        "Transaction dataset generated."
     )
 
     print(
-        f"  Train : {dataset.train_count}"
+        f"  Total : "
+        f"{dataset.total_count}"
     )
 
     print(
-        f"  Test  : {dataset.test_count}"
+        f"  Train : "
+        f"{dataset.train_count}"
+    )
+
+    print(
+        f"  Test  : "
+        f"{dataset.test_count}"
     )
 
     if dataset.total_count == 0:
@@ -576,7 +674,9 @@ def test_transaction_generator(G):
         )
 
     print()
-    print("First 5 transactions:")
+    print(
+        "First 5 transactions:"
+    )
 
     for tx in dataset.transactions[:5]:
 
@@ -654,7 +754,9 @@ def test_failure_model(G):
     )
 
     print()
-    print("FailureModel result:")
+    print(
+        "FailureModel result:"
+    )
 
     for key_name, value in result.items():
 
@@ -750,46 +852,39 @@ def test_onion_router():
     )
 
     print(
-        f"  Version     : {packet['version']}"
+        f"  Version     : "
+        f"{packet['version']}"
     )
 
     print(
-        f"  Source      : {packet['source']}"
+        f"  Source      : "
+        f"{packet['source']}"
     )
 
     print(
-        f"  Destination : {packet['destination']}"
+        f"  Destination : "
+        f"{packet['destination']}"
     )
 
     print(
-        f"  Path length : {packet['path_length']}"
+        f"  Path length : "
+        f"{packet['path_length']}"
     )
 
     print(
-        f"  Bucket ID   : {packet['bucket_id']}"
+        f"  Bucket ID   : "
+        f"{packet['bucket_id']}"
     )
 
     print(
-        f"  TX ID       : {packet['tx_id']}"
+        f"  TX ID       : "
+        f"{packet['tx_id']}"
     )
 
     print(
-        f"  Attempt ID  : {packet['attempt_id']}"
+        f"  Attempt ID  : "
+        f"{packet['attempt_id']}"
     )
-
-    # ------------------------------------------------------
-    # Forward the actual onion packet.
-    #
-    # This test verifies:
-    #
-    # A -> B
-    # B -> C
-    # C -> destination
-    #
-    # The OnionRouter itself is responsible for reading
-    # the nested packet. We do not manually rebuild the
-    # packet between hops.
-    # ------------------------------------------------------
 
     current_packet = packet
     current_node = path[0]
@@ -954,13 +1049,6 @@ def test_router():
         "Router result:"
     )
 
-    # ------------------------------------------------------
-    # Print compact result.
-    #
-    # Do NOT print the encrypted onion payload because
-    # it makes the integration-test output unreadable.
-    # ------------------------------------------------------
-
     for key in [
         "success",
         "reason",
@@ -977,10 +1065,6 @@ def test_router():
             f"  {key}: "
             f"{result.get(key)}"
         )
-
-    # ------------------------------------------------------
-    # Required Router contract
-    # ------------------------------------------------------
 
     if not result.get(
         "success",
@@ -1069,12 +1153,6 @@ def test_router():
             "Router packet path_length is incorrect."
         )
 
-    # ------------------------------------------------------
-    # Route ID should be stable for the same path.
-    #
-    # This is important for Bucket / Onion integration.
-    # ------------------------------------------------------
-
     result2 = router.forward(
         path=path,
         bucket_id=0,
@@ -1101,27 +1179,266 @@ def test_router():
     )
 
     print(
-        f"  Route ID       : {route_id}"
+        f"  Route ID       : "
+        f"{route_id}"
     )
 
     print(
-        f"  Source         : {packet['source']}"
+        f"  Source         : "
+        f"{packet['source']}"
     )
 
     print(
-        f"  Destination    : {packet['destination']}"
+        f"  Destination    : "
+        f"{packet['destination']}"
     )
 
     print(
-        f"  Path length    : {packet['path_length']}"
+        f"  Path length    : "
+        f"{packet['path_length']}"
     )
 
     return router
 
 
 # ==========================================================
+# ROUTING CANDIDATES
+# ==========================================================
+
+def generate_routing_candidates(
+    G,
+    tx,
+):
+    """
+    Generate Top-K candidate routes using the actual
+    Pathfinding module.
+
+    Routing flow:
+
+        Network
+           |
+           v
+        eta
+           |
+           v
+    Adaptive Heuristic
+           |
+           v
+    Modified Cost
+           |
+           v
+       Top-K Paths
+    """
+
+    candidates = top_k_paths(
+        G=G,
+        source=tx.source,
+        target=tx.destination,
+        amount=tx.amount,
+        eta=ETA,
+        k=TOP_K,
+        max_hops=MAX_HOPS,
+        lambda_h=LAMBDA_H,
+    )
+
+    return candidates
+
+
+# ==========================================================
+# BUCKET CREATION
+# ==========================================================
+
+def build_bucket(
+    G,
+    tx,
+):
+    """
+    Generate, filter and rank candidates, then create Bucket.
+
+    CandidateManager is deliberately used before Bucket.
+    """
+
+    candidates = generate_routing_candidates(
+        G,
+        tx,
+    )
+
+    if not candidates:
+        return None, [], None
+
+    manager = CandidateManager(
+        candidates=candidates,
+        max_candidates=TOP_K,
+    )
+
+    filtered = manager.filter_candidates(
+        G,
+        tx.amount,
+    )
+
+    if not filtered:
+        return None, candidates, manager
+
+    manager.rank_candidates()
+
+    bucket = manager.create_bucket(
+        tx_id=tx.tx_id,
+        k=TOP_K,
+    )
+
+    return bucket, manager.candidates, manager
+
+
+# ==========================================================
+# PRINT CANDIDATES
+# ==========================================================
+
+def print_candidates(
+    candidates,
+):
+
+    if not candidates:
+
+        print(
+            "  No candidate route generated."
+        )
+
+        return
+
+    print()
+    print(
+        f"  Candidate routes: "
+        f"{len(candidates)}"
+    )
+
+    for index, candidate in enumerate(
+        candidates,
+        start=1,
+    ):
+
+        path = candidate.get(
+            "path",
+            [],
+        )
+
+        print(
+            f"    [{index}] "
+            f"rank={index} "
+            f"| hops={candidate.get('hop_count')} "
+            f"| cost={candidate.get('cost', 0.0):.4f} "
+            f"| fee={candidate.get('total_fee', 0.0):.4f} "
+            f"| reliability={candidate.get('reliability', 0.0):.6f}"
+        )
+
+        print(
+            f"         "
+            f"{path}"
+        )
+
+
+# ==========================================================
+# UPDATE CANDIDATE SUCCESS STATUS
+# ==========================================================
+
+def mark_candidate_success(
+    bucket,
+    candidate,
+    success,
+):
+    """
+    Update the candidate's runtime success status.
+
+    This does not alter the routing cost.
+    """
+
+    if isinstance(
+        candidate,
+        dict,
+    ):
+
+        candidate["success"] = bool(
+            success
+        )
+
+    if success:
+
+        bucket.mark_success(
+            candidate
+        )
+
+
+# ==========================================================
+# FULL REROUTE
+# ==========================================================
+
+def full_reroute(
+    G,
+    tx,
+    failed_routes=None,
+):
+    """
+    Generate a fresh candidate set from the current network state.
+
+    This is the fallback when Bucket cannot provide a valid
+    partial-backtracking suffix.
+    """
+
+    candidates = top_k_paths(
+        G=G,
+        source=tx.source,
+        target=tx.destination,
+        amount=tx.amount,
+        eta=ETA,
+        k=TOP_K,
+        max_hops=MAX_HOPS,
+        lambda_h=LAMBDA_H,
+    )
+
+    if failed_routes:
+
+        filtered = []
+
+        for candidate in candidates:
+
+            path = tuple(
+                candidate.get(
+                    "path",
+                    [],
+                )
+            )
+
+            if path in failed_routes:
+                continue
+
+            filtered.append(
+                candidate
+            )
+
+        candidates = filtered
+
+    manager = CandidateManager(
+        candidates=candidates,
+        max_candidates=TOP_K,
+    )
+
+    candidates = manager.filter_candidates(
+        G,
+        tx.amount,
+    )
+
+    manager.rank_candidates()
+
+    bucket = manager.create_bucket(
+        tx_id=tx.tx_id,
+        k=TOP_K,
+    )
+
+    return bucket, candidates
+
+
+# ==========================================================
 # TEST 6
-# PAYMENT SIMULATION
+# INTEGRATED PAYMENT SIMULATION
 # ==========================================================
 
 def test_payment_simulation(
@@ -1133,7 +1450,7 @@ def test_payment_simulation(
 
     section(
         9,
-        "TEST PAYMENT SIMULATION",
+        "TEST INTEGRATED ROUTING + BUCKET + PAYMENT SIMULATION",
     )
 
     simulator = PaymentSimulator(
@@ -1142,13 +1459,71 @@ def test_payment_simulation(
         network_dynamics=network_dynamics,
     )
 
+    backtracker = PartialBacktracker(
+        network=G,
+    )
+
     print(
         "PaymentSimulator initialized."
+    )
+
+    print(
+        "PartialBacktracker initialized."
+    )
+
+    print()
+    print(
+        "Routing pipeline:"
+    )
+
+    print(
+        "  Transaction"
+    )
+
+    print(
+        "      -> Top-K Pathfinding"
+    )
+
+    print(
+        "      -> CandidateManager"
+    )
+
+    print(
+        "      -> Bucket"
+    )
+
+    print(
+        "      -> PaymentSimulator"
+    )
+
+    print(
+        "      -> Failure"
+    )
+
+    print(
+        "      -> Partial Backtracking"
+    )
+
+    print(
+        "      -> Bucket Alternative"
+    )
+
+    print(
+        "      -> Retry"
+    )
+
+    print(
+        "      -> Full Reroute if required"
     )
 
     successful = 0
     failed = 0
     no_path = 0
+
+    partial_backtrack_count = 0
+    partial_backtrack_success = 0
+    full_reroute_count = 0
+
     tested = 0
 
     for tx in dataset.test:
@@ -1169,37 +1544,37 @@ def test_payment_simulation(
             continue
 
         # --------------------------------------------------
-        # Baseline route
-        #
-        # This is NOT the RL route.
-        #
-        # It only verifies that PaymentSimulator can
-        # execute a selected route.
+        # Generate initial candidates
         # --------------------------------------------------
 
-        path = find_simple_path(
+        bucket, candidates, manager = build_bucket(
             G,
-            tx.source,
-            tx.destination,
+            tx,
         )
 
-        if path is None:
+        if bucket is None:
+
+            print()
+            print("-" * 70)
+
+            print(
+                f"TX {tx.tx_id}: "
+                f"{tx.source} -> "
+                f"{tx.destination}"
+            )
+
+            print(
+                f"Amount: "
+                f"{tx.amount:.2f}"
+            )
+
+            print(
+                "No usable candidate routes."
+            )
 
             no_path += 1
-            continue
+            tested += 1
 
-        # --------------------------------------------------
-        # Exact directed edges
-        # --------------------------------------------------
-
-        edges = path_to_edges(
-            G,
-            path,
-        )
-
-        if edges is None:
-
-            no_path += 1
             continue
 
         print()
@@ -1207,87 +1582,538 @@ def test_payment_simulation(
 
         print(
             f"TX {tx.tx_id}: "
-            f"{tx.source} -> {tx.destination}"
+            f"{tx.source} -> "
+            f"{tx.destination}"
         )
 
         print(
-            f"Amount: {tx.amount:.2f}"
+            f"Amount: "
+            f"{tx.amount:.2f}"
         )
 
         print(
-            f"Path length: {len(path)}"
+            f"Initial candidates: "
+            f"{len(candidates)}"
+        )
+
+        print_candidates(
+            candidates
         )
 
         # --------------------------------------------------
-        # Execute
+        # Create a Backtracker using the real Bucket.
         # --------------------------------------------------
 
-        result = simulator.simulate_payment(
-            path=path,
-            edges=edges,
-            amount=tx.amount,
-            tx_id=tx.tx_id,
+        backtracker.bucket = bucket
+
+        # --------------------------------------------------
+        # Attempt loop
+        # --------------------------------------------------
+
+        attempt_id = 0
+
+        failed_routes = set()
+
+        payment_success = False
+
+        current_bucket = bucket
+
+        max_attempts = (
+            max(
+                1,
+                TOP_K
+            )
+            + 2
         )
 
-        if hasattr(
-            result,
-            "to_dict",
+        while (
+            attempt_id < max_attempts
         ):
 
-            result_dict = result.to_dict()
+            # --------------------------------------------------
+            # Current candidate
+            # --------------------------------------------------
 
-        else:
+            candidate = current_bucket.current()
 
-            result_dict = result
+            if candidate is None:
+                break
 
-        success = result_dict.get(
-            "success",
-            False,
-        )
+            if isinstance(
+                candidate,
+                dict,
+            ):
 
-        reason = result_dict.get(
-            "reason"
-        )
+                path = candidate.get(
+                    "path"
+                )
 
-        print(
-            f"Success : {success}"
-        )
+                candidate_edges = candidate.get(
+                    "edges"
+                )
 
-        print(
-            f"Reason  : {reason}"
-        )
+            else:
 
-        failed_edge = result_dict.get(
-            "failed_edge"
-        )
+                # Legacy compatibility
+                try:
 
-        failed_node = result_dict.get(
-            "failed_node"
-        )
+                    path = candidate[0]
+                    candidate_edges = candidate[1]
 
-        failure_index = result_dict.get(
-            "failure_index"
-        )
+                except (
+                    TypeError,
+                    IndexError,
+                ):
 
-        if failed_edge is not None:
+                    path = None
+                    candidate_edges = None
 
+            if not path:
+
+                current_bucket.next_candidate()
+                continue
+
+            # --------------------------------------------------
+            # Prefer exact edges stored by Top-K Pathfinding.
+            #
+            # If they are unavailable, resolve the current
+            # route against the live graph.
+            # --------------------------------------------------
+
+            edges = candidate_edges
+
+            if not edges:
+
+                edges = path_to_edges(
+                    G,
+                    path,
+                )
+
+            if edges is None:
+
+                failed_routes.add(
+                    tuple(path)
+                )
+
+                current_bucket.backtrack(
+                    failed_candidate=candidate
+                )
+
+                continue
+
+            attempt_id += 1
+
+            print()
             print(
-                f"Failed edge: {failed_edge}"
+                f"  Attempt {attempt_id}"
             )
 
-        if failed_node is not None:
-
             print(
-                f"Failed node: {failed_node}"
+                f"    Candidate rank : "
+                f"{current_bucket.current_index + 1}"
             )
 
-        if failure_index is not None:
-
             print(
-                f"Failure index: {failure_index}"
+                f"    Path           : "
+                f"{path}"
             )
 
-        if success:
+            print(
+                f"    Edges          : "
+                f"{edges}"
+            )
+
+            # --------------------------------------------------
+            # Execute payment
+            # --------------------------------------------------
+
+            result = simulator.simulate_payment(
+                path=path,
+                edges=edges,
+                amount=tx.amount,
+                tx_id=tx.tx_id,
+            )
+
+            if hasattr(
+                result,
+                "to_dict",
+            ):
+
+                result_dict = result.to_dict()
+
+            else:
+
+                result_dict = result
+
+            success = result_dict.get(
+                "success",
+                False,
+            )
+
+            reason = result_dict.get(
+                "reason"
+            )
+
+            failed_edge = result_dict.get(
+                "failed_edge"
+            )
+
+            failed_node = result_dict.get(
+                "failed_node"
+            )
+
+            failure_index = result_dict.get(
+                "failure_index"
+            )
+
+            print(
+                f"    Success        : "
+                f"{success}"
+            )
+
+            print(
+                f"    Reason         : "
+                f"{reason}"
+            )
+
+            if failed_edge is not None:
+
+                print(
+                    f"    Failed edge    : "
+                    f"{failed_edge}"
+                )
+
+            if failed_node is not None:
+
+                print(
+                    f"    Failed node    : "
+                    f"{failed_node}"
+                )
+
+            if failure_index is not None:
+
+                print(
+                    f"    Failure index  : "
+                    f"{failure_index}"
+                )
+
+            # ==================================================
+            # SUCCESS
+            # ==================================================
+
+            if success:
+
+                mark_candidate_success(
+                    current_bucket,
+                    candidate,
+                    True,
+                )
+
+                payment_success = True
+
+                print()
+                print(
+                    "    PAYMENT SUCCESS"
+                )
+
+                print(
+                    f"    Selected rank  : "
+                    f"{current_bucket.selected_candidate_rank}"
+                )
+
+                print(
+                    f"    Attempts       : "
+                    f"{attempt_id}"
+                )
+
+                break
+
+            # ==================================================
+            # FAILURE
+            # ==================================================
+
+            if isinstance(
+                candidate,
+                dict,
+            ):
+
+                candidate["success"] = False
+
+            failed_routes.add(
+                tuple(path)
+            )
+
+            # --------------------------------------------------
+            # If failure information is unavailable,
+            # move directly to next Bucket candidate.
+            # --------------------------------------------------
+
+            if (
+                failed_edge is None
+                and
+                failure_index is None
+            ):
+
+                print(
+                    "    No failure-edge information."
+                )
+
+                current_bucket.backtrack(
+                    failed_candidate=candidate
+                )
+
+                continue
+
+            # ==================================================
+            # PARTIAL BACKTRACKING
+            # ==================================================
+
+            partial_backtrack_count += 1
+
+            print()
+            print(
+                "    PARTIAL BACKTRACKING"
+            )
+
+            backtrack_result = backtracker.backtrack(
+                route=path,
+                failed_edge=failed_edge,
+                failure_index=failure_index,
+                amount=tx.amount,
+                bucket_id=current_bucket.bucket_id,
+                attempt_id=attempt_id,
+            )
+
+            status = backtrack_result.get(
+                "status"
+            )
+
+            print(
+                f"    Status         : "
+                f"{status}"
+            )
+
+            print(
+                f"    Branch point   : "
+                f"{backtrack_result.get('branch_point')}"
+            )
+
+            print(
+                f"    Failed edge    : "
+                f"{backtrack_result.get('failed_edge')}"
+            )
+
+            print(
+                f"    Prefix         : "
+                f"{backtrack_result.get('preserved_prefix')}"
+            )
+
+            print(
+                f"    Suffix         : "
+                f"{backtrack_result.get('alternative_suffix')}"
+            )
+
+            print(
+                f"    New route      : "
+                f"{backtrack_result.get('new_route')}"
+            )
+
+            # --------------------------------------------------
+            # Alternative suffix found
+            # --------------------------------------------------
+
+            if (
+                status == "alternative_found"
+                and
+                backtrack_result.get(
+                    "success",
+                    False,
+                )
+            ):
+
+                partial_backtrack_success += 1
+
+                new_path = backtrack_result.get(
+                    "new_route"
+                )
+
+                if not new_path:
+
+                    print(
+                        "    Backtracker returned "
+                        "an empty route."
+                    )
+
+                    current_bucket.backtrack(
+                        failed_candidate=candidate
+                    )
+
+                    continue
+
+                new_edges = path_to_edges(
+                    G,
+                    new_path,
+                )
+
+                if new_edges is None:
+
+                    print(
+                        "    Alternative route "
+                        "is no longer executable."
+                    )
+
+                    current_bucket.backtrack(
+                        failed_candidate=candidate
+                    )
+
+                    continue
+
+                # --------------------------------------------------
+                # Execute the new partial-backtracked route.
+                # --------------------------------------------------
+
+                retry_attempt = attempt_id + 1
+
+                print()
+                print(
+                    "    RETRY ALTERNATIVE ROUTE"
+                )
+
+                print(
+                    f"    Retry attempt : "
+                    f"{retry_attempt}"
+                )
+
+                print(
+                    f"    Route         : "
+                    f"{new_path}"
+                )
+
+                retry_result = simulator.simulate_payment(
+                    path=new_path,
+                    edges=new_edges,
+                    amount=tx.amount,
+                    tx_id=tx.tx_id,
+                )
+
+                if hasattr(
+                    retry_result,
+                    "to_dict",
+                ):
+
+                    retry_dict = (
+                        retry_result.to_dict()
+                    )
+
+                else:
+
+                    retry_dict = retry_result
+
+                retry_success = retry_dict.get(
+                    "success",
+                    False,
+                )
+
+                retry_reason = retry_dict.get(
+                    "reason"
+                )
+
+                print(
+                    f"    Retry success : "
+                    f"{retry_success}"
+                )
+
+                print(
+                    f"    Retry reason  : "
+                    f"{retry_reason}"
+                )
+
+                if retry_success:
+
+                    payment_success = True
+
+                    print()
+                    print(
+                        "    PARTIAL BACKTRACKING "
+                        "PAYMENT SUCCESS"
+                    )
+
+                    break
+
+                # --------------------------------------------------
+                # Alternative suffix also failed.
+                #
+                # Move Bucket forward and allow another candidate.
+                # --------------------------------------------------
+
+                print(
+                    "    Alternative route failed."
+                )
+
+                current_bucket.backtrack(
+                    failed_candidate=candidate
+                )
+
+                continue
+
+            # ==================================================
+            # NO VALID BUCKET ALTERNATIVE
+            # ==================================================
+
+            print()
+            print(
+                "    No valid Bucket alternative."
+            )
+
+            print(
+                "    Full reroute required."
+            )
+
+            full_reroute_count += 1
+
+            reroute_bucket, reroute_candidates = (
+                full_reroute(
+                    G,
+                    tx,
+                    failed_routes=failed_routes,
+                )
+            )
+
+            if reroute_bucket is None:
+
+                print(
+                    "    Full reroute produced "
+                    "no usable route."
+                )
+
+                break
+
+            print()
+            print(
+                "    FULL REROUTE CANDIDATES"
+            )
+
+            print_candidates(
+                reroute_candidates
+            )
+
+            # --------------------------------------------------
+            # Replace current Bucket.
+            # --------------------------------------------------
+
+            current_bucket = reroute_bucket
+
+            backtracker.bucket = current_bucket
+
+            # --------------------------------------------------
+            # Continue from the new Bucket.
+            # --------------------------------------------------
+
+        # ==================================================
+        # Transaction result
+        # ==================================================
+
+        if payment_success:
 
             successful += 1
 
@@ -1295,33 +2121,59 @@ def test_payment_simulation(
 
             failed += 1
 
+            print()
+            print(
+                "  PAYMENT FAILED"
+            )
+
         tested += 1
 
-    # ------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------
+    # ==========================================================
+    # SUMMARY
+    # ==========================================================
 
     print()
-    print("-" * 70)
+    print("=" * 70)
 
     print(
-        "PAYMENT SIMULATION SUMMARY"
+        "INTEGRATED PAYMENT SIMULATION SUMMARY"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"  Tested                    : "
+        f"{tested}"
     )
 
     print(
-        f"  Tested       : {tested}"
+        f"  Successful                : "
+        f"{successful}"
     )
 
     print(
-        f"  Successful   : {successful}"
+        f"  Failed                    : "
+        f"{failed}"
     )
 
     print(
-        f"  Failed       : {failed}"
+        f"  No valid initial path     : "
+        f"{no_path}"
     )
 
     print(
-        f"  No valid path: {no_path}"
+        f"  Partial backtrack events  : "
+        f"{partial_backtrack_count}"
+    )
+
+    print(
+        f"  Successful partial routes : "
+        f"{partial_backtrack_success}"
+    )
+
+    print(
+        f"  Full reroute events       : "
+        f"{full_reroute_count}"
     )
 
     if tested > 0:
@@ -1331,8 +2183,21 @@ def test_payment_simulation(
         ) * 100.0
 
         print(
-            f"  Success rate : "
+            f"  Payment success rate      : "
             f"{success_rate:.2f}%"
+        )
+
+    if partial_backtrack_count > 0:
+
+        backtrack_rate = (
+            partial_backtrack_success
+            /
+            partial_backtrack_count
+        ) * 100.0
+
+        print(
+            f"  Partial backtrack success : "
+            f"{backtrack_rate:.2f}%"
         )
 
     return simulator
@@ -1347,13 +2212,37 @@ def main():
     print()
 
     print("=" * 70)
+
     print(
-        " REAL LIGHTNING SIMULATION INTEGRATION TEST"
+        " REAL LIGHTNING SIMULATION "
+        "INTEGRATION TEST"
     )
+
     print("=" * 70)
 
     print(
-        f" Snapshot: {SNAPSHOT_NAME}"
+        f" Snapshot: "
+        f"{SNAPSHOT_NAME}"
+    )
+
+    print(
+        f" Top-K: "
+        f"{TOP_K}"
+    )
+
+    print(
+        f" Max hops: "
+        f"{MAX_HOPS}"
+    )
+
+    print(
+        f" ETA: "
+        f"{ETA}"
+    )
+
+    print(
+        f" Lambda_h: "
+        f"{LAMBDA_H}"
     )
 
     print("=" * 70)
@@ -1374,7 +2263,9 @@ def main():
         # 2. Normalize
         # --------------------------------------------------
 
-        G = normalize_graph(G)
+        G = normalize_graph(
+            G
+        )
 
         # --------------------------------------------------
         # 3. Channel attributes
@@ -1421,7 +2312,7 @@ def main():
         test_router()
 
         # --------------------------------------------------
-        # 9. Payment simulation
+        # 9. Integrated routing/payment simulation
         # --------------------------------------------------
 
         test_payment_simulation(
@@ -1437,9 +2328,11 @@ def main():
 
         print()
         print("=" * 70)
+
         print(
             " SIMULATION TEST COMPLETED"
         )
+
         print("=" * 70)
 
         print()
@@ -1480,7 +2373,27 @@ def main():
         )
 
         print(
+            "  [OK] Top-K Pathfinding"
+        )
+
+        print(
+            "  [OK] CandidateManager"
+        )
+
+        print(
+            "  [OK] Bucket"
+        )
+
+        print(
             "  [OK] Payment Simulator"
+        )
+
+        print(
+            "  [OK] Partial Backtracking"
+        )
+
+        print(
+            "  [OK] Full Reroute Fallback"
         )
 
         print()
@@ -1490,18 +2403,22 @@ def main():
 
         print()
         print("=" * 70)
+
         print(
             " SIMULATION TEST FAILED"
         )
+
         print("=" * 70)
 
         print()
         print(
-            f"Error type: {type(exc).__name__}"
+            f"Error type: "
+            f"{type(exc).__name__}"
         )
 
         print(
-            f"Error: {exc}"
+            f"Error: "
+            f"{exc}"
         )
 
         print()
@@ -1521,4 +2438,5 @@ def main():
 # ==========================================================
 
 if __name__ == "__main__":
+
     main()

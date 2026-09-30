@@ -96,6 +96,10 @@ def geo_features(
         "inter_continent":
             inter_continent,
 
+        "regcolor":
+            carbon,
+
+        # Backward-compatible alias for older callers.
         "carbon_intensity":
             carbon
     }

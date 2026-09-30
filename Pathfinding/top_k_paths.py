@@ -8,7 +8,7 @@ from .heuristics import (
     adaptive_heuristic,
     modified_cost,
     channel_fee,
-    reliability_penalty
+    reliability_penalty,
 )
 
 
@@ -20,59 +20,35 @@ def _estimated_liquidity(data):
     """
     Return learned/observed directional liquidity.
 
-    IMPORTANT
-    ---------
-    capacity is NOT interpreted as:
-
-        balance
-        liquidity
-        available payment amount
-
     Priority:
-
         1. estimated_liquidity
         2. liquidity_uv
         3. balance_uv
 
-    If none exists:
-        liquidity is unknown -> None
+    Important:
+        capacity is NOT interpreted as liquidity.
+        Unknown liquidity is returned as None.
     """
 
     for field in (
         "estimated_liquidity",
         "liquidity_uv",
-        "balance_uv"
+        "balance_uv",
     ):
-
         if field not in data:
             continue
 
-        value = data.get(
-            field
-        )
+        value = data.get(field)
 
         if value is None:
             continue
 
         try:
-
-            value = float(
-                value
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
+            value = float(value)
+        except (TypeError, ValueError):
             continue
 
-        if (
-            math.isfinite(value)
-            and
-            value >= 0.0
-        ):
-
+        if math.isfinite(value) and value >= 0.0:
             return value
 
     return None
@@ -82,40 +58,29 @@ def _estimated_liquidity(data):
 # Channel Feasibility
 # ==========================================================
 
-def _channel_can_carry(
-    data,
-    amount
-):
+def _channel_can_carry(data, amount):
     """
     Check known directional liquidity.
 
-    Cases:
+    liquidity < amount
+        -> channel is rejected
 
-        liquidity < amount
-            -> reject
+    liquidity >= amount
+        -> channel is accepted
 
-        liquidity >= amount
-            -> accept
+    liquidity unknown
+        -> channel is accepted
 
-        liquidity unknown
-            -> accept
-
-    Unknown liquidity is NOT treated as zero.
-
-    Actual payment feasibility is evaluated later by the
-    payment simulator / failure model.
+    Actual payment feasibility is evaluated later by
+    FailureModel / PaymentSimulator.
     """
 
-    liquidity = _estimated_liquidity(
-        data
-    )
+    liquidity = _estimated_liquidity(data)
 
     if liquidity is None:
         return True
 
-    return (
-        liquidity >= float(amount)
-    )
+    return liquidity >= float(amount)
 
 
 # ==========================================================
@@ -124,73 +89,42 @@ def _channel_can_carry(
 
 def _channel_reliability(data):
     """
-    Return estimated forwarding reliability.
+    Estimate forwarding reliability.
 
-    If experience statistics exist:
-
-        reliability =
-            success /
-            (success + failure)
-
-    Otherwise use failure_probability if available.
-
-    If there is no information, use the neutral initial
-    failure probability used by Dijkstra.
+    Priority:
+        1. success/failure history
+        2. failure_probability
+        3. default failure probability = 0.01
     """
 
     success = _safe_float(
-        data.get(
-            "success_count",
-            0
-        )
+        data.get("success_count", 0)
     )
 
     failure = _safe_float(
-        data.get(
-            "failure_count",
-            0
-        )
+        data.get("failure_count", 0)
     )
 
-    total = (
-        success
-        +
-        failure
-    )
+    total = success + failure
 
     if total > 0:
-
-        probability = (
-            failure
-            /
-            total
-        )
+        failure_probability = failure / total
 
     elif "failure_probability" in data:
-
-        probability = _safe_float(
-            data.get(
-                "failure_probability"
-            )
+        failure_probability = _safe_float(
+            data.get("failure_probability"),
+            default=0.01,
         )
 
     else:
+        failure_probability = 0.01
 
-        probability = 0.01
-
-    probability = min(
-        max(
-            probability,
-            0.0
-        ),
-        1.0
+    failure_probability = min(
+        max(failure_probability, 0.0),
+        1.0,
     )
 
-    return (
-        1.0
-        -
-        probability
-    )
+    return 1.0 - failure_probability
 
 
 # ==========================================================
@@ -205,10 +139,10 @@ def _adaptive_edge_cost(
     amount,
     eta,
     heuristic_fn=None,
-    lambda_h=1.0
+    lambda_h=1.0,
 ):
     """
-    Calculate the modified routing cost.
+    Calculate adaptive routing cost.
 
     Native cost:
 
@@ -220,17 +154,9 @@ def _adaptive_edge_cost(
 
     Modified cost:
 
-        C'(e)
-        =
-        C_LND(e)
-        +
-        lambda_h * h(u,v)
+        C'(e) = C_LND(e) + lambda_h * h(u,v)
 
-    The adaptive heuristic is generated from the node
-    carbon-intensity values.
-
-    rgb_color is treated as the numeric carbon-intensity
-    value by heuristics.py.
+    eta is generated by PPO and passed to adaptive_heuristic().
     """
 
     # ------------------------------------------------------
@@ -238,44 +164,36 @@ def _adaptive_edge_cost(
     # ------------------------------------------------------
 
     if heuristic_fn is not None:
-
         try:
-
             native_cost = heuristic_fn(
                 G,
                 u,
                 v,
                 data,
-                amount
+                amount,
             )
-
         except (
             TypeError,
             ValueError,
-            KeyError
+            KeyError,
         ):
-
             native_cost = lnd_cost(
                 G,
                 u,
                 v,
                 data,
-                amount
+                amount,
             )
-
     else:
-
         native_cost = lnd_cost(
             G,
             u,
             v,
             data,
-            amount
+            amount,
         )
 
-    if not _valid_cost(
-        native_cost
-    ):
+    if not _valid_cost(native_cost):
         return None
 
     # ------------------------------------------------------
@@ -283,25 +201,20 @@ def _adaptive_edge_cost(
     # ------------------------------------------------------
 
     try:
-
         h = adaptive_heuristic(
             G,
             u,
             v,
-            eta
+            eta,
         )
-
     except (
         TypeError,
         ValueError,
-        KeyError
+        KeyError,
     ):
-
         h = 0.0
 
-    if not _valid_number(
-        h
-    ):
+    if not _valid_number(h):
         return None
 
     # ------------------------------------------------------
@@ -309,32 +222,23 @@ def _adaptive_edge_cost(
     # ------------------------------------------------------
 
     try:
-
         cost = modified_cost(
-            native_cost=float(
-                native_cost
-            ),
+            native_cost=float(native_cost),
             geo_penalty=float(h),
             eta=float(eta),
-            lambda_h=float(lambda_h)
+            lambda_h=float(lambda_h),
         )
-
     except (
         TypeError,
         ValueError,
-        KeyError
-    ):
-
-        return None
-
-    if not _valid_cost(
-        cost
+        KeyError,
     ):
         return None
 
-    return float(
-        cost
-    )
+    if not _valid_cost(cost):
+        return None
+
+    return float(cost)
 
 
 # ==========================================================
@@ -347,193 +251,235 @@ def _build_routing_graph(
     eta,
     max_hops,
     heuristic_fn=None,
-    lambda_h=1.0
+    lambda_h=1.0,
 ):
     """
-    Build a simplified directed graph for K-best
-    node-level candidate paths.
+    Build a simplified directed graph for node-level
+    candidate route generation.
 
-    The original graph may be a MultiDiGraph containing
-    parallel channels between two nodes.
+    The original graph may be a MultiDiGraph with parallel
+    Lightning channels.
 
-    For each directed node pair (u,v), the currently
-    cheapest usable channel is retained.
+    For each directed node pair (u,v), the cheapest usable
+    channel is retained.
 
-    The original channel key and data are preserved.
-
-    IMPORTANT
-    ---------
-    This produces K node-level candidate paths.
-
-    It does NOT claim that K distinct channels are returned
-    when multiple parallel channels exist between the same
-    two nodes.
+    The original channel key and channel data are preserved.
     """
 
     H = nx.DiGraph()
 
     # ------------------------------------------------------
-    # Copy node attributes
+    # Copy nodes
     # ------------------------------------------------------
 
-    for node, node_data in G.nodes(
-        data=True
-    ):
-
+    for node, node_data in G.nodes(data=True):
         H.add_node(
             node,
-            **dict(node_data)
+            **dict(node_data),
         )
 
     # ------------------------------------------------------
     # Process channels
     # ------------------------------------------------------
 
-    for u, v, key, raw_data in G.edges(
-        keys=True,
-        data=True
-    ):
+    if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
 
-        # --------------------------------------------------
-        # Work with a copy.
-        # --------------------------------------------------
-
-        data = dict(
-            raw_data
+        edge_iterator = G.edges(
+            keys=True,
+            data=True,
         )
 
-        # --------------------------------------------------
-        # Channel availability
-        # --------------------------------------------------
+        for u, v, key, raw_data in edge_iterator:
 
-        if not bool(
-            data.get(
-                "available",
-                True
-            )
-        ):
-            continue
+            data = dict(raw_data)
 
-        # --------------------------------------------------
-        # Known liquidity constraint
-        # --------------------------------------------------
+            # ----------------------------------------------
+            # Channel availability
+            # ----------------------------------------------
 
-        if not _channel_can_carry(
-            data,
-            amount
-        ):
-            continue
+            if not bool(
+                data.get(
+                    "available",
+                    True,
+                )
+            ):
+                continue
 
-        # --------------------------------------------------
-        # Maximum hop count is a path-level constraint.
-        # --------------------------------------------------
+            # ----------------------------------------------
+            # Endpoint availability
+            # ----------------------------------------------
 
-        if max_hops <= 0:
-            continue
+            if not _node_available(G, u):
+                continue
 
-        # --------------------------------------------------
-        # Adaptive edge cost
-        # --------------------------------------------------
+            if not _node_available(G, v):
+                continue
 
-        weight = _adaptive_edge_cost(
-            G=G,
-            u=u,
-            v=v,
-            data=data,
-            amount=amount,
-            eta=eta,
-            heuristic_fn=heuristic_fn,
-            lambda_h=lambda_h
-        )
+            # ----------------------------------------------
+            # Known directional liquidity
+            # ----------------------------------------------
 
-        if weight is None:
-            continue
-
-        # --------------------------------------------------
-        # Channel metrics
-        # --------------------------------------------------
-
-        fee = channel_fee(
-            data,
-            amount
-        )
-
-        if not _valid_metric(
-            fee
-        ):
-            continue
-
-        delay = _channel_delay(
-            data
-        )
-
-        if not _valid_metric(
-            delay
-        ):
-            continue
-
-        reliability = _channel_reliability(
-            data
-        )
-
-        if not _valid_metric(
-            reliability
-        ):
-            continue
-
-        # --------------------------------------------------
-        # Candidate edge attributes
-        # --------------------------------------------------
-
-        edge_attributes = {
-
-            "weight":
-                float(weight),
-
-            "channel_key":
-                key,
-
-            "channel_data":
+            if not _channel_can_carry(
                 data,
+                amount,
+            ):
+                continue
 
-            "fee":
-                float(fee),
+            # ----------------------------------------------
+            # Adaptive cost
+            # ----------------------------------------------
 
-            "delay":
-                float(delay),
-
-            "reliability":
-                float(reliability),
-
-            "eta":
-                float(eta)
-        }
-
-        # --------------------------------------------------
-        # Keep cheapest channel for node-level path search
-        # --------------------------------------------------
-
-        if not H.has_edge(
-            u,
-            v
-        ):
-
-            H.add_edge(
-                u,
-                v,
-                **edge_attributes
+            weight = _adaptive_edge_cost(
+                G=G,
+                u=u,
+                v=v,
+                data=data,
+                amount=amount,
+                eta=eta,
+                heuristic_fn=heuristic_fn,
+                lambda_h=lambda_h,
             )
 
-        else:
+            if weight is None:
+                continue
 
-            existing_weight = (
-                H[u][v]["weight"]
+            # ----------------------------------------------
+            # Channel metrics
+            # ----------------------------------------------
+
+            fee = channel_fee(
+                data,
+                amount,
             )
 
-            if weight < existing_weight:
+            if not _valid_metric(fee):
+                continue
 
-                H[u][v].update(
-                    edge_attributes
+            delay = _channel_delay(data)
+
+            if not _valid_metric(delay):
+                continue
+
+            reliability = _channel_reliability(data)
+
+            if not _valid_metric(reliability):
+                continue
+
+            edge_attributes = {
+                "weight": float(weight),
+                "channel_key": key,
+                "channel_data": data,
+                "fee": float(fee),
+                "delay": float(delay),
+                "reliability": float(reliability),
+                "eta": float(eta),
+            }
+
+            # ----------------------------------------------
+            # Keep cheapest usable channel for node pair
+            # ----------------------------------------------
+
+            if not H.has_edge(u, v):
+
+                H.add_edge(
+                    u,
+                    v,
+                    **edge_attributes,
+                )
+
+            else:
+
+                existing_weight = H[u][v]["weight"]
+
+                if weight < existing_weight:
+                    H[u][v].update(
+                        edge_attributes
+                    )
+
+    else:
+
+        # --------------------------------------------------
+        # Support ordinary Graph / DiGraph as well.
+        # --------------------------------------------------
+
+        for u, v, raw_data in G.edges(data=True):
+
+            data = dict(raw_data)
+
+            if not bool(
+                data.get(
+                    "available",
+                    True,
+                )
+            ):
+                continue
+
+            if not _node_available(G, u):
+                continue
+
+            if not _node_available(G, v):
+                continue
+
+            if not _channel_can_carry(
+                data,
+                amount,
+            ):
+                continue
+
+            weight = _adaptive_edge_cost(
+                G=G,
+                u=u,
+                v=v,
+                data=data,
+                amount=amount,
+                eta=eta,
+                heuristic_fn=heuristic_fn,
+                lambda_h=lambda_h,
+            )
+
+            if weight is None:
+                continue
+
+            fee = channel_fee(
+                data,
+                amount,
+            )
+
+            if not _valid_metric(fee):
+                continue
+
+            delay = _channel_delay(data)
+
+            if not _valid_metric(delay):
+                continue
+
+            reliability = _channel_reliability(data)
+
+            if not _valid_metric(reliability):
+                continue
+
+            edge_attributes = {
+                "weight": float(weight),
+                "channel_key": data.get(
+                    "channel_key",
+                    None,
+                ),
+                "channel_data": data,
+                "fee": float(fee),
+                "delay": float(delay),
+                "reliability": float(reliability),
+                "eta": float(eta),
+            }
+
+            if (
+                not H.has_edge(u, v)
+                or
+                weight < H[u][v]["weight"]
+            ):
+                H.add_edge(
+                    u,
+                    v,
+                    **edge_attributes,
                 )
 
     return H
@@ -543,19 +489,9 @@ def _build_routing_graph(
 # Complete Path Metrics
 # ==========================================================
 
-def _path_metrics(
-    H,
-    path
-):
+def _path_metrics(H, path):
     """
     Calculate aggregate candidate-path metrics.
-
-    Returns:
-
-        cost
-        fee
-        delay
-        reliability
     """
 
     total_cost = 0.0
@@ -565,64 +501,45 @@ def _path_metrics(
 
     for u, v in zip(
         path[:-1],
-        path[1:]
+        path[1:],
     ):
-
         edge = H[u][v]
 
         total_cost += _safe_float(
-            edge.get(
-                "weight",
-                0.0
-            )
+            edge.get("weight", 0.0)
         )
 
         total_fee += _safe_float(
-            edge.get(
-                "fee",
-                0.0
-            )
+            edge.get("fee", 0.0)
         )
 
         total_delay += _safe_float(
-            edge.get(
-                "delay",
-                0.0
-            )
+            edge.get("delay", 0.0)
         )
 
-        reliability *= min(
+        edge_reliability = min(
             max(
                 _safe_float(
                     edge.get(
                         "reliability",
-                        1.0
+                        1.0,
                     )
                 ),
-                0.0
+                0.0,
             ),
-            1.0
+            1.0,
         )
 
+        reliability *= edge_reliability
+
     return {
-        "cost":
-            float(total_cost),
-
-        "total_fee":
-            float(total_fee),
-
-        "total_delay":
-            float(total_delay),
-
-        "reliability":
-            float(reliability),
-
-        "failure_probability":
-            float(
-                1.0
-                -
-                reliability
-            )
+        "cost": float(total_cost),
+        "total_fee": float(total_fee),
+        "total_delay": float(total_delay),
+        "reliability": float(reliability),
+        "failure_probability": float(
+            1.0 - reliability
+        ),
     }
 
 
@@ -630,16 +547,11 @@ def _path_metrics(
 # Convert Node Path to Channel Path
 # ==========================================================
 
-def _path_edges(
-    H,
-    path
-):
+def _path_edges(H, path):
     """
-    Convert node path into:
+    Convert a node path into exact channel edges:
 
         (u, v, channel_key)
-
-    tuples.
 
     The selected original channel key is preserved.
     """
@@ -648,9 +560,8 @@ def _path_edges(
 
     for u, v in zip(
         path[:-1],
-        path[1:]
+        path[1:],
     ):
-
         key = H[u][v].get(
             "channel_key"
         )
@@ -659,11 +570,52 @@ def _path_edges(
             (
                 u,
                 v,
-                key
+                key,
             )
         )
 
     return edges
+
+
+# ==========================================================
+# Validate Candidate Route
+# ==========================================================
+
+def _valid_candidate_path(
+    path,
+    source,
+    target,
+    max_hops,
+):
+    """
+    Validate a node-level candidate path.
+    """
+
+    if not isinstance(
+        path,
+        (list, tuple),
+    ):
+        return False
+
+    if len(path) < 2:
+        return False
+
+    if path[0] != source:
+        return False
+
+    if path[-1] != target:
+        return False
+
+    hops = len(path) - 1
+
+    if hops > max_hops:
+        return False
+
+    # Simple path: no repeated nodes.
+    if len(set(path)) != len(path):
+        return False
+
+    return True
 
 
 # ==========================================================
@@ -679,12 +631,12 @@ def top_k_paths(
     eta=0.0,
     k=10,
     max_hops=12,
-    lambda_h=1.0
+    lambda_h=1.0,
 ):
     """
     Generate K candidate routing paths.
 
-    Routing pipeline:
+    Pipeline:
 
         Network State
               |
@@ -709,55 +661,37 @@ def top_k_paths(
               v
        Payment Simulation
 
-    Parameters
-    ----------
-    G : networkx.MultiDiGraph
-        Lightning-style routing graph.
-
-    source : node
-        Payment source.
-
-    target : node
-        Payment destination.
-
-    amount : float
-        Payment amount.
-
-    heuristic_fn : callable, optional
-        Native routing-cost function.
-
-        If omitted, lnd_cost is used.
-
-    eta : float
-        PPO-generated adaptive routing parameter.
-
-        -1 <= eta <= 1
-
-    k : int
-        Number of candidate paths.
-
-    max_hops : int
-        Maximum number of hops.
-
-    lambda_h : float
-        Weight of adaptive heuristic.
-
     Returns
     -------
     list of dict
-        Candidate routes sorted by modified cost.
 
-    IMPORTANT
+        Each candidate contains:
+
+            path
+            edges
+            cost
+            hop_count
+            total_fee
+            total_delay
+            reliability
+            failure_probability
+            eta
+            lambda_h
+            candidate
+            success
+
+    Important
     ---------
-    candidate=True does NOT mean payment success.
+    candidate=True means the route was generated by the
+    routing layer.
 
-    It means only that the path has been selected by the
-    routing layer and can subsequently be tested by Bucket
-    and the payment simulator.
+    It does NOT mean that the payment will succeed.
+    Actual payment success is determined later by
+    FailureModel / PaymentSimulator.
     """
 
     # ======================================================
-    # Validation
+    # Basic validation
     # ======================================================
 
     if source == target:
@@ -770,96 +704,68 @@ def top_k_paths(
         return []
 
     try:
-
-        amount = float(
-            amount
-        )
-
+        amount = float(amount)
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         return []
 
     if (
         not math.isfinite(amount)
         or
-        amount <= 0
+        amount <= 0.0
     ):
         return []
 
     try:
-
-        k = int(
-            k
-        )
-
+        k = int(k)
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         return []
 
     if k <= 0:
         return []
 
     try:
-
-        max_hops = int(
-            max_hops
-        )
-
+        max_hops = int(max_hops)
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         return []
 
     if max_hops <= 0:
         return []
 
     try:
-
-        eta = float(
-            eta
-        )
-
+        eta = float(eta)
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         raise ValueError(
             "eta must be numeric"
         )
 
-    if not math.isfinite(
-        eta
-    ):
+    if not math.isfinite(eta):
         raise ValueError(
             "eta must be finite"
         )
 
     if not -1.0 <= eta <= 1.0:
-
         raise ValueError(
             f"eta must be in [-1, 1], got {eta}"
         )
 
     try:
-
-        lambda_h = float(
-            lambda_h
-        )
-
+        lambda_h = float(lambda_h)
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         raise ValueError(
             "lambda_h must be numeric"
         )
@@ -869,7 +775,6 @@ def top_k_paths(
         or
         lambda_h < 0.0
     ):
-
         raise ValueError(
             "lambda_h must be finite and >= 0"
         )
@@ -884,7 +789,7 @@ def top_k_paths(
         eta=eta,
         max_hops=max_hops,
         heuristic_fn=heuristic_fn,
-        lambda_h=lambda_h
+        lambda_h=lambda_h,
     )
 
     if (
@@ -895,125 +800,118 @@ def top_k_paths(
         return []
 
     # ======================================================
-    # K shortest simple node paths
+    # Candidate generation
     # ======================================================
 
     try:
-
-        path_generator = (
-            nx.shortest_simple_paths(
-                H,
-                source,
-                target,
-                weight="weight"
-            )
+        path_generator = nx.shortest_simple_paths(
+            H,
+            source,
+            target,
+            weight="weight",
         )
-
     except (
         nx.NetworkXNoPath,
-        nx.NodeNotFound
+        nx.NodeNotFound,
     ):
-
         return []
 
     results = []
-
-    # ======================================================
-    # Collect candidates
-    # ======================================================
+    seen_paths = set()
 
     try:
 
         for path in path_generator:
 
-            hops = len(path) - 1
+            # ------------------------------------------------
+            # Validate path
+            # ------------------------------------------------
 
-            # ----------------------------------------------
-            # Invalid / excessive path
-            # ----------------------------------------------
-
-            if hops <= 0:
+            if not _valid_candidate_path(
+                path,
+                source,
+                target,
+                max_hops,
+            ):
                 continue
 
-            if hops > max_hops:
+            path_tuple = tuple(path)
+
+            if path_tuple in seen_paths:
                 continue
 
-            # ----------------------------------------------
-            # Path edges
-            # ----------------------------------------------
+            seen_paths.add(path_tuple)
+
+            # ------------------------------------------------
+            # Convert path to exact channel edges
+            # ------------------------------------------------
 
             edges = _path_edges(
                 H,
-                path
+                path,
             )
 
-            # ----------------------------------------------
+            if len(edges) != len(path) - 1:
+                continue
+
+            # ------------------------------------------------
             # Aggregate metrics
-            # ----------------------------------------------
+            # ------------------------------------------------
 
             metrics = _path_metrics(
                 H,
-                path
+                path,
             )
 
-            # ----------------------------------------------
+            # ------------------------------------------------
             # Candidate
-            # ----------------------------------------------
+            # ------------------------------------------------
 
             candidate = {
+                "path": list(path),
 
-                "path":
-                    list(path),
+                "edges": edges,
 
-                "edges":
-                    edges,
+                "cost": metrics["cost"],
 
-                "cost":
-                    metrics["cost"],
+                "hop_count": int(
+                    len(path) - 1
+                ),
 
-                "hop_count":
-                    int(hops),
+                "total_fee": metrics[
+                    "total_fee"
+                ],
 
-                "total_fee":
-                    metrics["total_fee"],
+                "total_delay": metrics[
+                    "total_delay"
+                ],
 
-                "total_delay":
-                    metrics["total_delay"],
+                "reliability": metrics[
+                    "reliability"
+                ],
 
-                "reliability":
-                    metrics["reliability"],
+                "failure_probability": metrics[
+                    "failure_probability"
+                ],
 
-                "failure_probability":
-                    metrics[
-                        "failure_probability"
-                    ],
+                "eta": float(eta),
 
-                "eta":
-                    float(eta),
+                "lambda_h": float(
+                    lambda_h
+                ),
 
-                "lambda_h":
-                    float(lambda_h),
+                "candidate": True,
 
-                "candidate":
-                    True,
-
-                "success":
-                    None
+                # PaymentSimulator will update this.
+                "success": None,
             }
 
-            results.append(
-                candidate
-            )
-
-            # ----------------------------------------------
-            # Stop after K candidates
-            # ----------------------------------------------
+            results.append(candidate)
 
             if len(results) >= k:
                 break
 
     except nx.NetworkXNoPath:
-
         pass
 
     # ======================================================
@@ -1021,8 +919,12 @@ def top_k_paths(
     # ======================================================
 
     results.sort(
-        key=lambda item:
-            item["cost"]
+        key=lambda item: (
+            item["cost"],
+            item["hop_count"],
+            item["total_fee"],
+            -item["reliability"],
+        )
     )
 
     return results
@@ -1032,9 +934,7 @@ def top_k_paths(
 # Channel Delay
 # ==========================================================
 
-def _channel_delay(
-    data
-):
+def _channel_delay(data):
     """
     Extract channel delay.
 
@@ -1049,10 +949,48 @@ def _channel_delay(
             "delay",
             data.get(
                 "cltv_expiry_delta",
-                0.0
-            )
+                0.0,
+            ),
         )
     )
+
+
+# ==========================================================
+# Node Availability
+# ==========================================================
+
+def _node_available(G, node):
+    """
+    Check node availability.
+
+    Both attributes are supported:
+
+        available
+        is_online
+    """
+
+    if node not in G:
+        return False
+
+    data = G.nodes[node]
+
+    if not bool(
+        data.get(
+            "available",
+            True,
+        )
+    ):
+        return False
+
+    if not bool(
+        data.get(
+            "is_online",
+            True,
+        )
+    ):
+        return False
+
+    return True
 
 
 # ==========================================================
@@ -1061,63 +999,42 @@ def _channel_delay(
 
 def _safe_float(
     value,
-    default=0.0
+    default=0.0,
 ):
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
-        if not math.isfinite(
-            value
-        ):
-
-            return float(
-                default
-            )
+        if not math.isfinite(value):
+            return float(default)
 
         return value
 
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
-        return float(
-            default
-        )
+        return float(default)
 
 
-def _valid_number(
-    value
-):
+def _valid_number(value):
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
-        return math.isfinite(
-            value
-        )
+        return math.isfinite(value)
 
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         return False
 
 
-def _valid_metric(
-    value
-):
+def _valid_metric(value):
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
         return (
             math.isfinite(value)
@@ -1127,15 +1044,12 @@ def _valid_metric(
 
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         return False
 
 
-def _valid_cost(
-    value
-):
+def _valid_cost(value):
     """
     Dijkstra / shortest-simple-path algorithms require
     non-negative edge weights.
@@ -1143,9 +1057,7 @@ def _valid_cost(
 
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
         return (
             math.isfinite(value)
@@ -1155,7 +1067,6 @@ def _valid_cost(
 
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
-
         return False

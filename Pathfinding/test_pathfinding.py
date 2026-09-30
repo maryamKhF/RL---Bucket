@@ -4,12 +4,12 @@ import math
 import random
 import sys
 from pathlib import Path
-import math
+
 import networkx as nx
 
 
 # ==========================================================
-# Project root
+# Project Root
 # ==========================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -19,11 +19,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ==========================================================
-# Repository imports
+# Repository Imports
 # ==========================================================
 
 from Pathfinding.top_k_paths import top_k_paths
-from Pathfinding.heuristics import lnd_cost
+from Pathfinding.heuristics import (
+    lnd_cost,
+    adaptive_heuristic,
+    modified_cost,
+    channel_fee,
+    estimated_liquidity,
+    reliability_penalty,
+)
 
 
 # ==========================================================
@@ -35,23 +42,38 @@ GML_FILE = PROJECT_ROOT / "20190501.gml.geo"
 K = 5
 MAX_HOPS = 12
 
-# PPO routing parameter.
-# In this standalone test, eta is fixed.
+# ----------------------------------------------------------
+# PPO adaptive parameter
+# ----------------------------------------------------------
+
 ETA = 0.5
 
-# Payment amount.
+# ----------------------------------------------------------
+# Weight of adaptive heuristic
+# ----------------------------------------------------------
+
+LAMBDA_H = 1.0
+
+# ----------------------------------------------------------
+# Payment amount
+# ----------------------------------------------------------
+
 AMOUNT = 10_000
+
+# ----------------------------------------------------------
+# Reproducibility
+# ----------------------------------------------------------
 
 RANDOM_SEED = 42
 
 
 # ==========================================================
-# Utility functions
+# Utility Functions
 # ==========================================================
 
 def print_separator(
     char="=",
-    length=78
+    length=78,
 ):
     print(
         char * length
@@ -59,12 +81,40 @@ def print_separator(
 
 
 def print_header(
-    title
+    title,
 ):
     print()
     print_separator()
     print(title)
     print_separator()
+
+
+def safe_float(
+    value,
+    default=0.0,
+):
+    try:
+
+        value = float(
+            value
+        )
+
+        if not math.isfinite(
+            value
+        ):
+            return float(
+                default
+            )
+
+        return value
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return float(
+            default
+        )
 
 
 # ==========================================================
@@ -75,19 +125,15 @@ def load_graph():
     """
     Load the real Lightning snapshot.
 
-    The GML file may be loaded as Graph, DiGraph,
-    MultiGraph or MultiDiGraph.
+    The Pathfinding module supports:
 
-    The routing implementation expects a MultiDiGraph.
+        Graph
+        DiGraph
+        MultiGraph
+        MultiDiGraph
 
-    IMPORTANT
-    ---------
-    If the source GML is undirected, converting it to
-    MultiDiGraph creates reverse edges structurally.
-
-    This does NOT mean that the original snapshot explicitly
-    contained independent directional channel policies for
-    those reverse edges.
+    Internally, the test converts the graph to MultiDiGraph
+    so that channel keys are preserved.
     """
 
     print_header(
@@ -110,10 +156,12 @@ def load_graph():
 
     G = nx.read_gml(
         GML_FILE,
-        label="id"
+        label="id",
     )
 
-    original_type = type(G).__name__
+    original_type = type(
+        G
+    ).__name__
 
     print()
     print(
@@ -139,20 +187,20 @@ def load_graph():
         f"{G.number_of_edges():,}"
     )
 
-    # ------------------------------------------------------
+    # ======================================================
     # Convert to MultiDiGraph
-    # ------------------------------------------------------
+    # ======================================================
 
     if isinstance(
         G,
-        nx.MultiDiGraph
+        nx.MultiDiGraph,
     ):
 
         routing_graph = G
 
     elif isinstance(
         G,
-        nx.DiGraph
+        nx.DiGraph,
     ):
 
         routing_graph = nx.MultiDiGraph(
@@ -161,7 +209,7 @@ def load_graph():
 
     elif isinstance(
         G,
-        nx.MultiGraph
+        nx.MultiGraph,
     ):
 
         routing_graph = nx.MultiDiGraph(
@@ -170,7 +218,7 @@ def load_graph():
 
     elif isinstance(
         G,
-        nx.Graph
+        nx.Graph,
     ):
 
         routing_graph = nx.MultiDiGraph(
@@ -204,12 +252,16 @@ def load_graph():
         f"{routing_graph.number_of_edges():,}"
     )
 
+    # ======================================================
+    # Direction warning
+    # ======================================================
+
     if not isinstance(
         G,
         (
             nx.DiGraph,
-            nx.MultiDiGraph
-        )
+            nx.MultiDiGraph,
+        ),
     ):
 
         print()
@@ -239,8 +291,11 @@ def load_graph():
 # ==========================================================
 
 def print_graph_statistics(
-    G
+    G,
 ):
+    """
+    Print topology and routing-related statistics.
+    """
 
     print_header(
         "2. GRAPH STATISTICS"
@@ -250,40 +305,72 @@ def print_graph_statistics(
         G.nodes
     )
 
-    # ------------------------------------------------------
-    # Nodes
-    # ------------------------------------------------------
+    # ======================================================
+    # Node Availability
+    # ======================================================
 
-    online_nodes = sum(
-        1
-        for node in nodes
-        if bool(
-            G.nodes[node].get(
+    online_nodes = 0
+    available_nodes = 0
+
+    for node in nodes:
+
+        data = G.nodes[
+            node
+        ]
+
+        online = bool(
+            data.get(
                 "online",
-                True
+                True,
             )
         )
-    )
 
-    # ------------------------------------------------------
-    # Channels
-    # ------------------------------------------------------
-
-    available_edges = 0
-
-    for _, _, _, data in G.edges(
-        keys=True,
-        data=True
-    ):
-
-        if bool(
+        available = bool(
             data.get(
                 "available",
-                True
+                True,
             )
-        ):
+        )
 
+        if online:
+            online_nodes += 1
+
+        if (
+            online
+            and
+            available
+        ):
+            available_nodes += 1
+
+    # ======================================================
+    # Channels
+    # ======================================================
+
+    available_edges = 0
+    unavailable_edges = 0
+
+    for (
+        _,
+        _,
+        _,
+        data,
+    ) in G.edges(
+        keys=True,
+        data=True,
+    ):
+
+        available = bool(
+            data.get(
+                "available",
+                True,
+            )
+        )
+
+        if available:
             available_edges += 1
+
+        else:
+            unavailable_edges += 1
 
     print(
         f"Total nodes              : "
@@ -301,21 +388,33 @@ def print_graph_statistics(
     )
 
     print(
+        f"Available nodes          : "
+        f"{available_nodes:,}"
+    )
+
+    print(
         f"Available channels       : "
         f"{available_edges:,}"
     )
 
+    print(
+        f"Unavailable channels     : "
+        f"{unavailable_edges:,}"
+    )
+
     # ======================================================
-    # Geographic data
+    # Geographic Data
     # ======================================================
 
     geo_nodes = 0
-    carbon_nodes = 0
     rgb_nodes = 0
+    carbon_nodes = 0
 
     for node in nodes:
 
-        data = G.nodes[node]
+        data = G.nodes[
+            node
+        ]
 
         if (
             "latitude" in data
@@ -330,9 +429,9 @@ def print_graph_statistics(
             rgb_nodes += 1
 
         if (
-            "carbon_intensity" in data
-            or
             "rgb_color" in data
+            or
+            "carbon_intensity" in data
         ):
 
             carbon_nodes += 1
@@ -343,44 +442,43 @@ def print_graph_statistics(
     )
 
     print(
-        f"  Nodes with coordinates   : "
+        f"  Nodes with coordinates  : "
         f"{geo_nodes:,}"
     )
 
     print(
-        f"  Nodes with rgb_color     : "
+        f"  Nodes with rgb_color    : "
         f"{rgb_nodes:,}"
     )
 
     print(
-        f"  Nodes with carbon data   : "
+        f"  Nodes with carbon data  : "
         f"{carbon_nodes:,}"
     )
 
     # ======================================================
-    # Directional liquidity
+    # Directional Liquidity
     # ======================================================
 
     known_liquidity = 0
-
     capacity_only = 0
+    unknown_liquidity = 0
 
-    for _, _, _, data in G.edges(
+    for (
+        _,
+        _,
+        _,
+        data,
+    ) in G.edges(
         keys=True,
-        data=True
+        data=True,
     ):
 
-        has_liquidity = any(
-            key in data
-            and data.get(key) is not None
-            for key in (
-                "estimated_liquidity",
-                "liquidity_uv",
-                "balance_uv"
-            )
+        liquidity = estimated_liquidity(
+            data
         )
 
-        if has_liquidity:
+        if liquidity is not None:
 
             known_liquidity += 1
 
@@ -388,21 +486,29 @@ def print_graph_statistics(
 
             capacity_only += 1
 
+        else:
+
+            unknown_liquidity += 1
+
     print()
     print(
         "Directional liquidity:"
     )
 
     print(
-        "  Channels with "
-        "learned/observed liquidity : "
+        "  Known directional "
+        "liquidity              : "
         f"{known_liquidity:,}"
     )
 
     print(
-        "  Channels with capacity but "
-        "no directional liquidity  : "
+        "  Capacity only          : "
         f"{capacity_only:,}"
+    )
+
+    print(
+        "  Completely unknown    : "
+        f"{unknown_liquidity:,}"
     )
 
     print()
@@ -411,8 +517,8 @@ def print_graph_statistics(
     )
 
     print(
-        "  Snapshot capacity is NOT used "
-        "as balance or liquidity."
+        "  Channel capacity is NOT interpreted "
+        "as directional liquidity."
     )
 
 
@@ -421,8 +527,12 @@ def print_graph_statistics(
 # ==========================================================
 
 def select_source_destination(
-    G
+    G,
 ):
+    """
+    Select source and destination from the largest strongly
+    connected component.
+    """
 
     print_header(
         "3. SELECT SOURCE / DESTINATION"
@@ -431,10 +541,6 @@ def select_source_destination(
     random.seed(
         RANDOM_SEED
     )
-
-    # ------------------------------------------------------
-    # Strongly connected components
-    # ------------------------------------------------------
 
     components = list(
         nx.strongly_connected_components(
@@ -450,7 +556,7 @@ def select_source_destination(
 
     largest_component = max(
         components,
-        key=len
+        key=len,
     )
 
     component_nodes = list(
@@ -466,7 +572,7 @@ def select_source_destination(
 
     source, target = random.sample(
         component_nodes,
-        2
+        2,
     )
 
     print(
@@ -493,7 +599,7 @@ def select_source_destination(
 
     print(
         f"Payment amount           : "
-        f"{AMOUNT:,.0f} sat"
+        f"{AMOUNT:,.0f}"
     )
 
     print(
@@ -511,14 +617,19 @@ def select_source_destination(
         f"{ETA}"
     )
 
+    print(
+        f"Lambda_h                 : "
+        f"{LAMBDA_H}"
+    )
+
     return (
         source,
-        target
+        target,
     )
 
 
 # ==========================================================
-# Route Validation
+# Validate Route
 # ==========================================================
 
 def validate_route(
@@ -526,21 +637,12 @@ def validate_route(
     route,
     source,
     target,
-    max_hops
+    max_hops,
 ):
     """
-    Validate structural consistency of a candidate route.
+    Validate structural consistency of one candidate route.
 
-    This does NOT execute the payment.
-
-    It only verifies that:
-
-        - source is correct
-        - destination is correct
-        - hop count is correct
-        - edge sequence is valid
-        - selected channel keys exist
-        - hop count <= max_hops
+    This test does NOT execute the payment.
     """
 
     path = route.get(
@@ -551,9 +653,9 @@ def validate_route(
         "edges"
     )
 
-    # ------------------------------------------------------
+    # ======================================================
     # Path
-    # ------------------------------------------------------
+    # ======================================================
 
     if not path:
 
@@ -567,9 +669,21 @@ def validate_route(
 
         return False, "invalid_target"
 
-    # ------------------------------------------------------
-    # Hop count
-    # ------------------------------------------------------
+    # ======================================================
+    # Simple Path Check
+    # ======================================================
+
+    if len(
+        path
+    ) != len(
+        set(path)
+    ):
+
+        return False, "loop_detected"
+
+    # ======================================================
+    # Hop Count
+    # ======================================================
 
     hop_count = route.get(
         "hop_count"
@@ -579,21 +693,25 @@ def validate_route(
 
         return False, "missing_hop_count"
 
+    hop_count = int(
+        hop_count
+    )
+
     if (
         len(path) - 1
         !=
-        int(hop_count)
+        hop_count
     ):
 
         return False, "hop_count_mismatch"
 
-    if int(hop_count) > max_hops:
+    if hop_count > max_hops:
 
         return False, "max_hops_exceeded"
 
-    # ------------------------------------------------------
-    # Edge count
-    # ------------------------------------------------------
+    # ======================================================
+    # Edge Count
+    # ======================================================
 
     if edges is None:
 
@@ -603,41 +721,53 @@ def validate_route(
 
         return False, "edge_count_mismatch"
 
-    # ------------------------------------------------------
-    # Validate every edge
-    # ------------------------------------------------------
+    # ======================================================
+    # Edge Validation
+    # ======================================================
 
-    for index, (
-        u,
-        v,
-        key
-    ) in enumerate(edges):
+    for index, edge in enumerate(
+        edges
+    ):
 
-        expected_u = path[index]
-        expected_v = path[index + 1]
+        if len(edge) != 3:
+
+            return (
+                False,
+                f"invalid_edge_format:{edge}",
+            )
+
+        u, v, key = edge
+
+        expected_u = path[
+            index
+        ]
+
+        expected_v = path[
+            index + 1
+        ]
 
         if u != expected_u:
 
             return (
                 False,
-                f"edge_source_mismatch:{u}"
+                f"edge_source_mismatch:{u}",
             )
 
         if v != expected_v:
 
             return (
                 False,
-                f"edge_target_mismatch:{v}"
+                f"edge_target_mismatch:{v}",
             )
 
         if not G.has_edge(
             u,
-            v
+            v,
         ):
 
             return (
                 False,
-                f"missing_edge:{u}->{v}"
+                f"missing_edge:{u}->{v}",
             )
 
         if key not in G[u][v]:
@@ -645,8 +775,118 @@ def validate_route(
             return (
                 False,
                 f"missing_channel:"
-                f"{u}->{v}:{key}"
+                f"{u}->{v}:{key}",
             )
+
+        data = G[u][v][key]
+
+        # --------------------------------------------------
+        # Channel availability
+        # --------------------------------------------------
+
+        if not bool(
+            data.get(
+                "available",
+                True,
+            )
+        ):
+
+            return (
+                False,
+                f"channel_unavailable:"
+                f"{u}->{v}:{key}",
+            )
+
+        # --------------------------------------------------
+        # Node availability
+        # --------------------------------------------------
+
+        if not bool(
+            G.nodes[u].get(
+                "online",
+                True,
+            )
+        ):
+
+            return (
+                False,
+                f"source_node_offline:{u}",
+            )
+
+        if not bool(
+            G.nodes[v].get(
+                "online",
+                True,
+            )
+        ):
+
+            return (
+                False,
+                f"target_node_offline:{v}",
+            )
+
+    return True, "OK"
+
+
+# ==========================================================
+# Validate Candidate Metadata
+# ==========================================================
+
+def validate_candidate_metadata(
+    route,
+):
+    """
+    Validate that adaptive routing metadata returned by
+    top_k_paths is internally consistent.
+    """
+
+    if "eta" not in route:
+
+        return False, "missing_eta"
+
+    if "lambda_h" not in route:
+
+        return False, "missing_lambda_h"
+
+    eta = safe_float(
+        route.get(
+            "eta"
+        ),
+        default=float("nan"),
+    )
+
+    lambda_h = safe_float(
+        route.get(
+            "lambda_h"
+        ),
+        default=float("nan"),
+    )
+
+    if not math.isfinite(
+        eta
+    ):
+
+        return False, "invalid_eta"
+
+    if not (
+        -1.0
+        <=
+        eta
+        <=
+        1.0
+    ):
+
+        return False, "eta_out_of_range"
+
+    if not math.isfinite(
+        lambda_h
+    ):
+
+        return False, "invalid_lambda_h"
+
+    if lambda_h < 0.0:
+
+        return False, "negative_lambda_h"
 
     return True, "OK"
 
@@ -660,13 +900,16 @@ def print_route(
     route,
     rank,
     source,
-    target
+    target,
 ):
+    """
+    Print complete information for one candidate route.
+    """
 
     print()
     print_separator(
         "-",
-        78
+        78,
     )
 
     print(
@@ -675,22 +918,22 @@ def print_route(
 
     print_separator(
         "-",
-        78
+        78,
     )
 
     path = route.get(
         "path",
-        []
+        [],
     )
 
     edges = route.get(
         "edges",
-        []
+        [],
     )
 
-    # ------------------------------------------------------
-    # Basic information
-    # ------------------------------------------------------
+    # ======================================================
+    # Basic Information
+    # ======================================================
 
     print()
     print(
@@ -715,22 +958,22 @@ def print_route(
 
     print(
         f"Cost                     : "
-        f"{route.get('cost', 0.0):.6f}"
+        f"{safe_float(route.get('cost')):.6f}"
     )
 
     print(
         f"ETA                      : "
-        f"{route.get('eta', ETA)}"
+        f"{route.get('eta')}"
     )
 
     print(
         f"Lambda_h                 : "
-        f"{route.get('lambda_h', 1.0)}"
+        f"{route.get('lambda_h')}"
     )
 
-    # ------------------------------------------------------
+    # ======================================================
     # Path
-    # ------------------------------------------------------
+    # ======================================================
 
     print()
     print(
@@ -746,26 +989,9 @@ def print_route(
         )
     )
 
-    # ------------------------------------------------------
-    # Nodes
-    # ------------------------------------------------------
-
-    print()
-    print(
-        "Path nodes:"
-    )
-
-    for index, node in enumerate(
-        path
-    ):
-
-        print(
-            f"  {index:02d}. {node}"
-        )
-
-    # ------------------------------------------------------
+    # ======================================================
     # Channels
-    # ------------------------------------------------------
+    # ======================================================
 
     print()
     print(
@@ -780,10 +1006,36 @@ def print_route(
 
             u, v, key = edge
 
+            data = G[u][v][key]
+
+            fee = channel_fee(
+                data,
+                AMOUNT,
+            )
+
+            reliability = (
+                1.0
+                -
+                reliability_penalty(
+                    data
+                )
+            )
+
+            liquidity = estimated_liquidity(
+                data
+            )
+
             print(
                 f"  {index + 1:02d}. "
                 f"{u} -> {v} "
                 f"(channel={key})"
+            )
+
+            print(
+                f"       fee={fee:.4f}, "
+                f"reliability={reliability:.6f}, "
+                f"liquidity="
+                f"{'unknown' if liquidity is None else f'{liquidity:.4f}'}"
             )
 
         else:
@@ -793,9 +1045,9 @@ def print_route(
                 f"{edge}"
             )
 
-    # ------------------------------------------------------
-    # Route metrics
-    # ------------------------------------------------------
+    # ======================================================
+    # Route Metrics
+    # ======================================================
 
     print()
     print(
@@ -806,28 +1058,38 @@ def print_route(
 
         (
             "Total cost",
-            "cost"
+            "cost",
         ),
 
         (
             "Total fee",
-            "total_fee"
+            "total_fee",
         ),
 
         (
             "Total delay",
-            "total_delay"
+            "total_delay",
         ),
 
         (
             "Reliability",
-            "reliability"
+            "reliability",
         ),
 
         (
             "Failure probability",
-            "failure_probability"
-        )
+            "failure_probability",
+        ),
+
+        (
+            "Distance",
+            "distance_km",
+        ),
+
+        (
+            "Carbon",
+            "carbon_intensity",
+        ),
     ]
 
     for label, key in metrics:
@@ -842,7 +1104,10 @@ def print_route(
 
         elif isinstance(
             value,
-            (float, int)
+            (
+                float,
+                int,
+            ),
         ):
 
             value_text = (
@@ -860,9 +1125,9 @@ def print_route(
             f"{value_text}"
         )
 
-    # ------------------------------------------------------
-    # Candidate status
-    # ------------------------------------------------------
+    # ======================================================
+    # Candidate Status
+    # ======================================================
 
     print()
     print(
@@ -879,29 +1144,22 @@ def print_route(
         f"{route.get('success')}"
     )
 
-    print()
-    print(
-        "Note:"
-    )
-
-    print(
-        "  This test evaluates route generation only."
-    )
-
-    print(
-        "  It does NOT execute the payment."
-    )
-
-    # ------------------------------------------------------
+    # ======================================================
     # Validation
-    # ------------------------------------------------------
+    # ======================================================
 
     valid, reason = validate_route(
         G=G,
         route=route,
         source=source,
         target=target,
-        max_hops=MAX_HOPS
+        max_hops=MAX_HOPS,
+    )
+
+    metadata_valid, metadata_reason = (
+        validate_candidate_metadata(
+            route
+        )
     )
 
     print()
@@ -910,25 +1168,40 @@ def print_route(
     )
 
     print(
-        f"  Status                   : "
+        f"  Structural status        : "
         f"{'PASS' if valid else 'FAIL'}"
     )
 
     if not valid:
 
         print(
-            f"  Reason                   : "
+            f"  Structural reason        : "
             f"{reason}"
+        )
+
+    print(
+        f"  Adaptive metadata        : "
+        f"{'PASS' if metadata_valid else 'FAIL'}"
+    )
+
+    if not metadata_valid:
+
+        print(
+            f"  Metadata reason          : "
+            f"{metadata_reason}"
         )
 
 
 # ==========================================================
-# Summary
+# Print Summary
 # ==========================================================
 
 def print_summary(
-    routes
+    routes,
 ):
+    """
+    Print compact candidate-route summary.
+    """
 
     print_header(
         "5. TOP-K ROUTES SUMMARY"
@@ -949,6 +1222,7 @@ def print_summary(
         f"{'Fee':<16}"
         f"{'Delay':<12}"
         f"{'Reliability':<15}"
+        f"{'ETA':<8}"
     )
 
     print(
@@ -957,21 +1231,22 @@ def print_summary(
 
     print_separator(
         "-",
-        len(header)
+        len(header),
     )
 
     for rank, route in enumerate(
         routes,
-        start=1
+        start=1,
     ):
 
         print(
             f"{rank:<6}"
             f"{route.get('hop_count', 0):<8}"
-            f"{route.get('cost', 0.0):<16.4f}"
-            f"{route.get('total_fee', 0.0):<16.4f}"
-            f"{route.get('total_delay', 0.0):<12.2f}"
-            f"{route.get('reliability', 0.0):<15.6f}"
+            f"{safe_float(route.get('cost')):<16.4f}"
+            f"{safe_float(route.get('total_fee')):<16.4f}"
+            f"{safe_float(route.get('total_delay')):<12.2f}"
+            f"{safe_float(route.get('reliability')):<15.6f}"
+            f"{safe_float(route.get('eta')):<8.3f}"
         )
 
 
@@ -980,7 +1255,7 @@ def print_summary(
 # ==========================================================
 
 def validate_cost_order(
-    routes
+    routes,
 ):
     """
     Verify:
@@ -993,21 +1268,189 @@ def validate_cost_order(
         return True
 
     costs = [
-        float(
+
+        safe_float(
             route.get(
                 "cost",
-                math.inf
-            )
+                math.inf,
+            ),
+            default=math.inf,
         )
+
         for route in routes
     ]
 
     return all(
-        costs[i] <= costs[i + 1]
-        for i in range(
+        costs[index]
+        <=
+        costs[index + 1]
+
+        for index in range(
             len(costs) - 1
         )
     )
+
+
+# ==========================================================
+# Validate K
+# ==========================================================
+
+def validate_k(
+    routes,
+    requested_k,
+):
+    """
+    Verify that the number of returned routes does not exceed
+    K and that every returned route is unique by node path.
+    """
+
+    if len(routes) > requested_k:
+
+        return False, "more_routes_than_requested"
+
+    paths = []
+
+    for route in routes:
+
+        path = tuple(
+            route.get(
+                "path",
+                [],
+            )
+        )
+
+        if not path:
+
+            return False, "empty_candidate_path"
+
+        if path in paths:
+
+            return False, "duplicate_candidate_path"
+
+        paths.append(
+            path
+        )
+
+    return True, "OK"
+
+
+# ==========================================================
+# Validate Adaptive Cost on First Route
+# ==========================================================
+
+def validate_adaptive_cost(
+    G,
+    route,
+):
+    """
+    Independently recompute the adaptive cost of the first
+    candidate route.
+
+    This verifies that the returned route cost is consistent
+    with:
+
+        LND cost
+        +
+        lambda_h * adaptive heuristic
+    """
+
+    path = route.get(
+        "path"
+    )
+
+    edges = route.get(
+        "edges"
+    )
+
+    if not path or not edges:
+
+        return False, "empty_route"
+
+    eta = safe_float(
+        route.get(
+            "eta"
+        ),
+        default=float("nan"),
+    )
+
+    lambda_h = safe_float(
+        route.get(
+            "lambda_h",
+            1.0,
+        ),
+        default=float("nan"),
+    )
+
+    if not math.isfinite(
+        eta
+    ):
+
+        return False, "invalid_eta"
+
+    if not math.isfinite(
+        lambda_h
+    ):
+
+        return False, "invalid_lambda_h"
+
+    recomputed_cost = 0.0
+
+    for u, v, key in edges:
+
+        data = G[u][v][key]
+
+        base_cost = lnd_cost(
+            G,
+            u,
+            v,
+            data,
+            AMOUNT,
+        )
+
+        h = adaptive_heuristic(
+            G,
+            u,
+            v,
+            eta,
+        )
+
+        edge_cost = modified_cost(
+            native_cost=base_cost,
+            geo_penalty=h,
+            eta=eta,
+            lambda_h=lambda_h,
+        )
+
+        recomputed_cost += edge_cost
+
+    reported_cost = safe_float(
+        route.get(
+            "cost"
+        ),
+        default=float("nan"),
+    )
+
+    if not math.isfinite(
+        reported_cost
+    ):
+
+        return False, "invalid_reported_cost"
+
+    if not math.isclose(
+        recomputed_cost,
+        reported_cost,
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    ):
+
+        return (
+            False,
+            "adaptive_cost_mismatch:"
+            f"reported={reported_cost},"
+            f"recomputed={recomputed_cost}",
+        )
+
+    return True, "OK"
 
 
 # ==========================================================
@@ -1032,7 +1475,7 @@ def main():
     G = load_graph()
 
     # ======================================================
-    # 2. Statistics
+    # 2. Graph statistics
     # ======================================================
 
     print_graph_statistics(
@@ -1040,18 +1483,18 @@ def main():
     )
 
     # ======================================================
-    # 3. Select source / destination
+    # 3. Source / Destination
     # ======================================================
 
     (
         source,
-        target
+        target,
     ) = select_source_destination(
         G
     )
 
     # ======================================================
-    # 4. Pathfinding
+    # 4. Run Top-K Pathfinding
     # ======================================================
 
     print_header(
@@ -1074,7 +1517,7 @@ def main():
 
     print(
         f"  Amount       : "
-        f"{AMOUNT:,.0f} sat"
+        f"{AMOUNT:,.0f}"
     )
 
     print(
@@ -1092,9 +1535,14 @@ def main():
         f"{ETA}"
     )
 
+    print(
+        f"  Lambda_h     : "
+        f"{LAMBDA_H}"
+    )
+
     print()
     print(
-        "Running pathfinding..."
+        "Running adaptive top-k pathfinding..."
     )
 
     try:
@@ -1107,7 +1555,39 @@ def main():
             heuristic_fn=lnd_cost,
             eta=ETA,
             k=K,
-            max_hops=MAX_HOPS
+            max_hops=MAX_HOPS,
+            lambda_h=LAMBDA_H,
+        )
+
+    except TypeError as exc:
+
+        print()
+        print(
+            "WARNING:"
+        )
+
+        print(
+            "The current top_k_paths() signature does "
+            "not accept lambda_h."
+        )
+
+        print(
+            "Retrying without explicit lambda_h."
+        )
+
+        print(
+            f"TypeError: {exc}"
+        )
+
+        routes = top_k_paths(
+            G=G,
+            source=source,
+            target=target,
+            amount=AMOUNT,
+            heuristic_fn=lnd_cost,
+            eta=ETA,
+            k=K,
+            max_hops=MAX_HOPS,
         )
 
     except Exception as exc:
@@ -1115,7 +1595,7 @@ def main():
         print()
         print_separator(
             "!",
-            78
+            78,
         )
 
         print(
@@ -1124,7 +1604,7 @@ def main():
 
         print_separator(
             "!",
-            78
+            78,
         )
 
         print()
@@ -1141,7 +1621,7 @@ def main():
         raise
 
     # ======================================================
-    # Number of routes
+    # 5. Number of routes
     # ======================================================
 
     print()
@@ -1151,12 +1631,87 @@ def main():
     )
 
     # ======================================================
-    # Print routes
+    # 6. Route validation
     # ======================================================
+
+    print_header(
+        "6. VALIDATE CANDIDATE ROUTES"
+    )
+
+    structural_pass = 0
+    metadata_pass = 0
 
     for rank, route in enumerate(
         routes,
-        start=1
+        start=1,
+    ):
+
+        valid, reason = validate_route(
+            G=G,
+            route=route,
+            source=source,
+            target=target,
+            max_hops=MAX_HOPS,
+        )
+
+        metadata_valid, metadata_reason = (
+            validate_candidate_metadata(
+                route
+            )
+        )
+
+        print(
+            f"Route #{rank:<3} "
+            f"structural="
+            f"{'PASS' if valid else 'FAIL':<5} "
+            f"adaptive="
+            f"{'PASS' if metadata_valid else 'FAIL'}"
+        )
+
+        if not valid:
+
+            print(
+                f"    structural reason: "
+                f"{reason}"
+            )
+
+        if not metadata_valid:
+
+            print(
+                f"    metadata reason: "
+                f"{metadata_reason}"
+            )
+
+        if valid:
+
+            structural_pass += 1
+
+        if metadata_valid:
+
+            metadata_pass += 1
+
+    print()
+    print(
+        f"Structural validation   : "
+        f"{structural_pass}/{len(routes)}"
+    )
+
+    print(
+        f"Adaptive metadata       : "
+        f"{metadata_pass}/{len(routes)}"
+    )
+
+    # ======================================================
+    # 7. Print routes
+    # ======================================================
+
+    print_header(
+        "7. CANDIDATE ROUTES"
+    )
+
+    for rank, route in enumerate(
+        routes,
+        start=1,
     ):
 
         print_route(
@@ -1164,11 +1719,11 @@ def main():
             route=route,
             rank=rank,
             source=source,
-            target=target
+            target=target,
         )
 
     # ======================================================
-    # Summary
+    # 8. Summary
     # ======================================================
 
     print_summary(
@@ -1176,11 +1731,11 @@ def main():
     )
 
     # ======================================================
-    # Validate ordering
+    # 9. Cost Ordering
     # ======================================================
 
     print_header(
-        "6. ROUTE ORDER VALIDATION"
+        "8. ROUTE ORDER VALIDATION"
     )
 
     ordered = validate_cost_order(
@@ -1194,84 +1749,96 @@ def main():
 
     if routes:
 
-        costs = [
-            route.get(
-                "cost",
-                math.inf
-            )
-            for route in routes
-        ]
-
         print()
         print(
             "Candidate costs:"
         )
 
-        for index, cost in enumerate(
-            costs,
-            start=1
+        for index, route in enumerate(
+            routes,
+            start=1,
         ):
 
             print(
                 f"  Route #{index}: "
-                f"{float(cost):.6f}"
+                f"{safe_float(route.get('cost')):.6f}"
             )
 
     # ======================================================
-    # Final result
+    # 10. K Validation
     # ======================================================
 
     print_header(
-        "7. TEST RESULT"
+        "9. TOP-K VALIDATION"
     )
 
-    if routes:
+    k_valid, k_reason = validate_k(
+        routes,
+        K,
+    )
+
+    print(
+        f"K validation              : "
+        f"{'PASS' if k_valid else 'FAIL'}"
+    )
+
+    if not k_valid:
 
         print(
-            "PATHFINDING STATUS : SUCCESS"
+            f"Reason                    : "
+            f"{k_reason}"
         )
 
-        print()
-        print(
-            f"Requested K        : "
-            f"{K}"
-        )
+    # ======================================================
+    # 11. Adaptive Cost Validation
+    # ======================================================
 
-        print(
-            f"Returned routes    : "
-            f"{len(routes)}"
-        )
+    print_header(
+        "10. ADAPTIVE COST VALIDATION"
+    )
 
-        print(
-            f"Maximum hops       : "
-            f"{MAX_HOPS}"
-        )
+    adaptive_pass = 0
 
-        print(
-            f"ETA                : "
-            f"{ETA}"
-        )
+    for rank, route in enumerate(
+        routes,
+        start=1,
+    ):
 
-        print()
-        print(
-            "The generated paths are candidate routes."
-        )
-
-        print(
-            "They have NOT yet been executed as payments."
-        )
-
-        print()
-        print(
-            "Next stage:"
+        valid, reason = validate_adaptive_cost(
+            G,
+            route,
         )
 
         print(
-            "  Candidate routes -> Bucket "
-            "-> Payment Simulator"
+            f"Route #{rank:<3}: "
+            f"{'PASS' if valid else 'FAIL'}"
         )
 
-    else:
+        if not valid:
+
+            print(
+                f"    Reason: {reason}"
+            )
+
+        else:
+
+            adaptive_pass += 1
+
+    print()
+    print(
+        f"Adaptive cost validation : "
+        f"{adaptive_pass}/{len(routes)}"
+    )
+
+    # ======================================================
+    # 12. Final Result
+    # ======================================================
+
+    print_header(
+        "11. TEST RESULT"
+    )
+
+    if not routes:
 
         print(
             "PATHFINDING STATUS : NO ROUTE"
@@ -1280,11 +1847,168 @@ def main():
         print()
         print(
             "No feasible candidate route was found "
-            "under the current topology, amount, "
+            "under the current topology, payment amount, "
             "ETA and hop constraints."
         )
 
+        print()
+        print(
+            "This is not necessarily a code failure."
+        )
+
+        print(
+            "It may indicate that the selected source/"
+            "destination pair has no feasible route."
+        )
+
+        print()
+        print_separator()
+
+        print(
+            " END OF TOP-K PATHFINDING TEST "
+        )
+
+        print_separator()
+
+        return
+
+    all_passed = (
+        structural_pass
+        ==
+        len(routes)
+        and
+        metadata_pass
+        ==
+        len(routes)
+        and
+        ordered
+        and
+        k_valid
+        and
+        adaptive_pass
+        ==
+        len(routes)
+    )
+
+    print(
+        f"PATHFINDING STATUS : "
+        f"{'SUCCESS' if all_passed else 'PARTIAL / CHECK REQUIRED'}"
+    )
+
     print()
+    print(
+        f"Requested K        : "
+        f"{K}"
+    )
+
+    print(
+        f"Returned routes    : "
+        f"{len(routes)}"
+    )
+
+    print(
+        f"Maximum hops       : "
+        f"{MAX_HOPS}"
+    )
+
+    print(
+        f"ETA                : "
+        f"{ETA}"
+    )
+
+    print(
+        f"Lambda_h           : "
+        f"{LAMBDA_H}"
+    )
+
+    print()
+    print(
+        "Verified components:"
+    )
+
+    print(
+        f"  Route structure       : "
+        f"{'PASS' if structural_pass == len(routes) else 'FAIL'}"
+    )
+
+    print(
+        f"  Adaptive metadata     : "
+        f"{'PASS' if metadata_pass == len(routes) else 'FAIL'}"
+    )
+
+    print(
+        f"  Cost ordering         : "
+        f"{'PASS' if ordered else 'FAIL'}"
+    )
+
+    print(
+        f"  K constraint          : "
+        f"{'PASS' if k_valid else 'FAIL'}"
+    )
+
+    print(
+        f"  Adaptive cost         : "
+        f"{'PASS' if adaptive_pass == len(routes) else 'FAIL'}"
+    )
+
+    print()
+    print(
+        "IMPORTANT:"
+    )
+
+    print(
+        "  This test verifies Pathfinding only."
+    )
+
+    print(
+        "  It does NOT execute payments."
+    )
+
+    print(
+        "  It does NOT train PPO."
+    )
+
+    print(
+        "  It does NOT use Bucket for route storage."
+    )
+
+    print(
+        "  It does NOT perform Partial Backtracking."
+    )
+
+    print()
+    print(
+        "Next integration stage:"
+    )
+
+    print(
+        "  Top-K Candidate Routes"
+    )
+
+    print(
+        "        -> Bucket"
+    )
+
+    print(
+        "        -> Selected Route"
+    )
+
+    print(
+        "        -> Payment Simulation"
+    )
+
+    print(
+        "        -> Failure Detection"
+    )
+
+    print(
+        "        -> Partial Backtracking"
+    )
+
+    print(
+        "        -> Alternative Suffix"
+    )
+
     print_separator()
 
     print(
@@ -1295,7 +2019,7 @@ def main():
 
 
 # ==========================================================
-# Entry point
+# Entry Point
 # ==========================================================
 
 if __name__ == "__main__":

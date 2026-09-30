@@ -1,6 +1,127 @@
+# Pathfinding/heuristics.py
+
 import math
 
 from Network.topology import geo_features
+
+
+# ==========================================================
+# Numeric Helpers
+# ==========================================================
+
+def _safe_float(value, default=0.0):
+    """
+    Convert a value to a finite float.
+
+    Invalid or non-finite values are replaced with default.
+    """
+
+    try:
+        value = float(value)
+
+        if not math.isfinite(value):
+            return float(default)
+
+        return value
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return float(default)
+
+
+def _valid_non_negative(value):
+    """
+    Return True if value is finite and >= 0.
+    """
+
+    try:
+        value = float(value)
+
+        return (
+            math.isfinite(value)
+            and
+            value >= 0.0
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
+def _validate_amount(amount):
+    """
+    Validate payment amount.
+    """
+
+    amount = _safe_float(
+        amount,
+        default=-1.0,
+    )
+
+    if (
+        not math.isfinite(amount)
+        or
+        amount <= 0.0
+    ):
+        raise ValueError(
+            "amount must be finite and greater than zero"
+        )
+
+    return amount
+
+
+def _validate_eta(eta):
+    """
+    Validate PPO adaptive parameter.
+
+    Required range:
+
+        -1 <= eta <= 1
+    """
+
+    eta = _safe_float(
+        eta,
+        default=float("nan"),
+    )
+
+    if not math.isfinite(eta):
+        raise ValueError(
+            "eta must be finite"
+        )
+
+    if not -1.0 <= eta <= 1.0:
+        raise ValueError(
+            f"eta must be in [-1, 1], got {eta}"
+        )
+
+    return eta
+
+
+def _validate_lambda_h(lambda_h):
+    """
+    Validate adaptive heuristic weight.
+    """
+
+    lambda_h = _safe_float(
+        lambda_h,
+        default=float("nan"),
+    )
+
+    if not math.isfinite(lambda_h):
+        raise ValueError(
+            "lambda_h must be finite"
+        )
+
+    if lambda_h < 0.0:
+        raise ValueError(
+            "lambda_h must be >= 0"
+        )
+
+    return lambda_h
 
 
 # ==========================================================
@@ -9,98 +130,231 @@ from Network.topology import geo_features
 
 def channel_fee(data, amount):
     """
-    Lightning forwarding fee.
+    Calculate Lightning forwarding fee.
 
-    fee_base:
-        Base forwarding fee.
+    Formula:
 
-    fee_rate:
-        Proportional forwarding fee in ppm.
+        fee =
+            fee_base
+            +
+            amount * fee_rate / 1,000,000
 
-    Important:
-        The original unit convention of the input dataset is
-        preserved here. Unit conversion between sat and msat
-        should be handled consistently across the simulator
-        and routing modules.
+    fee_rate is interpreted as proportional fee in PPM.
+
+    Supported fields:
+
+        fee_base
+        fee_base_msat
+
+        fee_rate
+        fee_proportional_millionths
+
+    The original numerical unit convention of the dataset
+    is preserved. Unit conversion between sat and msat must
+    be handled consistently by the caller and simulator.
     """
 
-    amount = float(amount)
+    amount = _validate_amount(
+        amount
+    )
 
-    fee_base = float(
+    fee_base = _safe_float(
         data.get(
             "fee_base",
             data.get(
                 "fee_base_msat",
-                0.0
-            )
-        )
+                0.0,
+            ),
+        ),
+        default=0.0,
     )
 
-    fee_rate = float(
+    fee_rate = _safe_float(
         data.get(
             "fee_rate",
             data.get(
                 "fee_proportional_millionths",
-                0.0
-            )
+                0.0,
+            ),
+        ),
+        default=0.0,
+    )
+
+    # Invalid negative fee parameters are not meaningful.
+    fee_base = max(
+        0.0,
+        fee_base,
+    )
+
+    fee_rate = max(
+        0.0,
+        fee_rate,
+    )
+
+    fee = (
+        fee_base
+        +
+        (
+            fee_rate
+            *
+            amount
+            /
+            1_000_000.0
         )
     )
 
-    return (
-        fee_base
-        +
-        fee_rate * amount / 1_000_000.0
+    return float(
+        max(
+            0.0,
+            fee,
+        )
     )
 
 
 # ==========================================================
-# Liquidity
+# Directional Liquidity
+# ==========================================================
+
+def estimated_liquidity(data):
+    """
+    Return known directional liquidity.
+
+    Priority:
+
+        1. estimated_liquidity
+        2. liquidity_uv
+        3. balance_uv
+
+    Important:
+
+        capacity is NEVER used as liquidity.
+
+    Returns:
+
+        float
+            Known directional liquidity.
+
+        None
+            Liquidity is unknown.
+    """
+
+    for field in (
+        "estimated_liquidity",
+        "liquidity_uv",
+        "balance_uv",
+    ):
+
+        if field not in data:
+            continue
+
+        value = data.get(
+            field
+        )
+
+        if value is None:
+            continue
+
+        try:
+            value = float(value)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        if (
+            math.isfinite(value)
+            and
+            value >= 0.0
+        ):
+            return value
+
+    return None
+
+
+# ==========================================================
+# Liquidity Feasibility
+# ==========================================================
+
+def liquidity_available(data, amount):
+    """
+    Check whether known directional liquidity can carry
+    the requested payment.
+
+    Cases:
+
+        known liquidity < amount
+            -> False
+
+        known liquidity >= amount
+            -> True
+
+        unknown liquidity
+            -> True
+
+    Unknown liquidity is NOT interpreted as zero.
+    """
+
+    amount = _validate_amount(
+        amount
+    )
+
+    liquidity = estimated_liquidity(
+        data
+    )
+
+    if liquidity is None:
+        return True
+
+    return (
+        liquidity >= amount
+    )
+
+
+# ==========================================================
+# Liquidity Penalty
 # ==========================================================
 
 def liquidity_penalty(data, amount):
     """
-    Optional liquidity penalty.
+    Calculate optional liquidity pressure.
+
+    Formula:
+
+        amount / estimated_liquidity
+
+    If liquidity is unknown:
+
+        0.0
+
+    If known liquidity is zero:
+
+        inf
 
     Important:
-        Channel capacity is NOT interpreted as directional
-        liquidity.
 
-    Only learned or observed directional liquidity can be used.
-
-    Priority:
-        1. estimated_liquidity
-        2. liquidity_uv
-        3. balance_uv
-        4. unknown
+        capacity is never used as liquidity.
     """
 
-    estimated_liquidity = data.get(
-        "estimated_liquidity",
-        data.get(
-            "liquidity_uv",
-            data.get(
-                "balance_uv",
-                None
-            )
-        )
+    amount = _validate_amount(
+        amount
     )
 
-    # Liquidity is unknown.
-    # Unknown does not mean zero.
-    if estimated_liquidity is None:
+    liquidity = estimated_liquidity(
+        data
+    )
+
+    # Unknown liquidity is not equivalent to zero.
+    if liquidity is None:
         return 0.0
 
-    estimated_liquidity = float(
-        estimated_liquidity
-    )
-
-    if estimated_liquidity <= 0:
+    if liquidity <= 0.0:
         return math.inf
 
-    return (
-        float(amount)
+    return float(
+        amount
         /
-        estimated_liquidity
+        liquidity
     )
 
 
@@ -112,41 +366,134 @@ def reliability_penalty(data):
     """
     Estimate channel failure probability.
 
-    If empirical success/failure observations exist,
-    use the observed failure ratio.
+    If empirical observations exist:
 
-    Otherwise use the initial failure probability prior.
+        failure /
+        (success + failure)
+
+    Otherwise:
+
+        failure_probability
+
+    Otherwise:
+
+        0.01
+
+    Return value is always clipped to [0,1].
     """
 
-    success = float(
+    success = _safe_float(
         data.get(
             "success_count",
-            0
-        )
+            0,
+        ),
+        default=0.0,
     )
 
-    failure = float(
+    failure = _safe_float(
         data.get(
             "failure_count",
-            0
-        )
+            0,
+        ),
+        default=0.0,
     )
 
-    total = success + failure
+    success = max(
+        0.0,
+        success,
+    )
 
-    if total > 0:
+    failure = max(
+        0.0,
+        failure,
+    )
 
-        return (
+    total = (
+        success
+        +
+        failure
+    )
+
+    if total > 0.0:
+
+        probability = (
             failure
             /
             total
         )
 
-    return float(
-        data.get(
-            "failure_probability",
-            0.01
+    else:
+
+        probability = _safe_float(
+            data.get(
+                "failure_probability",
+                0.01,
+            ),
+            default=0.01,
         )
+
+    return float(
+        min(
+            max(
+                probability,
+                0.0,
+            ),
+            1.0,
+        )
+    )
+
+
+# ==========================================================
+# Channel Reliability
+# ==========================================================
+
+def channel_reliability(data):
+    """
+    Return estimated forwarding reliability.
+
+    reliability =
+        1 - failure_probability
+    """
+
+    probability = reliability_penalty(
+        data
+    )
+
+    return float(
+        1.0
+        -
+        probability
+    )
+
+
+# ==========================================================
+# Channel Delay
+# ==========================================================
+
+def channel_delay(data):
+    """
+    Extract channel forwarding delay.
+
+    Supported attributes:
+
+        delay
+        cltv_expiry_delta
+    """
+
+    delay = _safe_float(
+        data.get(
+            "delay",
+            data.get(
+                "cltv_expiry_delta",
+                0.0,
+            ),
+        ),
+        default=0.0,
+    )
+
+    return max(
+        0.0,
+        delay,
     )
 
 
@@ -155,47 +502,56 @@ def reliability_penalty(data):
 # ==========================================================
 
 def lnd_cost(
-        G,
-        u,
-        v,
-        data,
-        amount
+    G,
+    u,
+    v,
+    data,
+    amount,
 ):
     """
     Native LND-like routing cost.
 
-    C_LND(e) =
-        forwarding_fee
-        + 0.5 * delay
-        + 1
+    Formula:
 
-    PPO does not directly select a route.
+        C_LND(e) =
+            forwarding_fee
+            +
+            0.5 * delay
+            +
+            1
 
-    PPO produces eta, which is subsequently used by the
-    adaptive heuristic to modify this native routing cost.
+    PPO does not directly select the route.
+
+    PPO produces eta, which is subsequently used by
+    adaptive_heuristic() to modify this base cost.
     """
 
-    fee = channel_fee(
-        data,
+    amount = _validate_amount(
         amount
     )
 
-    delay = float(
-        data.get(
-            "delay",
-            data.get(
-                "cltv_expiry_delta",
-                0.0
-            )
-        )
+    fee = channel_fee(
+        data,
+        amount,
     )
 
-    return (
+    delay = channel_delay(
+        data
+    )
+
+    cost = (
         fee
         +
         0.5 * delay
         +
         1.0
+    )
+
+    return float(
+        max(
+            1e-9,
+            cost,
+        )
     )
 
 
@@ -204,39 +560,46 @@ def lnd_cost(
 # ==========================================================
 
 def cln_cost(
-        G,
-        u,
-        v,
-        data,
-        amount
+    G,
+    u,
+    v,
+    data,
+    amount,
 ):
     """
     CLN-like routing cost.
 
-    Used only for baseline comparison.
+    This function is retained for baseline comparison.
+
+    It is not the main PPO adaptive routing cost.
     """
 
-    fee = channel_fee(
-        data,
+    amount = _validate_amount(
         amount
     )
 
-    delay = float(
-        data.get(
-            "delay",
-            data.get(
-                "cltv_expiry_delta",
-                0.0
-            )
-        )
+    fee = channel_fee(
+        data,
+        amount,
     )
 
-    return (
+    delay = channel_delay(
+        data
+    )
+
+    cost = (
         fee
         +
         delay
         +
         0.7
+    )
+
+    return float(
+        max(
+            1e-9,
+            cost,
+        )
     )
 
 
@@ -245,39 +608,46 @@ def cln_cost(
 # ==========================================================
 
 def ecl_cost(
-        G,
-        u,
-        v,
-        data,
-        amount
+    G,
+    u,
+    v,
+    data,
+    amount,
 ):
     """
     ECL-like routing cost.
 
-    Used only for baseline comparison.
+    This function is retained for baseline comparison.
+
+    It is not the main PPO adaptive routing cost.
     """
 
-    fee = channel_fee(
-        data,
+    amount = _validate_amount(
         amount
     )
 
-    delay = float(
-        data.get(
-            "delay",
-            data.get(
-                "cltv_expiry_delta",
-                0.0
-            )
-        )
+    fee = channel_fee(
+        data,
+        amount,
     )
 
-    return (
+    delay = channel_delay(
+        data
+    )
+
+    cost = (
         fee
         +
         0.8 * delay
         +
         1.3
+    )
+
+    return float(
+        max(
+            1e-9,
+            cost,
+        )
     )
 
 
@@ -286,25 +656,23 @@ def ecl_cost(
 # ==========================================================
 
 def node_carbon_intensity(
-        G,
-        node
+    G,
+    node,
 ):
     """
-    Return the numeric carbon-intensity value of a node.
+    Return numeric carbon intensity of a node.
 
     Modeling rule:
 
         carbon_intensity(node) = rgb_color(node)
 
-    Larger rgb_color means higher carbon intensity.
-
-    The graph_builder stores the original rgb_color attribute
-    and also mirrors it into carbon_intensity.
-
     Priority:
+
         1. rgb_color
         2. carbon_intensity
         3. 0.0
+
+    The function does not modify the graph.
     """
 
     if node not in G:
@@ -313,48 +681,69 @@ def node_carbon_intensity(
             f"Node {node} does not exist in graph."
         )
 
-    node_data = G.nodes[node]
+    node_data = G.nodes[
+        node
+    ]
 
-    # Primary source:
-    # rgb_color from the dataset.
+    # ------------------------------------------------------
+    # Primary source: rgb_color
+    # ------------------------------------------------------
+
     rgb_value = node_data.get(
         "rgb_color",
-        None
+        None,
     )
 
     if rgb_value is not None:
 
         try:
 
-            return float(
+            rgb_value = float(
                 rgb_value
             )
 
+            if math.isfinite(
+                rgb_value
+            ):
+                return float(
+                    rgb_value
+                )
+
         except (
             TypeError,
-            ValueError
+            ValueError,
         ):
-
             pass
 
-    # Backward compatibility.
+    # ------------------------------------------------------
+    # Compatibility fallback
+    # ------------------------------------------------------
+
     carbon_value = node_data.get(
         "carbon_intensity",
-        0.0
+        0.0,
     )
 
     try:
 
-        return float(
+        carbon_value = float(
             carbon_value
         )
 
+        if math.isfinite(
+            carbon_value
+        ):
+            return float(
+                carbon_value
+            )
+
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
+        pass
 
-        return 0.0
+    return 0.0
 
 
 # ==========================================================
@@ -362,46 +751,45 @@ def node_carbon_intensity(
 # ==========================================================
 
 def adaptive_heuristic(
-        G,
-        u,
-        v,
-        eta
+    G,
+    u,
+    v,
+    eta,
 ):
     """
-    Adaptive routing heuristic defined by the README.
+    Adaptive routing heuristic.
 
-    h(u,v) =
-        eta * ((intCO2[u] + intCO2[v]) / 2)
-        +
-        (1 - eta) * (intCO2[v] - intCO2[u])
+    README formulation:
 
-    Carbon intensity is obtained directly from rgb_color.
+        h(u,v) =
+            eta * ((C_u + C_v) / 2)
+            +
+            (1 - eta) * (C_v - C_u)
 
-    eta is dynamically produced by PPO.
+    where:
+
+        C_u = carbon intensity of u
+        C_v = carbon intensity of v
+
+    eta is dynamically generated by PPO.
 
     Valid range:
 
         -1 <= eta <= 1
     """
 
-    eta = float(
+    eta = _validate_eta(
         eta
     )
 
-    if not -1.0 <= eta <= 1.0:
-
-        raise ValueError(
-            f"eta must be in [-1, 1], got {eta}"
-        )
-
     carbon_u = node_carbon_intensity(
         G,
-        u
+        u,
     )
 
     carbon_v = node_carbon_intensity(
         G,
-        v
+        v,
     )
 
     average_carbon = (
@@ -416,16 +804,29 @@ def adaptive_heuristic(
         carbon_u
     )
 
-    h = (
-        eta * average_carbon
+    heuristic = (
+        eta
+        *
+        average_carbon
         +
-        (1.0 - eta)
+        (
+            1.0
+            -
+            eta
+        )
         *
         carbon_difference
     )
 
+    if not math.isfinite(
+        heuristic
+    ):
+        raise ValueError(
+            "Adaptive heuristic produced a non-finite value."
+        )
+
     return float(
-        h
+        heuristic
     )
 
 
@@ -434,62 +835,82 @@ def adaptive_heuristic(
 # ==========================================================
 
 def geographic_penalty(
-        G,
-        u,
-        v,
-        data=None
+    G,
+    u,
+    v,
+    data=None,
 ):
     """
-    Return geographic information of an edge.
+    Return geographic information for an edge.
 
-    This function is kept for compatibility with existing
-    evaluation code.
+    This function is retained for compatibility.
 
     It is NOT the adaptive routing heuristic.
 
     The adaptive routing heuristic is implemented separately
-    in adaptive_heuristic().
+    by adaptive_heuristic().
     """
 
-    features = geo_features(
-        G,
-        u,
-        v
-    )
+    try:
+
+        features = geo_features(
+            G,
+            u,
+            v,
+        )
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ):
+
+        features = {}
 
     return {
 
         "distance_km":
-            float(
-                features.get(
-                    "distance_km",
-                    0.0
-                )
+            max(
+                0.0,
+                _safe_float(
+                    features.get(
+                        "distance_km",
+                        0.0,
+                    )
+                ),
             ),
 
         "carbon_intensity":
-            float(
-                features.get(
-                    "carbon_intensity",
-                    0.0
-                )
+            max(
+                0.0,
+                _safe_float(
+                    features.get(
+                        "carbon_intensity",
+                        0.0,
+                    )
+                ),
             ),
 
         "inter_country":
             float(
-                features.get(
-                    "inter_country",
-                    0.0
+                bool(
+                    features.get(
+                        "inter_country",
+                        False,
+                    )
                 )
             ),
 
         "inter_continent":
             float(
-                features.get(
-                    "inter_continent",
-                    0.0
+                bool(
+                    features.get(
+                        "inter_continent",
+                        False,
+                    )
                 )
-            )
+            ),
     }
 
 
@@ -498,74 +919,117 @@ def geographic_penalty(
 # ==========================================================
 
 def modified_cost(
-        native_cost,
-        geo_penalty,
-        eta,
-        lambda_h=1.0
+    native_cost,
+    geo_penalty,
+    eta,
+    lambda_h=1.0,
 ):
     """
-    Calculate the final adaptive routing cost.
+    Calculate adaptive routing cost.
 
-    C'(e) =
-        C_LND(e)
-        +
-        lambda_h * h(e)
+    Formula:
 
-    Here geo_penalty is retained as the historical parameter
-    name for compatibility, but its actual meaning is:
+        C'(e) =
+            C_LND(e)
+            +
+            lambda_h * h(e)
 
-        geo_penalty = adaptive heuristic h(e)
+    Parameters
+    ----------
+    native_cost:
+        Native LND-like edge cost.
 
-    eta is validated here because the modified cost belongs
-    to the adaptive routing mechanism.
+    geo_penalty:
+        Historical parameter name.
+
+        In the current model this value is actually the
+        adaptive heuristic h(e).
+
+    eta:
+        PPO-generated adaptive coefficient.
+
+    lambda_h:
+        Weight assigned to adaptive heuristic.
+
+    Important:
+        Routing algorithms require non-negative edge costs.
+        Therefore the final cost is clipped to a very small
+        positive value if the adaptive term makes it <= 0.
     """
 
-    eta = float(
+    native_cost = _safe_float(
+        native_cost,
+        default=float("nan"),
+    )
+
+    if not math.isfinite(
+        native_cost
+    ):
+        raise ValueError(
+            "native_cost must be finite."
+        )
+
+    if native_cost < 0.0:
+        raise ValueError(
+            "native_cost must be non-negative."
+        )
+
+    h = _safe_float(
+        geo_penalty,
+        default=float("nan"),
+    )
+
+    if not math.isfinite(
+        h
+    ):
+        raise ValueError(
+            "adaptive heuristic must be finite."
+        )
+
+    eta = _validate_eta(
         eta
     )
 
-    if not -1.0 <= eta <= 1.0:
-
-        raise ValueError(
-            f"eta must be in [-1, 1], got {eta}"
-        )
-
-    h = float(
-        geo_penalty
-    )
-
-    lambda_h = float(
+    lambda_h = _validate_lambda_h(
         lambda_h
     )
 
     cost = (
-        float(native_cost)
+        native_cost
         +
         lambda_h * h
     )
 
-    # Routing costs must remain positive.
-    return max(
-        1e-9,
+    if not math.isfinite(
         cost
+    ):
+        raise ValueError(
+            "modified routing cost is not finite."
+        )
+
+    return float(
+        max(
+            1e-9,
+            cost,
+        )
     )
 
 
 # ==========================================================
-# Complete Adaptive Edge Cost
+# Complete Adaptive LND Cost
 # ==========================================================
 
 def adaptive_lnd_cost(
-        G,
-        u,
-        v,
-        data,
-        amount,
-        eta,
-        lambda_h=1.0
+    G,
+    u,
+    v,
+    data,
+    amount,
+    eta,
+    lambda_h=1.0,
 ):
     """
-    Complete PPO + adaptive heuristic + LND routing cost.
+    Complete PPO + adaptive heuristic + LND cost.
 
     Flow:
 
@@ -578,13 +1042,13 @@ def adaptive_lnd_cost(
         rgb_color
          |
          v
-        adaptive heuristic h(u,v)
+    adaptive_heuristic()
          |
          v
-        C_LND + lambda_h * h
+    modified_cost()
          |
          v
-        Dijkstra
+       Dijkstra
     """
 
     base_cost = lnd_cost(
@@ -592,21 +1056,21 @@ def adaptive_lnd_cost(
         u,
         v,
         data,
-        amount
+        amount,
     )
 
-    h = adaptive_heuristic(
+    heuristic = adaptive_heuristic(
         G,
         u,
         v,
-        eta
+        eta,
     )
 
     return modified_cost(
         native_cost=base_cost,
-        geo_penalty=h,
+        geo_penalty=heuristic,
         eta=eta,
-        lambda_h=lambda_h
+        lambda_h=lambda_h,
     )
 
 
@@ -615,21 +1079,44 @@ def adaptive_lnd_cost(
 # ==========================================================
 
 def enhanced_cost(
-        G,
-        u,
-        v,
-        data,
-        amount,
-        fee_weight=1.0,
-        liquidity_weight=0.5,
-        reliability_weight=0.5
+    G,
+    u,
+    v,
+    data,
+    amount,
+    fee_weight=1.0,
+    liquidity_weight=0.5,
+    reliability_weight=0.5,
 ):
     """
     Extended routing cost for auxiliary experiments.
 
-    This is NOT the main PPO adaptive heuristic defined
-    in the README.
+    Important:
+
+        This is NOT the main PPO adaptive routing cost.
+
+    It is provided only for experiments where fee,
+    liquidity pressure and reliability are jointly evaluated.
     """
+
+    amount = _validate_amount(
+        amount
+    )
+
+    fee_weight = _safe_float(
+        fee_weight,
+        default=1.0,
+    )
+
+    liquidity_weight = _safe_float(
+        liquidity_weight,
+        default=0.5,
+    )
+
+    reliability_weight = _safe_float(
+        reliability_weight,
+        default=0.5,
+    )
 
     base = (
         fee_weight
@@ -639,13 +1126,13 @@ def enhanced_cost(
             u,
             v,
             data,
-            amount
+            amount,
         )
     )
 
     liquidity = liquidity_penalty(
         data,
-        amount
+        amount,
     )
 
     reliability = reliability_penalty(
@@ -655,15 +1142,30 @@ def enhanced_cost(
     if math.isinf(
         liquidity
     ):
-
         return math.inf
 
-    return (
+    result = (
         base
         +
-        liquidity_weight * liquidity
+        liquidity_weight
+        *
+        liquidity
         +
-        reliability_weight * reliability
+        reliability_weight
+        *
+        reliability
+    )
+
+    if not math.isfinite(
+        result
+    ):
+        return math.inf
+
+    return float(
+        max(
+            1e-9,
+            result,
+        )
     )
 
 
@@ -672,27 +1174,55 @@ def enhanced_cost(
 # ==========================================================
 
 def evaluate_path(
-        G,
-        edges,
-        amount
+    G,
+    edges,
+    amount,
 ):
     """
-    Calculate complete metrics for a route.
+    Calculate complete metrics for a selected route.
 
-    Liquidity is based only on known/learned directional
-    liquidity.
+    Parameters
+    ----------
+    G:
+        NetworkX graph.
 
-    Snapshot capacity is never interpreted as directional
-    balance.
+    edges:
+        Iterable of:
 
-    Returned metrics:
+            (u, v, key)
+
+        for MultiDiGraph.
+
+    amount:
+        Payment amount.
+
+    Returns
+    -------
+    dict
+
         fee
         delay
         min_liquidity
         reliability
         distance_km
         carbon_intensity
+
+    Important:
+
+        Unknown liquidity is ignored when calculating
+        min_liquidity.
+
+        capacity is never treated as liquidity.
     """
+
+    amount = _validate_amount(
+        amount
+    )
+
+    if edges is None:
+        raise ValueError(
+            "edges cannot be None."
+        )
 
     total_fee = 0.0
     total_delay = 0.0
@@ -704,9 +1234,42 @@ def evaluate_path(
     total_distance = 0.0
     total_carbon = 0.0
 
-    for u, v, k in edges:
+    # ======================================================
+    # Evaluate each route edge
+    # ======================================================
 
-        data = G[u][v][k]
+    for edge in edges:
+
+        if len(edge) != 3:
+            raise ValueError(
+                "Each route edge must be (u, v, key)."
+            )
+
+        u, v, key = edge
+
+        # --------------------------------------------------
+        # Retrieve channel data
+        # --------------------------------------------------
+
+        try:
+
+            if key is None:
+
+                # Simple graph / compatibility mode.
+                data = G[u][v]
+
+            else:
+
+                data = G[u][v][key]
+
+        except (
+            KeyError,
+            TypeError,
+        ):
+
+            raise ValueError(
+                f"Channel ({u}, {v}, {key}) does not exist."
+            )
 
         # --------------------------------------------------
         # Fee
@@ -714,81 +1277,55 @@ def evaluate_path(
 
         total_fee += channel_fee(
             data,
-            amount
+            amount,
         )
 
         # --------------------------------------------------
         # Delay
         # --------------------------------------------------
 
-        total_delay += float(
-            data.get(
-                "delay",
-                data.get(
-                    "cltv_expiry_delta",
-                    0.0
-                )
-            )
+        total_delay += channel_delay(
+            data
         )
 
         # --------------------------------------------------
-        # Learned / observed directional liquidity
+        # Directional liquidity
         # --------------------------------------------------
 
-        estimated_liquidity = data.get(
-            "estimated_liquidity",
-            data.get(
-                "liquidity_uv",
-                data.get(
-                    "balance_uv",
-                    None
-                )
-            )
+        liquidity = estimated_liquidity(
+            data
         )
 
-        if estimated_liquidity is not None:
+        if liquidity is not None:
 
-            try:
-
-                known_liquidities.append(
-                    float(
-                        estimated_liquidity
-                    )
+            known_liquidities.append(
+                float(
+                    liquidity
                 )
-
-            except (
-                TypeError,
-                ValueError
-            ):
-
-                pass
+            )
 
         # --------------------------------------------------
         # Reliability
         # --------------------------------------------------
 
-        failure_probability = reliability_penalty(
-            data
+        failure_probability = (
+            reliability_penalty(
+                data
+            )
         )
 
-        failure_probability = min(
-            max(
-                float(
-                    failure_probability
-                ),
-                0.0
-            ),
-            1.0
-        )
-
-        reliability *= (
+        channel_reliability = (
             1.0
             -
             failure_probability
         )
 
+        reliability *= (
+            channel_reliability
+        )
+
         # --------------------------------------------------
-        # Geographic / carbon metrics
+        # Geographic information
         # --------------------------------------------------
 
         try:
@@ -796,28 +1333,46 @@ def evaluate_path(
             features = geo_features(
                 G,
                 u,
-                v
+                v,
             )
 
-            total_distance += float(
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            AttributeError,
+        ):
+
+            features = {}
+
+        total_distance += max(
+            0.0,
+            _safe_float(
                 features.get(
                     "distance_km",
-                    0.0
+                    0.0,
                 )
-            )
+            ),
+        )
 
-            # Use the node-based rgb_color values directly
-            # rather than relying on a separately invented
-            # carbon value in the topology module.
+        # --------------------------------------------------
+        # Carbon
+        #
+        # Carbon is calculated from endpoint node
+        # intensities rather than treating channel capacity
+        # or another channel attribute as carbon.
+        # --------------------------------------------------
+
+        try:
 
             carbon_u = node_carbon_intensity(
                 G,
-                u
+                u,
             )
 
             carbon_v = node_carbon_intensity(
                 G,
-                v
+                v,
             )
 
             total_carbon += (
@@ -829,14 +1384,22 @@ def evaluate_path(
         except (
             KeyError,
             TypeError,
-            ValueError
+            ValueError,
         ):
 
-            pass
+            total_carbon += max(
+                0.0,
+                _safe_float(
+                    features.get(
+                        "carbon_intensity",
+                        0.0,
+                    )
+                ),
+            )
 
-    # ------------------------------------------------------
+    # ======================================================
     # Minimum Known Liquidity
-    # ------------------------------------------------------
+    # ======================================================
 
     if known_liquidities:
 
@@ -848,23 +1411,52 @@ def evaluate_path(
 
         min_liquidity = None
 
+    # ======================================================
+    # Final Result
+    # ======================================================
+
     return {
 
         "fee":
-            total_fee,
+            float(
+                total_fee
+            ),
 
         "delay":
-            total_delay,
+            float(
+                total_delay
+            ),
 
         "min_liquidity":
-            min_liquidity,
+            (
+                None
+                if min_liquidity is None
+                else float(
+                    min_liquidity
+                )
+            ),
 
         "reliability":
-            reliability,
+            float(
+                min(
+                    max(
+                        reliability,
+                        0.0,
+                    ),
+                    1.0,
+                )
+            ),
 
         "distance_km":
-            total_distance,
+            float(
+                total_distance
+            ),
 
         "carbon_intensity":
-            total_carbon
+            float(
+                max(
+                    0.0,
+                    total_carbon,
+                )
+            ),
     }

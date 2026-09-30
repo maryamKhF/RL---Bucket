@@ -8,19 +8,18 @@ from .node import Node
 from .channel import Channel
 
 
-
 class LNGraphBuilder:
     """
     Builds a NetworkX MultiDiGraph
     from:
         1. Real Lightning Network JSON snapshot
-        2. Synthetic Lightning topology
+        2. In-memory JSON-like data
+        3. Synthetic Lightning topology
     """
 
-
-    # =====================================================
-    # Load Real LN Snapshot
-    # =====================================================
+   
+    # Load Real LN Snapshot from JSON File
+    
 
     def from_json(self, path):
 
@@ -31,6 +30,14 @@ class LNGraphBuilder:
             )
         )
 
+        return self.from_data(data)
+
+
+    
+    # Load Real LN Snapshot from In-Memory Data
+   
+
+    def from_data(self, data):
 
         G = nx.MultiDiGraph()
 
@@ -53,24 +60,64 @@ class LNGraphBuilder:
         )
 
 
-        # -----------------------------
         # Add Nodes
-        # -----------------------------
+        
 
         for n in nodes:
 
-
-            nid = str(
+            nid = n.get(
+                "node_id",
                 n.get(
-                    "node_id",
-                    n.get("id")
+                    "id"
                 )
             )
 
 
-            if not nid:
+            if nid is None:
                 continue
 
+
+            nid = str(
+                nid
+            )
+
+
+            # Node attributes
+
+            latitude = n.get(
+                "latitude",
+                n.get(
+                    "lat",
+                    0.0
+                )
+            )
+
+
+            longitude = n.get(
+                "longitude",
+                n.get(
+                    "lon",
+                    0.0
+                )
+            )
+
+
+            country = n.get(
+                "country",
+                "US"
+            )
+
+
+            carbon_intensity = n.get(
+                "carbon_intensity",
+                300.0
+            )
+
+
+            online = n.get(
+                "online",
+                True
+            )
 
 
             node = Node(
@@ -78,62 +125,59 @@ class LNGraphBuilder:
                 node_id=nid,
 
                 country=str(
-                    n.get(
-                        "country",
-                        "US"
-                    )
+                    country
                 ),
 
                 latitude=float(
-                    n.get(
-                        "latitude",
-                        n.get("lat",0.0)
-                    )
+                    latitude
                 ),
 
                 longitude=float(
-                    n.get(
-                        "longitude",
-                        n.get("lon",0.0)
-                    )
+                    longitude
                 ),
 
                 carbon_intensity=float(
-                    n.get(
-                        "carbon_intensity",
-                        300.0
-                    )
+                    carbon_intensity
                 ),
 
                 online=bool(
-                    n.get(
-                        "online",
-                        True
-                    )
+                    online
                 )
             )
 
 
             G.add_node(
+
                 nid,
+
                 **node.__dict__
+
             )
 
 
-
-        # -----------------------------
         # Add Channels
-        # -----------------------------
 
-        for i,e in enumerate(channels):
+        for i, e in enumerate(channels):
+
+            source = e.get(
+                "source"
+            )
+
+            target = e.get(
+                "target"
+            )
+
+
+            if source is None or target is None:
+                continue
 
 
             u = str(
-                e["source"]
+                source
             )
 
             v = str(
-                e["target"]
+                target
             )
 
 
@@ -145,79 +189,169 @@ class LNGraphBuilder:
                 continue
 
 
+            # Capacity
 
-            capacity = float(
+            capacity = e.get(
+                "capacity",
                 e.get(
-                    "capacity",
+                    "capacity_sat",
                     1_000_000
                 )
             )
 
 
+            capacity = float(
+                capacity
+            )
 
-            channel = Channel(
 
-                channel_id=str(
-                    e.get(
-                        "channel_id",
-                        f"ch-{i}"
-                    )
-                ),
+            
+            # Channel ID
+            #
+            # Real LN snapshot:
+            # scid -> channel_id
 
-                capacity=capacity,
-
-                fee_base=float(
-                    e.get(
-                        "fee_base",
-                        1000
-                    )
-                ),
-
-                fee_rate=float(
-                    e.get(
-                        "fee_rate",
-                        10
-                    )
-                ),
-
-                delay=float(
-                    e.get(
-                        "delay",
-                        1.0
-                    )
-                ),
-
-                failure_probability=float(
-                    e.get(
-                        "failure_probability",
-                        0.01
-                    )
-                ),
-
-                available=bool(
-                    e.get(
-                        "available",
-                        True
-                    )
-                ),
-
-                balance_uv=float(
-                    e.get(
-                        "balance_uv",
-                        capacity/2
-                    )
-                ),
-
-                balance_vu=float(
-                    e.get(
-                        "balance_vu",
-                        capacity/2
-                    )
+            channel_id = e.get(
+                "channel_id",
+                e.get(
+                    "scid",
+                    f"ch-{i}"
                 )
             )
 
 
-            # u -> v
+            channel_id = str(
+                channel_id
+            )
+
+
+            # Base Fee
+            #
+            # fee_base_msat -> fee_base
+
+            fee_base = e.get(
+                "fee_base",
+                e.get(
+                    "fee_base_msat",
+                    1000
+                )
+            )
+
+
+            fee_base = float(
+                fee_base
+            )
+
+
+            # Fee Rate
+            #
+            # fee_proportional_millionths -> fee_rate
+
+            fee_rate = e.get(
+                "fee_rate",
+                e.get(
+                    "fee_proportional_millionths",
+                    10
+                )
+            )
+
+
+            fee_rate = float(
+                fee_rate
+            )
+
+
+            # Delay
+            #
+            # cltv_expiry_delta -> delay
+
+            delay = e.get(
+                "delay",
+                e.get(
+                    "cltv_expiry_delta",
+                    1.0
+                )
+            )
+
+
+            delay = float(
+                delay
+            )
+
+
+            # Failure Probability
+
+            failure_probability = e.get(
+                "failure_probability",
+                0.01
+            )
+
+
+            failure_probability = float(
+                failure_probability
+            )
+
+
+            # Availability
+
+            available = e.get(
+                "available",
+                True
+            )
+
+
+            # Balances
+
+            balance_uv = e.get(
+                "balance_uv",
+                capacity / 2
+            )
+
+
+            balance_vu = e.get(
+                "balance_vu",
+                capacity / 2
+            )
+
+
+            balance_uv = float(
+                balance_uv
+            )
+
+
+            balance_vu = float(
+                balance_vu
+            )
+
+
+            # Create Channel
+
+            channel = Channel(
+
+                channel_id=channel_id,
+
+                capacity=capacity,
+
+                fee_base=fee_base,
+
+                fee_rate=fee_rate,
+
+                delay=delay,
+
+                failure_probability=failure_probability,
+
+                available=bool(
+                    available
+                ),
+
+                balance_uv=balance_uv,
+
+                balance_vu=balance_vu
+
+            )
+
+
+            # Forward Channel: u -> v
 
             G.add_edge(
 
@@ -232,7 +366,7 @@ class LNGraphBuilder:
             )
 
 
-            # v -> u
+            # Reverse Channel: v -> u
 
             reverse_channel = {
 
@@ -266,19 +400,14 @@ class LNGraphBuilder:
         return G
 
 
-
-    # =====================================================
     # Synthetic LN Generator
-    # =====================================================
-
 
     def synthetic(
-            self,
-            n=250,
-            extra_edges=500,
-            seed=42
+        self,
+        n=250,
+        extra_edges=500,
+        seed=42
     ):
-
 
         rng = np.random.default_rng(
             seed
@@ -301,10 +430,7 @@ class LNGraphBuilder:
         ]
 
 
-
-        # ---------------------------------
         # Create Scale-Free topology
-        # ---------------------------------
 
         base_graph = nx.barabasi_albert_graph(
 
@@ -314,7 +440,7 @@ class LNGraphBuilder:
                 2,
                 min(
                     5,
-                    n-1
+                    n - 1
                 )
             ),
 
@@ -326,17 +452,14 @@ class LNGraphBuilder:
         G = nx.MultiDiGraph()
 
 
-
         # Add bidirectional channels
 
-        for u,v in base_graph.edges():
-
+        for u, v in base_graph.edges():
 
             G.add_edge(
                 int(u),
                 int(v)
             )
-
 
             G.add_edge(
                 int(v),
@@ -344,13 +467,13 @@ class LNGraphBuilder:
             )
 
 
-
         # Add extra random connections
 
-        for _ in range(extra_edges):
+        for _ in range(
+            extra_edges
+        ):
 
-
-            u,v = rng.choice(
+            u, v = rng.choice(
 
                 n,
 
@@ -366,24 +489,21 @@ class LNGraphBuilder:
                 int(v)
             )
 
-
             G.add_edge(
                 int(v),
                 int(u)
             )
 
 
-
-        # ---------------------------------
         # Add node attributes
-        # ---------------------------------
 
         for node_id in G.nodes:
 
-
             node = Node(
 
-                node_id=str(node_id),
+                node_id=str(
+                    node_id
+                ),
 
                 country=str(
                     rng.choice(
@@ -417,24 +537,22 @@ class LNGraphBuilder:
             )
 
 
-            G.nodes[node_id].update(
+            G.nodes[
+                node_id
+            ].update(
                 node.__dict__
             )
 
 
-
-        # ---------------------------------
         # Add channel attributes
-        # ---------------------------------
 
-        for idx,(u,v,k) in enumerate(
-                G.edges(
-                    keys=True
-                )
+        for idx, (u, v, k) in enumerate(
+            G.edges(
+                keys=True
+            )
         ):
 
-
-            capacity=float(
+            capacity = float(
                 rng.lognormal(
                     np.log(300000),
                     0.8
@@ -473,9 +591,9 @@ class LNGraphBuilder:
 
                 available=True,
 
-                balance_uv=capacity/2,
+                balance_uv=capacity / 2,
 
-                balance_vu=capacity/2,
+                balance_vu=capacity / 2,
 
                 failure_count=0,
 
@@ -484,34 +602,31 @@ class LNGraphBuilder:
             )
 
 
-            G.edges[u,v,k].update(
+            G.edges[
+                u,
+                v,
+                k
+            ].update(
                 channel.__dict__
             )
-
 
 
         return G
 
 
-
-    # =====================================================
     # Utility Functions
-    # =====================================================
 
-
-    def number_of_nodes(self,G):
+    def number_of_nodes(self, G):
 
         return G.number_of_nodes()
 
 
-
-    def number_of_channels(self,G):
+    def number_of_channels(self, G):
 
         return G.number_of_edges()
 
 
-
-    def summary(self,G):
+    def summary(self, G):
 
         print(
             "Lightning Network Graph"
@@ -524,3 +639,4 @@ class LNGraphBuilder:
         print(
             f"Channels: {G.number_of_edges()}"
         )
+

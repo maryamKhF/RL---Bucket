@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 from .onion import OnionRouter
@@ -12,29 +13,57 @@ class Router:
     Router
     ------
 
-    This module is responsible only for forwarding an already selected
-    route through the OnionRouter.
+    Forward an already selected route through OnionRouter.
 
-    Routing/pathfinding is NOT performed here.
+    Router is a forwarding layer only.
 
-    Responsibilities:
-        1. Validate the selected route.
-        2. Build the onion packet.
-        3. Generate/propagate route_id.
-        4. Forward the packet hop-by-hop.
-        5. Return forwarding information.
+    Responsibilities
+    ----------------
+    1. Validate the selected route.
+    2. Validate the payment amount.
+    3. Build an onion packet.
+    4. Preserve the authoritative route_id.
+    5. Forward the onion packet hop-by-hop.
+    6. Return structured forwarding information.
+    7. Rebuild and forward an alternative route/suffix.
 
-    Not responsible for:
-        - PPO
-        - Dijkstra / LND
-        - Bucket management
-        - Candidate route generation
-        - Failure probability
-        - Network state evolution
+    NOT responsible for
+    -------------------
+    - PPO
+    - Dijkstra / LND
+    - Top-K route generation
+    - Bucket management
+    - Failure probability
+    - Payment settlement
+    - Network state evolution
+    - Partial backtracking decisions
+
+    Intended flow
+    -------------
+
+        Bucket
+          |
+          | selected candidate
+          v
+        Router
+          |
+          | Onion forwarding
+          v
+        PaymentSimulator
+          |
+          v
+        FailureModel
     """
 
-    def __init__(self, onion_router: Optional[OnionRouter] = None):
-        self.onion_router = onion_router or OnionRouter()
+    def __init__(
+        self,
+        onion_router: Optional[OnionRouter] = None,
+    ):
+        self.onion_router = (
+            onion_router
+            if onion_router is not None
+            else OnionRouter()
+        )
 
     # ==========================================================
     # PUBLIC API
@@ -51,88 +80,46 @@ class Router:
         route_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Build and forward an onion packet over an already selected path.
+        Build and forward an onion packet over an already
+        selected route.
 
-        If route_id is not supplied, OnionRouter generates it.
+        The route is NOT discovered here.
 
-        The generated route_id is ALWAYS propagated to the returned
-        Router result.
+        If OnionRouter generates a route_id, the value stored
+        inside the generated packet is authoritative.
         """
 
         self._validate_path(path)
         self._validate_amount(amount)
 
-        # ------------------------------------------------------
-        # Build onion packet
-        # ------------------------------------------------------
         packet = self.onion_router.build_onion(
             path=path,
             bucket_id=bucket_id,
             tx_id=tx_id,
-            amount=amount,
+            amount=float(amount),
             metadata=metadata,
             attempt_id=attempt_id,
             route_id=route_id,
         )
 
-        # ------------------------------------------------------
-        # IMPORTANT:
-        # OnionRouter may generate route_id automatically.
-        # Therefore the authoritative value is packet["route_id"],
-        # not the original route_id argument.
-        # ------------------------------------------------------
-        generated_route_id = packet.get("route_id")
+        self._validate_packet(packet)
 
-        if not generated_route_id:
-            raise RuntimeError(
-                "OnionRouter did not generate a valid route_id."
-            )
+        generated_route_id = packet.get(
+            "route_id"
+        )
 
-        # ------------------------------------------------------
-        # Forward packet hop-by-hop
-        # ------------------------------------------------------
         forwarding = self._forward_packet(
             packet=packet,
             path=path,
         )
 
-        # ------------------------------------------------------
-        # Return unified result
-        # ------------------------------------------------------
-        result = {
-            "success": forwarding["success"],
-            "reason": forwarding.get("reason"),
-
-            "path": list(path),
-
-            "visited": forwarding.get(
-                "visited",
-                [],
-            ),
-
-            "hops": forwarding.get(
-                "hops",
-                [],
-            ),
-
-            "attempt_id": attempt_id,
-
-            # IMPORTANT FIX
-            "route_id": generated_route_id,
-
-            "source": path[0],
-            "destination": path[-1],
-            "path_length": len(path),
-
-            "destination_reached": forwarding.get(
-                "destination_reached",
-                False,
-            ),
-
-            "packet": packet,
-        }
-
-        return result
+        return self._build_result(
+            forwarding=forwarding,
+            path=path,
+            attempt_id=attempt_id,
+            route_id=generated_route_id,
+            packet=packet,
+        )
 
     # ==========================================================
     # REBUILD
@@ -149,9 +136,15 @@ class Router:
         route_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Rebuild an onion packet for a new route or alternative suffix.
+        Rebuild and forward an onion packet for an alternative
+        route or alternative suffix.
 
-        Used after Partial Backtracking.
+        This method is intended to be called after a routing
+        failure has been detected by the payment/backtracking
+        layer.
+
+        Router itself does NOT decide which alternative route
+        should be selected.
         """
 
         self._validate_path(path)
@@ -161,59 +154,33 @@ class Router:
             path=path,
             bucket_id=bucket_id,
             tx_id=tx_id,
-            amount=amount,
+            amount=float(amount),
             metadata=metadata,
             attempt_id=attempt_id,
             route_id=route_id,
         )
 
-        generated_route_id = packet.get("route_id")
+        self._validate_packet(packet)
 
-        if not generated_route_id:
-            raise RuntimeError(
-                "OnionRouter did not generate a valid route_id "
-                "during rebuild."
-            )
+        generated_route_id = packet.get(
+            "route_id"
+        )
 
         forwarding = self._forward_packet(
             packet=packet,
             path=path,
         )
 
-        return {
-            "success": forwarding["success"],
-            "reason": forwarding.get("reason"),
-
-            "path": list(path),
-
-            "visited": forwarding.get(
-                "visited",
-                [],
-            ),
-
-            "hops": forwarding.get(
-                "hops",
-                [],
-            ),
-
-            "attempt_id": attempt_id,
-
-            "route_id": generated_route_id,
-
-            "source": path[0],
-            "destination": path[-1],
-            "path_length": len(path),
-
-            "destination_reached": forwarding.get(
-                "destination_reached",
-                False,
-            ),
-
-            "packet": packet,
-        }
+        return self._build_result(
+            forwarding=forwarding,
+            path=path,
+            attempt_id=attempt_id,
+            route_id=generated_route_id,
+            packet=packet,
+        )
 
     # ==========================================================
-    # FORWARD PACKET
+    # FORWARD EXISTING PACKET
     # ==========================================================
 
     def forward_packet(
@@ -223,16 +190,31 @@ class Router:
     ) -> Dict[str, Any]:
         """
         Forward an existing onion packet over the supplied path.
+
+        This method does not rebuild the packet.
         """
 
         self._validate_path(path)
+        self._validate_packet(packet)
 
-        if not isinstance(packet, dict):
-            raise TypeError("packet must be a dictionary.")
+        route_id = packet.get(
+            "route_id"
+        )
 
-        return self._forward_packet(
+        forwarding = self._forward_packet(
             packet=packet,
             path=path,
+        )
+
+        return self._build_result(
+            forwarding=forwarding,
+            path=path,
+            attempt_id=packet.get(
+                "attempt_id",
+                0,
+            ),
+            route_id=route_id,
+            packet=packet,
         )
 
     # ==========================================================
@@ -245,28 +227,37 @@ class Router:
         path: List[Any],
     ) -> Dict[str, Any]:
         """
-        Forward the packet using OnionRouter.forward().
+        Forward one onion packet hop-by-hop.
 
-        The packet itself maintains the current onion layer.
+        OnionRouter is authoritative for the forwarding step.
+
+        Router only:
+            - passes the current packet,
+            - records forwarding results,
+            - propagates the next onion layer,
+            - detects destination arrival.
         """
 
-        visited = []
-        hops = []
+        visited: List[Any] = []
+        hops: List[Dict[str, Any]] = []
 
         current_packet = packet
 
+        destination = path[-1]
+
         try:
 
-            for node in path:
+            for hop_index, node in enumerate(path):
 
                 if current_packet is None:
-                    return {
-                        "success": False,
-                        "reason": "Onion packet exhausted before destination.",
-                        "visited": visited,
-                        "hops": hops,
-                        "destination_reached": False,
-                    }
+                    return self._failure(
+                        reason=(
+                            "Onion packet exhausted before "
+                            "destination was reached."
+                        ),
+                        visited=visited,
+                        hops=hops,
+                    )
 
                 step = self.onion_router.forward(
                     current_packet,
@@ -274,103 +265,323 @@ class Router:
                 )
 
                 if not isinstance(step, dict):
-                    return {
-                        "success": False,
-                        "reason": "Invalid OnionRouter forwarding result.",
-                        "visited": visited,
-                        "hops": hops,
-                        "destination_reached": False,
-                    }
+                    return self._failure(
+                        reason=(
+                            "Invalid OnionRouter forwarding "
+                            "result."
+                        ),
+                        visited=visited,
+                        hops=hops,
+                    )
+
+                # --------------------------------------------------
+                # Explicit forwarding failure
+                # --------------------------------------------------
 
                 if step.get("success") is False:
-                    return {
-                        "success": False,
-                        "reason": step.get(
+
+                    return self._failure(
+                        reason=step.get(
                             "reason",
                             "Onion forwarding failed.",
                         ),
-                        "visited": visited,
-                        "hops": hops,
-                        "destination_reached": False,
-                    }
+                        visited=visited,
+                        hops=hops,
+                        extra={
+                            "failed_node": node,
+                            "failure_index": hop_index,
+                        },
+                    )
 
-                visited.append(node)
+                # --------------------------------------------------
+                # Record visited node
+                # --------------------------------------------------
+
+                visited.append(
+                    step.get(
+                        "node",
+                        node,
+                    )
+                )
+
+                hop_record = {
+                    "hop_index": step.get(
+                        "hop_index",
+                        hop_index,
+                    ),
+                    "node": step.get(
+                        "node",
+                        node,
+                    ),
+                    "next_hop": step.get(
+                        "next_hop"
+                    ),
+                }
 
                 hops.append(
-                    {
-                        "hop_index": step.get(
-                            "hop_index"
-                        ),
-                        "node": step.get(
-                            "node",
-                            node,
-                        ),
-                        "next_hop": step.get(
-                            "next_hop"
-                        ),
-                    }
+                    hop_record
                 )
 
                 # --------------------------------------------------
                 # Destination reached
                 # --------------------------------------------------
-                if step.get("destination_reached") is True:
+
+                if step.get(
+                    "destination_reached"
+                ) is True:
+
+                    # The OnionRouter reports destination
+                    # reached. Make sure this corresponds to
+                    # the route destination whenever it provides
+                    # a node value.
+
+                    reached_node = step.get(
+                        "node",
+                        node,
+                    )
+
+                    if reached_node != destination:
+                        return self._failure(
+                            reason=(
+                                "OnionRouter reported destination "
+                                "reached at an unexpected node."
+                            ),
+                            visited=visited,
+                            hops=hops,
+                            extra={
+                                "failed_node": reached_node,
+                                "failure_index": hop_index,
+                            },
+                        )
+
                     return {
                         "success": True,
                         "reason": None,
                         "visited": visited,
                         "hops": hops,
                         "destination_reached": True,
+                        "failed_node": None,
+                        "failure_index": None,
                     }
 
                 # --------------------------------------------------
                 # Continue with next onion packet
                 # --------------------------------------------------
-                current_packet = step.get(
+
+                next_packet = step.get(
                     "next_packet"
                 )
 
-                if current_packet is None:
-                    return {
-                        "success": False,
-                        "reason": (
+                if next_packet is None:
+                    return self._failure(
+                        reason=(
                             "Missing next_packet before "
                             "destination was reached."
                         ),
-                        "visited": visited,
-                        "hops": hops,
-                        "destination_reached": False,
-                    }
+                        visited=visited,
+                        hops=hops,
+                        extra={
+                            "failed_node": node,
+                            "failure_index": hop_index,
+                        },
+                    )
+
+                current_packet = next_packet
 
             # ------------------------------------------------------
-            # If loop finishes without destination
+            # Loop completed without destination
             # ------------------------------------------------------
-            return {
-                "success": False,
-                "reason": "Destination was not reached.",
-                "visited": visited,
-                "hops": hops,
-                "destination_reached": False,
-            }
+
+            return self._failure(
+                reason=(
+                    "Destination was not reached "
+                    "after forwarding all route hops."
+                ),
+                visited=visited,
+                hops=hops,
+            )
 
         except Exception as exc:
 
-            return {
-                "success": False,
-                "reason": str(exc),
-                "visited": visited,
-                "hops": hops,
-                "destination_reached": False,
-            }
+            return self._failure(
+                reason=(
+                    f"onion_forwarding_error:"
+                    f"{type(exc).__name__}:"
+                    f"{exc}"
+                ),
+                visited=visited,
+                hops=hops,
+            )
 
     # ==========================================================
-    # VALIDATION
+    # RESULT BUILDING
     # ==========================================================
 
     @staticmethod
-    def _validate_path(path: List[Any]) -> None:
+    def _build_result(
+        forwarding: Dict[str, Any],
+        path: List[Any],
+        attempt_id: int,
+        route_id: Optional[str],
+        packet: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Convert the internal forwarding result into the
+        public Router result.
+        """
 
-        if not isinstance(path, (list, tuple)):
+        if not route_id:
+            raise RuntimeError(
+                "OnionRouter did not provide a valid route_id."
+            )
+
+        result = {
+            "success": bool(
+                forwarding.get(
+                    "success",
+                    False,
+                )
+            ),
+
+            "reason": forwarding.get(
+                "reason"
+            ),
+
+            "path": list(
+                path
+            ),
+
+            "visited": list(
+                forwarding.get(
+                    "visited",
+                    [],
+                )
+            ),
+
+            "hops": list(
+                forwarding.get(
+                    "hops",
+                    [],
+                )
+            ),
+
+            "attempt_id": attempt_id,
+
+            "route_id": route_id,
+
+            "source": path[0],
+
+            "destination": path[-1],
+
+            "path_length": len(
+                path
+            ),
+
+            "destination_reached": bool(
+                forwarding.get(
+                    "destination_reached",
+                    False,
+                )
+            ),
+
+            "failed_node": forwarding.get(
+                "failed_node"
+            ),
+
+            "failure_index": forwarding.get(
+                "failure_index"
+            ),
+
+            "packet": packet,
+        }
+
+        return result
+
+    # ==========================================================
+    # FAILURE RESULT
+    # ==========================================================
+
+    @staticmethod
+    def _failure(
+        reason: str,
+        visited: List[Any],
+        hops: List[Dict[str, Any]],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build a consistent internal forwarding failure result.
+        """
+
+        result = {
+            "success": False,
+            "reason": reason,
+            "visited": list(
+                visited
+            ),
+            "hops": list(
+                hops
+            ),
+            "destination_reached": False,
+            "failed_node": None,
+            "failure_index": None,
+        }
+
+        if extra:
+            result.update(
+                extra
+            )
+
+        return result
+
+    # ==========================================================
+    # PACKET VALIDATION
+    # ==========================================================
+
+    @staticmethod
+    def _validate_packet(
+        packet: Dict[str, Any]
+    ) -> None:
+        """
+        Validate the minimum packet contract required by Router.
+        """
+
+        if not isinstance(
+            packet,
+            dict,
+        ):
+            raise TypeError(
+                "Onion packet must be a dictionary."
+            )
+
+        route_id = packet.get(
+            "route_id"
+        )
+
+        if not route_id:
+            raise ValueError(
+                "Onion packet must contain a valid route_id."
+            )
+
+    # ==========================================================
+    # PATH VALIDATION
+    # ==========================================================
+
+    @staticmethod
+    def _validate_path(
+        path: List[Any]
+    ) -> None:
+        """
+        Validate an already selected route.
+
+        Router does not determine whether this is the optimal
+        route. It only verifies that the supplied route is
+        structurally valid for forwarding.
+        """
+
+        if not isinstance(
+            path,
+            (list, tuple),
+        ):
             raise TypeError(
                 "path must be a list or tuple."
             )
@@ -385,13 +596,31 @@ class Router:
                 "Source and destination must be different."
             )
 
-        if len(set(path)) != len(path):
+        try:
+            unique_nodes = set(
+                path
+            )
+        except TypeError as exc:
+            raise TypeError(
+                "path nodes must be hashable."
+            ) from exc
+
+        if len(unique_nodes) != len(path):
             raise ValueError(
                 "path contains duplicate nodes."
             )
 
+    # ==========================================================
+    # AMOUNT VALIDATION
+    # ==========================================================
+
     @staticmethod
-    def _validate_amount(amount: float) -> None:
+    def _validate_amount(
+        amount: float
+    ) -> None:
+        """
+        Validate payment amount.
+        """
 
         if amount is None:
             raise ValueError(
@@ -399,13 +628,26 @@ class Router:
             )
 
         try:
-            amount = float(amount)
-        except (TypeError, ValueError):
+            numeric_amount = float(
+                amount
+            )
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+
             raise ValueError(
                 "amount must be numeric."
+            ) from exc
+
+        if not math.isfinite(
+            numeric_amount
+        ):
+            raise ValueError(
+                "amount must be finite."
             )
 
-        if amount <= 0:
+        if numeric_amount <= 0:
             raise ValueError(
                 "amount must be greater than zero."
             )

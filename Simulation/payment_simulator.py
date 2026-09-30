@@ -1,22 +1,55 @@
 """
 Simulation/payment_simulator.py
 
-Execute a selected payment route over a simulated
+Execute exactly ONE selected payment route over a simulated
 Lightning Network.
 
 Responsibilities
 ----------------
 1. Validate the selected route.
-2. Evaluate forwarding through FailureModel.
-3. Calculate payment/routing metrics.
-4. Commit successful settlement through NetworkDynamics.
-5. Return structured PaymentResult.
-6. Provide exact failure information required by
-   Partial Backtracking.
+2. Preserve exact channel identity.
+3. Evaluate forwarding through FailureModel.
+4. Calculate payment/routing metrics.
+5. Commit successful settlement through NetworkDynamics.
+6. Return structured PaymentResult.
+7. Expose exact failure information required by:
+       - Bucket.backtrack
+       - Simulation.backtrack.PartialBacktracker
+
+This module does NOT:
+    - select candidates
+    - manage Bucket state
+    - perform candidate-level backtracking
+    - perform partial route recovery
+    - perform full rerouting
+    - make PPO/RL decisions
+
+Execution flow
+---------------
+Bucket
+    |
+    v
+selected candidate
+    |
+    v
+Bucket.record_attempt()
+    |
+    v
+PaymentSimulator
+    |
+    v
+FailureModel
+    |
+    +---- failure ----> PaymentResult
+    |
+    +---- success ----> settlement
+                         |
+                         v
+                    PaymentResult
 
 Fee handling
 ------------
-The simulator supports both normalized attributes:
+Supported attributes:
 
     fee_base
     fee_rate
@@ -26,10 +59,18 @@ and native Lightning/GML attributes:
     fee_base_msat
     fee_proportional_millionths
 
-This keeps PaymentSimulator compatible with both the
-prepared graph and the original Lightning GML snapshot.
+Channel identity
+----------------
+For MultiDiGraph / MultiDiGraph-like graphs, exact channel
+keys are preserved whenever supplied:
+
+    (u, v, key)
+
+Capacity is NOT interpreted as directional liquidity.
 """
 
+
+import math
 import time
 
 
@@ -45,38 +86,64 @@ def estimate_inter_continent(
     """
     Estimate whether a hop crosses continents.
 
-    This is a geographic abstraction used only for
-    simulation metrics.
+    This helper is used only for routing metrics.
+
+    Missing geographic information does NOT mean coordinates
+    are zero. If either endpoint lacks valid latitude or
+    longitude, the result is 0.
+
+    Returns
+    -------
+    int
+        1 if the hop is estimated to cross continents,
+        otherwise 0.
     """
 
-    if u not in G.nodes or v not in G.nodes:
+    if G is None:
+        return 0
+
+    try:
+        if u not in G.nodes or v not in G.nodes:
+            return 0
+    except Exception:
         return 0
 
     source = G.nodes[u]
     target = G.nodes[v]
 
+    source_lat = PaymentSimulator._finite_float(
+        source.get("latitude")
+    )
+
+    target_lat = PaymentSimulator._finite_float(
+        target.get("latitude")
+    )
+
+    source_lon = PaymentSimulator._finite_float(
+        source.get("longitude")
+    )
+
+    target_lon = PaymentSimulator._finite_float(
+        target.get("longitude")
+    )
+
+    if (
+        source_lat is None
+        or
+        target_lat is None
+        or
+        source_lon is None
+        or
+        target_lon is None
+    ):
+        return 0
+
     latitude_difference = abs(
-        source.get(
-            "latitude",
-            0
-        )
-        -
-        target.get(
-            "latitude",
-            0
-        )
+        source_lat - target_lat
     )
 
     longitude_difference = abs(
-        source.get(
-            "longitude",
-            0
-        )
-        -
-        target.get(
-            "longitude",
-            0
-        )
+        source_lon - target_lon
     )
 
     return int(
@@ -92,10 +159,7 @@ def estimate_inter_continent(
 
 class PaymentResult:
     """
-    Structured result of a simulated Lightning payment.
-
-    The result contains both successful-payment metrics and
-    failure information required by Partial Backtracking.
+    Structured result of exactly one payment attempt.
     """
 
     def __init__(
@@ -121,13 +185,13 @@ class PaymentResult:
         )
 
         self.path = (
-            path
+            list(path)
             if path is not None
             else []
         )
 
         self.edges = (
-            edges
+            list(edges)
             if edges is not None
             else []
         )
@@ -158,10 +222,6 @@ class PaymentResult:
             elapsed
         )
 
-        # ----------------------------------------------------
-        # Failure information
-        # ----------------------------------------------------
-
         self.failed_node = (
             failed_node
         )
@@ -175,7 +235,7 @@ class PaymentResult:
         )
 
         self.visited_edges = (
-            visited_edges
+            list(visited_edges)
             if visited_edges is not None
             else []
         )
@@ -185,19 +245,28 @@ class PaymentResult:
     # ========================================================
 
     def to_dict(self):
+        """
+        Convert result into a serializable dictionary.
+        """
 
         return {
-            "success": self.success,
+            "success":
+                self.success,
 
-            "path": self.path,
+            "path":
+                list(self.path),
 
-            "edges": self.edges,
+            "edges":
+                list(self.edges),
 
-            "fee": self.fee,
+            "fee":
+                self.fee,
 
-            "delay": self.delay,
+            "delay":
+                self.delay,
 
-            "carbon": self.carbon,
+            "carbon":
+                self.carbon,
 
             "inter_country_hops":
                 self.inter_country_hops,
@@ -205,9 +274,11 @@ class PaymentResult:
             "inter_continent_hops":
                 self.inter_continent_hops,
 
-            "reason": self.reason,
+            "reason":
+                self.reason,
 
-            "elapsed": self.elapsed,
+            "elapsed":
+                self.elapsed,
 
             "failed_node":
                 self.failed_node,
@@ -219,7 +290,7 @@ class PaymentResult:
                 self.failure_index,
 
             "visited_edges":
-                self.visited_edges
+                list(self.visited_edges)
         }
 
     # ========================================================
@@ -246,18 +317,10 @@ class PaymentResult:
 
 class PaymentSimulator:
     """
-    Execute payments over the current Lightning graph.
+    Execute exactly one selected payment route.
 
-    Parameters
-    ----------
-    G : NetworkX graph
-        Lightning Network graph.
-
-    failure_model : FailureModel
-        Runtime payment failure evaluator.
-
-    network_dynamics : NetworkDynamics
-        Network state and settlement manager.
+    PaymentSimulator is intentionally unaware of Bucket,
+    Backtracker and PPO.
     """
 
     def __init__(
@@ -293,7 +356,7 @@ class PaymentSimulator:
         )
 
     # ========================================================
-    # Execute Payment
+    # Execute One Payment
     # ========================================================
 
     def simulate_payment(
@@ -304,69 +367,101 @@ class PaymentSimulator:
         tx_id=None
     ):
         """
-        Execute one selected payment route.
+        Execute exactly one payment attempt.
 
-        Parameters
-        ----------
-        path : list
-            Ordered node path.
-
-        edges : list
-            Exact route edges.
-
-            Example:
-                [
-                    (u, v, key),
-                    (v, w, key)
-                ]
-
-        amount : float
-            Payment amount.
-
-        tx_id : int / str, optional
-            Transaction identifier.
-
-        Returns
-        -------
-        PaymentResult
+        No retry is performed here.
         """
 
         start_time = time.perf_counter()
 
         # ----------------------------------------------------
-        # Basic validation
+        # Validate amount
         # ----------------------------------------------------
 
-        if amount <= 0:
+        amount_value = self._positive_amount(
+            amount
+        )
 
-            return self._result(
-                success=False,
-                path=path,
-                edges=edges,
-                reason="invalid_amount",
-                elapsed=(
-                    time.perf_counter()
-                    -
-                    start_time
-                )
-            )
+        if amount_value is None:
 
-        if not path or not edges:
-
-            return self._result(
-                success=False,
-                path=path or [],
-                edges=edges or [],
-                reason="no_path",
-                elapsed=(
-                    time.perf_counter()
-                    -
-                    start_time
-                )
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=edges,
+                    reason="invalid_amount",
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
             )
 
         # ----------------------------------------------------
-        # Validate path / edge consistency
+        # Validate basic route input
+        # ----------------------------------------------------
+
+        if not isinstance(
+            path,
+            (list, tuple)
+        ):
+
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=[],
+                    edges=edges,
+                    reason="invalid_path",
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
+            )
+
+        if not isinstance(
+            edges,
+            (list, tuple)
+        ):
+
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=[],
+                    reason="invalid_edges",
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
+            )
+
+        if len(path) < 2:
+
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=edges,
+                    reason="no_path",
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
+            )
+
+        # ----------------------------------------------------
+        # Validate route and exact edges
         # ----------------------------------------------------
 
         validation = self._validate_route(
@@ -376,46 +471,142 @@ class PaymentSimulator:
 
         if not validation["valid"]:
 
-            return self._result(
-                success=False,
-                path=path,
-                edges=edges,
-                reason=validation["reason"],
-                elapsed=(
-                    time.perf_counter()
-                    -
-                    start_time
-                )
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=edges,
+                    reason=validation["reason"],
+                    failed_edge=validation.get(
+                        "failed_edge"
+                    ),
+                    failure_index=validation.get(
+                        "failure_index"
+                    ),
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
             )
 
         # ----------------------------------------------------
-        # Calculate static route metrics
+        # Calculate metrics
         # ----------------------------------------------------
 
         metrics = self._calculate_metrics(
             edges,
-            amount
+            amount_value
         )
 
         # ----------------------------------------------------
-        # Evaluate payment failure
+        # FailureModel
         # ----------------------------------------------------
 
-        failure = (
-            self.failure_model
-            .evaluate_payment_failure(
-                route=path,
-                amount=amount,
-                network=self.G,
-                route_edges=edges
+        try:
+
+            failure = (
+                self.failure_model
+                .evaluate_payment_failure(
+                    route=list(path),
+                    amount=amount_value,
+                    network=self.G,
+                    route_edges=list(edges)
+                )
             )
-        )
+
+        except Exception as exc:
+
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=edges,
+                    fee=metrics["fee"],
+                    delay=metrics["delay"],
+                    carbon=metrics["carbon"],
+                    inter_country_hops=(
+                        metrics[
+                            "inter_country_hops"
+                        ]
+                    ),
+                    inter_continent_hops=(
+                        metrics[
+                            "inter_continent_hops"
+                        ]
+                    ),
+                    reason=(
+                        "failure_model_error:"
+                        f"{type(exc).__name__}"
+                    ),
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
+            )
+
+        # ----------------------------------------------------
+        # Validate FailureModel output
+        # ----------------------------------------------------
+
+        if not isinstance(
+            failure,
+            dict
+        ):
+
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=edges,
+                    fee=metrics["fee"],
+                    delay=metrics["delay"],
+                    carbon=metrics["carbon"],
+                    inter_country_hops=(
+                        metrics[
+                            "inter_country_hops"
+                        ]
+                    ),
+                    inter_continent_hops=(
+                        metrics[
+                            "inter_continent_hops"
+                        ]
+                    ),
+                    reason="invalid_failure_model_result",
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
+            )
 
         # ----------------------------------------------------
         # Payment failed
         # ----------------------------------------------------
 
-        if not failure["success"]:
+        if not bool(
+            failure.get(
+                "success",
+                False
+            )
+        ):
+
+            visited_edges = (
+                failure.get(
+                    "visited_edges",
+                    []
+                )
+            )
+
+            if visited_edges is None:
+                visited_edges = []
 
             result = self._result(
                 success=False,
@@ -434,7 +625,10 @@ class PaymentSimulator:
                         "inter_continent_hops"
                     ]
                 ),
-                reason=failure["reason"],
+                reason=failure.get(
+                    "reason",
+                    "payment_failed"
+                ),
                 failed_node=failure.get(
                     "failed_node"
                 ),
@@ -444,10 +638,7 @@ class PaymentSimulator:
                 failure_index=failure.get(
                     "failure_index"
                 ),
-                visited_edges=failure.get(
-                    "visited_edges",
-                    []
-                ),
+                visited_edges=visited_edges,
                 elapsed=(
                     time.perf_counter()
                     -
@@ -455,69 +646,98 @@ class PaymentSimulator:
                 )
             )
 
-            # ----------------------------------------------
-            # Record failure
-            # ----------------------------------------------
+            return self._finalize_result(
+                result,
+                tx_id
+            )
 
-            if tx_id is not None:
+        # ----------------------------------------------------
+        # FailureModel says forwarding succeeded.
+        #
+        # Now settlement is attempted.
+        # ----------------------------------------------------
 
-                self.network_dynamics.record_payment(
-                    tx_id,
-                    result.to_dict()
+        try:
+
+            settlement_success = (
+                self.network_dynamics
+                .settle_route(
+                    route_edges=list(edges),
+                    amount=amount_value
                 )
+            )
 
-            return result
+        except Exception as exc:
+
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=edges,
+                    fee=metrics["fee"],
+                    delay=metrics["delay"],
+                    carbon=metrics["carbon"],
+                    inter_country_hops=(
+                        metrics[
+                            "inter_country_hops"
+                        ]
+                    ),
+                    inter_continent_hops=(
+                        metrics[
+                            "inter_continent_hops"
+                        ]
+                    ),
+                    reason=(
+                        "settlement_error:"
+                        f"{type(exc).__name__}"
+                    ),
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
+            )
+
+        # ----------------------------------------------------
+        # Settlement rejected
+        # ----------------------------------------------------
+
+        if not bool(
+            settlement_success
+        ):
+
+            return self._finalize_result(
+                self._result(
+                    success=False,
+                    path=path,
+                    edges=edges,
+                    fee=metrics["fee"],
+                    delay=metrics["delay"],
+                    carbon=metrics["carbon"],
+                    inter_country_hops=(
+                        metrics[
+                            "inter_country_hops"
+                        ]
+                    ),
+                    inter_continent_hops=(
+                        metrics[
+                            "inter_continent_hops"
+                        ]
+                    ),
+                    reason="settlement_failed",
+                    elapsed=(
+                        time.perf_counter()
+                        -
+                        start_time
+                    )
+                ),
+                tx_id
+            )
 
         # ----------------------------------------------------
         # Successful payment
-        # ----------------------------------------------------
-
-        settlement_success = (
-            self.network_dynamics
-            .settle_route(
-                route_edges=edges,
-                amount=amount
-            )
-        )
-
-        if not settlement_success:
-
-            result = self._result(
-                success=False,
-                path=path,
-                edges=edges,
-                fee=metrics["fee"],
-                delay=metrics["delay"],
-                carbon=metrics["carbon"],
-                inter_country_hops=(
-                    metrics[
-                        "inter_country_hops"
-                    ]
-                ),
-                inter_continent_hops=(
-                    metrics[
-                        "inter_continent_hops"
-                    ]
-                ),
-                reason="settlement_failed",
-                elapsed=(
-                    time.perf_counter()
-                    -
-                    start_time
-                )
-            )
-
-            if tx_id is not None:
-
-                self.network_dynamics.record_payment(
-                    tx_id,
-                    result.to_dict()
-                )
-
-            return result
-
-        # ----------------------------------------------------
-        # Successful result
         # ----------------------------------------------------
 
         result = self._result(
@@ -548,16 +768,38 @@ class PaymentSimulator:
             )
         )
 
-        # ----------------------------------------------------
-        # Record successful payment
-        # ----------------------------------------------------
+        return self._finalize_result(
+            result,
+            tx_id
+        )
+
+    # ========================================================
+    # Finalize / Record
+    # ========================================================
+
+    def _finalize_result(
+        self,
+        result,
+        tx_id
+    ):
+        """
+        Record one completed attempt.
+
+        Failure to record a result must not invalidate the
+        PaymentResult already produced by the simulator.
+        """
 
         if tx_id is not None:
 
-            self.network_dynamics.record_payment(
-                tx_id,
-                result.to_dict()
-            )
+            try:
+
+                self.network_dynamics.record_payment(
+                    tx_id,
+                    result.to_dict()
+                )
+
+            except Exception:
+                pass
 
         return result
 
@@ -571,27 +813,82 @@ class PaymentSimulator:
         edges
     ):
         """
-        Validate consistency between node path and
-        exact edge sequence.
-
-        Example:
-
-            path:
-                A -> B -> C
-
-            edges:
-                (A, B, k1)
-                (B, C, k2)
+        Validate node path and exact edge sequence.
         """
+
+        if not isinstance(
+            path,
+            (list, tuple)
+        ):
+
+            return {
+                "valid": False,
+                "reason": "invalid_path",
+                "failed_edge": None,
+                "failure_index": None
+            }
+
+        if not isinstance(
+            edges,
+            (list, tuple)
+        ):
+
+            return {
+                "valid": False,
+                "reason": "invalid_edges",
+                "failed_edge": None,
+                "failure_index": None
+            }
+
+        if len(path) < 2:
+
+            return {
+                "valid": False,
+                "reason": "path_too_short",
+                "failed_edge": None,
+                "failure_index": None
+            }
 
         if len(path) != len(edges) + 1:
 
             return {
                 "valid": False,
-                "reason": "route_edge_mismatch"
+                "reason": "route_edge_mismatch",
+                "failed_edge": None,
+                "failure_index": None
             }
 
-        for i, edge in enumerate(
+        # ----------------------------------------------------
+        # Reject repeated nodes.
+        # ----------------------------------------------------
+
+        try:
+
+            if len(path) != len(
+                set(path)
+            ):
+
+                return {
+                    "valid": False,
+                    "reason": "route_contains_loop",
+                    "failed_edge": None,
+                    "failure_index": None
+                }
+
+        except TypeError:
+
+            return {
+                "valid": False,
+                "reason": "unhashable_route_node",
+                "failed_edge": None,
+                "failure_index": None
+            }
+
+        # ----------------------------------------------------
+        # Validate every exact edge.
+        # ----------------------------------------------------
+
+        for index, edge in enumerate(
             edges
         ):
 
@@ -603,55 +900,123 @@ class PaymentSimulator:
 
                 return {
                     "valid": False,
-                    "reason": "invalid_edge"
+                    "reason": "invalid_edge",
+                    "failed_edge": edge,
+                    "failure_index": index
                 }
 
             u, v, key = parsed
 
-            if u != path[i]:
+            # ------------------------------------------------
+            # Node sequence consistency
+            # ------------------------------------------------
+
+            if u != path[index]:
 
                 return {
                     "valid": False,
-                    "reason": "invalid_route_source"
+                    "reason": "invalid_route_source",
+                    "failed_edge": edge,
+                    "failure_index": index
                 }
 
-            if v != path[i + 1]:
+            if v != path[index + 1]:
 
                 return {
                     "valid": False,
-                    "reason": "invalid_route_destination"
+                    "reason": "invalid_route_destination",
+                    "failed_edge": edge,
+                    "failure_index": index
                 }
 
-            if not self.G.has_edge(
-                u,
-                v
-            ):
+            # ------------------------------------------------
+            # Channel existence
+            # ------------------------------------------------
 
-                return {
-                    "valid": False,
-                    "reason": "missing_channel"
-                }
-
-            if (
-                self.G.is_multigraph()
-                and
-                key is not None
-            ):
+            try:
 
                 if not self.G.has_edge(
                     u,
-                    v,
-                    key
+                    v
                 ):
 
                     return {
                         "valid": False,
-                        "reason": "missing_channel"
+                        "reason": "missing_channel",
+                        "failed_edge": edge,
+                        "failure_index": index
+                    }
+
+            except Exception:
+
+                return {
+                    "valid": False,
+                    "reason": "channel_lookup_error",
+                    "failed_edge": edge,
+                    "failure_index": index
+                }
+
+            # ------------------------------------------------
+            # Exact channel validation
+            # ------------------------------------------------
+
+            if self.G.is_multigraph():
+
+                if key is None:
+
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "missing_channel_key"
+                        ),
+                        "failed_edge": edge,
+                        "failure_index": index
+                    }
+
+                try:
+
+                    if not self.G.has_edge(
+                        u,
+                        v,
+                        key
+                    ):
+
+                        return {
+                            "valid": False,
+                            "reason": "missing_channel",
+                            "failed_edge": edge,
+                            "failure_index": index
+                        }
+
+                except Exception:
+
+                    return {
+                        "valid": False,
+                        "reason": "channel_lookup_error",
+                        "failed_edge": edge,
+                        "failure_index": index
+                    }
+
+            else:
+
+                # Simple Graph / DiGraph should not require
+                # a channel key.
+                if key is not None:
+
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "unexpected_channel_key"
+                        ),
+                        "failed_edge": edge,
+                        "failure_index": index
                     }
 
         return {
             "valid": True,
-            "reason": None
+            "reason": None,
+            "failed_edge": None,
+            "failure_index": None
         }
 
     # ========================================================
@@ -664,25 +1029,15 @@ class PaymentSimulator:
         amount
     ):
         """
-        Calculate payment metrics without modifying
+        Calculate route-level metrics without modifying
         network state.
-
-        Metrics:
-            - fee
-            - delay
-            - carbon
-            - inter-country hops
-            - inter-continent hops
         """
 
         fee = 0.0
-
         delay = 0.0
-
         carbon = 0.0
 
         inter_country = 0
-
         inter_continent = 0
 
         for edge in edges:
@@ -737,25 +1092,28 @@ class PaymentSimulator:
                 )
             )
 
+            delay += self._safe_float(
+                delay_value
+            )
+
+            # ------------------------------------------------
+            # Node metrics
+            # ------------------------------------------------
+
             try:
 
-                delay += float(
-                    delay_value
-                )
+                if (
+                    u not in self.G.nodes
+                    or
+                    v not in self.G.nodes
+                ):
+                    continue
 
-            except (
-                TypeError,
-                ValueError
-            ):
+            except Exception:
 
-                pass
-
-            # ------------------------------------------------
-            # Geographic metrics
-            # ------------------------------------------------
+                continue
 
             source = self.G.nodes[u]
-
             target = self.G.nodes[v]
 
             source_carbon = self._safe_float(
@@ -778,17 +1136,37 @@ class PaymentSimulator:
                 target_carbon
             ) / 2.0
 
-            inter_country += int(
-                source.get(
-                    "country",
-                    ""
-                )
-                !=
-                target.get(
-                    "country",
-                    ""
-                )
+            # ------------------------------------------------
+            # Country metric
+            # ------------------------------------------------
+
+            source_country = source.get(
+                "country"
             )
+
+            target_country = target.get(
+                "country"
+            )
+
+            if (
+                source_country not in (
+                    None,
+                    ""
+                )
+                and
+                target_country not in (
+                    None,
+                    ""
+                )
+                and
+                source_country != target_country
+            ):
+
+                inter_country += 1
+
+            # ------------------------------------------------
+            # Continent metric
+            # ------------------------------------------------
 
             inter_continent += (
                 estimate_inter_continent(
@@ -799,8 +1177,7 @@ class PaymentSimulator:
             )
 
         average_carbon = (
-            carbon
-            /
+            carbon /
             max(
                 1,
                 len(edges)
@@ -808,17 +1185,24 @@ class PaymentSimulator:
         )
 
         return {
-            "fee": fee,
-            "delay": delay,
-            "carbon": average_carbon,
+            "fee":
+                fee,
+
+            "delay":
+                delay,
+
+            "carbon":
+                average_carbon,
+
             "inter_country_hops":
                 inter_country,
+
             "inter_continent_hops":
                 inter_continent
         }
 
     # ========================================================
-    # Fee Extraction
+    # Fee Components
     # ========================================================
 
     @staticmethod
@@ -826,34 +1210,17 @@ class PaymentSimulator:
         data
     ):
         """
-        Extract the two Lightning fee components.
+        Extract base and proportional Lightning fee.
 
-        Supported normalized representation:
+        Supported forms:
 
             fee_base
             fee_rate
 
-        Supported native Lightning/GML representation:
+        or:
 
             fee_base_msat
             fee_proportional_millionths
-
-        Returns
-        -------
-        tuple
-            (base_fee, proportional_rate)
-
-        Important
-        ---------
-        The units are kept consistent with the existing
-        Pathfinding implementation.
-
-        Therefore:
-
-            fee =
-                base
-                +
-                rate * amount / 1,000,000
         """
 
         if not data:
@@ -863,11 +1230,12 @@ class PaymentSimulator:
         # Base fee
         # ----------------------------------------------------
 
-        if "fee_base" in data:
+        if data.get(
+            "fee_base"
+        ) is not None:
 
             base = data.get(
-                "fee_base",
-                0.0
+                "fee_base"
             )
 
         else:
@@ -881,11 +1249,12 @@ class PaymentSimulator:
         # Proportional fee
         # ----------------------------------------------------
 
-        if "fee_rate" in data:
+        if data.get(
+            "fee_rate"
+        ) is not None:
 
             rate = data.get(
-                "fee_rate",
-                0.0
+                "fee_rate"
             )
 
         else:
@@ -903,6 +1272,12 @@ class PaymentSimulator:
             rate
         )
 
+        if base < 0:
+            base = 0.0
+
+        if rate < 0:
+            rate = 0.0
+
         return base, rate
 
     # ========================================================
@@ -915,12 +1290,12 @@ class PaymentSimulator:
         default=0.0
     ):
         """
-        Safely convert a value to float.
+        Safe finite float conversion.
         """
 
         try:
 
-            return float(
+            value = float(
                 value
             )
 
@@ -932,6 +1307,85 @@ class PaymentSimulator:
             return float(
                 default
             )
+
+        if not math.isfinite(
+            value
+        ):
+
+            return float(
+                default
+            )
+
+        return value
+
+    # ========================================================
+    # Finite Float
+    # ========================================================
+
+    @staticmethod
+    def _finite_float(
+        value
+    ):
+        """
+        Return finite float or None.
+        """
+
+        try:
+
+            value = float(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            return None
+
+        if not math.isfinite(
+            value
+        ):
+
+            return None
+
+        return value
+
+    # ========================================================
+    # Positive Amount
+    # ========================================================
+
+    @staticmethod
+    def _positive_amount(
+        amount
+    ):
+        """
+        Return a finite positive amount or None.
+        """
+
+        try:
+
+            value = float(
+                amount
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            return None
+
+        if not math.isfinite(
+            value
+        ):
+
+            return None
+
+        if value <= 0:
+            return None
+
+        return value
 
     # ========================================================
     # Result Factory
@@ -991,39 +1445,37 @@ class PaymentSimulator:
         Normalize edge representation.
 
         Accepted:
+
             (u, v)
+
+        or:
+
             (u, v, key)
         """
 
         if edge is None:
             return None
 
-        try:
-
-            length = len(edge)
-
-        except TypeError:
-
+        if not isinstance(
+            edge,
+            (tuple, list)
+        ):
             return None
 
-        if length == 2:
-
-            u, v = edge
+        if len(edge) == 2:
 
             return (
-                u,
-                v,
+                edge[0],
+                edge[1],
                 None
             )
 
-        if length == 3:
-
-            u, v, key = edge
+        if len(edge) == 3:
 
             return (
-                u,
-                v,
-                key
+                edge[0],
+                edge[1],
+                edge[2]
             )
 
         return None
@@ -1039,56 +1491,74 @@ class PaymentSimulator:
         key=None
     ):
         """
-        Get exact edge data from the graph.
+        Return exact edge data.
 
-        For MultiDiGraph, the supplied key is preferred.
+        MultiGraph
+        ----------
+        If key is supplied, only that exact channel is used.
+
+        If key is omitted, None is returned intentionally.
+
+        PaymentSimulator requires exact channel identity for
+        MultiDiGraph execution and must not silently select
+        another parallel channel.
+
+        Graph / DiGraph
+        ---------------
+        The ordinary edge data is returned.
         """
 
-        if not self.G.has_edge(
-            u,
-            v
-        ):
+        try:
+
+            if not self.G.has_edge(
+                u,
+                v
+            ):
+
+                return None
+
+        except Exception:
+
             return None
+
+        # ----------------------------------------------------
+        # MultiGraph / MultiDiGraph
+        # ----------------------------------------------------
 
         if self.G.is_multigraph():
 
-            edge_data = self.G.get_edge_data(
+            if key is None:
+
+                return None
+
+            try:
+
+                edge_data = self.G.get_edge_data(
+                    u,
+                    v,
+                    key
+                )
+
+            except Exception:
+
+                return None
+
+            return edge_data
+
+        # ----------------------------------------------------
+        # Graph / DiGraph
+        # ----------------------------------------------------
+
+        try:
+
+            return self.G.get_edge_data(
                 u,
                 v
             )
 
-            if not edge_data:
-                return None
+        except Exception:
 
-            # ------------------------------------------------
-            # Exact edge requested
-            # ------------------------------------------------
-
-            if key is not None:
-
-                exact = edge_data.get(
-                    key
-                )
-
-                if exact is not None:
-                    return exact
-
-            # ------------------------------------------------
-            # Fallback
-            # ------------------------------------------------
-
-            first_key = next(
-                iter(edge_data)
-            )
-
-            return edge_data[
-                first_key
-            ]
-
-        return self.G.get_edge_data(
-            u,
-            v
-        )
+            return None
 
 
 # ============================================================
@@ -1105,10 +1575,9 @@ def simulate_payment(
     tx_id=None
 ):
     """
-    Functional wrapper around PaymentSimulator.
+    Functional wrapper.
 
-    This preserves the old API style while using the new
-    FailureModel and NetworkDynamics architecture.
+    Executes exactly ONE payment attempt.
     """
 
     if failure_model is None:
@@ -1134,4 +1603,382 @@ def simulate_payment(
         edges=edges,
         amount=amount,
         tx_id=tx_id
+    )
+
+
+# ============================================================
+# Standalone Module Test
+# ============================================================
+
+if __name__ == "__main__":
+
+    import networkx as nx
+
+    print()
+    print("=" * 72)
+    print("PAYMENT SIMULATOR MODULE TEST")
+    print("=" * 72)
+
+    # --------------------------------------------------------
+    # Test graph
+    # --------------------------------------------------------
+
+    G = nx.MultiDiGraph()
+
+    G.add_edge(
+        "A",
+        "B",
+        key=10,
+        fee_base_msat=1000,
+        fee_proportional_millionths=100,
+        cltv_expiry_delta=40,
+        balance_uv=10000,
+        capacity=20000,
+        available=True
+    )
+
+    G.add_edge(
+        "B",
+        "C",
+        key=20,
+        fee_base_msat=1000,
+        fee_proportional_millionths=200,
+        cltv_expiry_delta=50,
+        balance_uv=10000,
+        capacity=20000,
+        available=True
+    )
+
+    for node in G.nodes:
+
+        G.nodes[node]["available"] = True
+        G.nodes[node]["is_online"] = True
+
+    # --------------------------------------------------------
+    # Minimal FailureModel mock
+    # --------------------------------------------------------
+
+    class TestFailureModel:
+
+        def evaluate_payment_failure(
+            self,
+            route,
+            amount,
+            network,
+            route_edges=None
+        ):
+
+            return {
+                "success": True,
+                "reason": "success",
+                "visited_edges": list(
+                    route_edges
+                )
+            }
+
+    # --------------------------------------------------------
+    # Minimal NetworkDynamics mock
+    # --------------------------------------------------------
+
+    class TestNetworkDynamics:
+
+        def __init__(self):
+
+            self.records = []
+
+        def settle_route(
+            self,
+            route_edges,
+            amount
+        ):
+
+            return True
+
+        def record_payment(
+            self,
+            tx_id,
+            result
+        ):
+
+            self.records.append(
+                (
+                    tx_id,
+                    result
+                )
+            )
+
+    failure_model = TestFailureModel()
+
+    network_dynamics = TestNetworkDynamics()
+
+    simulator = PaymentSimulator(
+        G=G,
+        failure_model=failure_model,
+        network_dynamics=network_dynamics
+    )
+
+    # --------------------------------------------------------
+    # Exact route
+    # --------------------------------------------------------
+
+    path = [
+        "A",
+        "B",
+        "C"
+    ]
+
+    edges = [
+        ("A", "B", 10),
+        ("B", "C", 20)
+    ]
+
+    result = simulator.simulate_payment(
+        path=path,
+        edges=edges,
+        amount=1000,
+        tx_id="TX-001"
+    )
+
+    print()
+    print(
+        f"Success             : "
+        f"{result.success}"
+    )
+
+    print(
+        f"Reason              : "
+        f"{result.reason}"
+    )
+
+    print(
+        f"Path                : "
+        f"{result.path}"
+    )
+
+    print(
+        f"Edges               : "
+        f"{result.edges}"
+    )
+
+    print(
+        f"Visited edges      : "
+        f"{result.visited_edges}"
+    )
+
+    print(
+        f"Fee                 : "
+        f"{result.fee:.4f}"
+    )
+
+    print(
+        f"Delay               : "
+        f"{result.delay:.4f}"
+    )
+
+    print(
+        f"Recorded results    : "
+        f"{len(network_dynamics.records)}"
+    )
+
+    # --------------------------------------------------------
+    # Assertions
+    # --------------------------------------------------------
+
+    assert result.success is True
+
+    assert result.reason == "success"
+
+    assert result.path == [
+        "A",
+        "B",
+        "C"
+    ]
+
+    assert result.edges == [
+        ("A", "B", 10),
+        ("B", "C", 20)
+    ]
+
+    assert result.visited_edges == [
+        ("A", "B", 10),
+        ("B", "C", 20)
+    ]
+
+    assert len(
+        network_dynamics.records
+    ) == 1
+
+    # --------------------------------------------------------
+    # Verify exact parallel-channel identity
+    # --------------------------------------------------------
+
+    G.add_edge(
+        "A",
+        "B",
+        key=99,
+        fee_base_msat=999999,
+        balance_uv=10000,
+        available=True
+    )
+
+    exact_data = simulator._get_edge(
+        "A",
+        "B",
+        10
+    )
+
+    assert exact_data is not None
+
+    assert (
+        exact_data[
+            "fee_base_msat"
+        ]
+        ==
+        1000
+    )
+
+    # Missing key must NOT silently select another
+    # parallel channel.
+
+    missing_data = simulator._get_edge(
+        "A",
+        "B",
+        777
+    )
+
+    assert missing_data is None
+
+    no_key_data = simulator._get_edge(
+        "A",
+        "B"
+    )
+
+    assert no_key_data is None
+
+    # --------------------------------------------------------
+    # Failure propagation test
+    # --------------------------------------------------------
+
+    class FailedPaymentModel:
+
+        def evaluate_payment_failure(
+            self,
+            route,
+            amount,
+            network,
+            route_edges=None
+        ):
+
+            return {
+                "success": False,
+                "reason": "channel_failure",
+                "failed_node": "B",
+                "failed_edge": (
+                    "B",
+                    "C",
+                    20
+                ),
+                "failure_index": 1,
+                "visited_edges": [
+                    ("A", "B", 10)
+                ]
+            }
+
+    failed_simulator = PaymentSimulator(
+        G=G,
+        failure_model=FailedPaymentModel(),
+        network_dynamics=network_dynamics
+    )
+
+    failed_result = (
+        failed_simulator.simulate_payment(
+            path=path,
+            edges=edges,
+            amount=1000,
+            tx_id="TX-002"
+        )
+    )
+
+    print()
+    print(
+        f"Failure test        : "
+        f"{failed_result.reason}"
+    )
+
+    print(
+        f"Failed edge         : "
+        f"{failed_result.failed_edge}"
+    )
+
+    print(
+        f"Failure index       : "
+        f"{failed_result.failure_index}"
+    )
+
+    print(
+        f"Visited edges      : "
+        f"{failed_result.visited_edges}"
+    )
+
+    assert failed_result.success is False
+
+    assert (
+        failed_result.reason
+        ==
+        "channel_failure"
+    )
+
+    assert (
+        failed_result.failed_edge
+        ==
+        ("B", "C", 20)
+    )
+
+    assert (
+        failed_result.failure_index
+        ==
+        1
+    )
+
+    assert failed_result.visited_edges == [
+        ("A", "B", 10)
+    ]
+
+    # --------------------------------------------------------
+    # Invalid exact channel test
+    # --------------------------------------------------------
+
+    invalid_result = simulator.simulate_payment(
+        path=path,
+        edges=[
+            ("A", "B", 777),
+            ("B", "C", 20)
+        ],
+        amount=1000,
+        tx_id="TX-003"
+    )
+
+    assert invalid_result.success is False
+
+    assert (
+        invalid_result.reason
+        ==
+        "missing_channel"
+    )
+
+    print()
+    print(
+        "Exact channel test  : PASS"
+    )
+
+    print(
+        "Failure propagation : PASS"
+    )
+
+    print(
+        "Settlement test     : PASS"
+    )
+
+    print(
+        "PAYMENT SIMULATOR STATUS : SUCCESS"
     )

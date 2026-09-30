@@ -3,7 +3,8 @@ Simulation/backtrack.py
 
 Partial Backtracking for RL + Bucket routing.
 
-Flow:
+Flow
+----
 
     RL / PPO
         |
@@ -12,9 +13,6 @@ Flow:
         |
         v
     Top-K Candidate Routes
-        |
-        v
-    CandidateManager
         |
         v
     Bucket
@@ -26,7 +24,10 @@ Flow:
     Payment Simulation
         |
         v
-    Failure
+    FailureModel
+        |
+        v
+    Failure Information
         |
         v
     Partial Backtracking
@@ -34,33 +35,61 @@ Flow:
         +----> Alternative suffix from Bucket
         |
         +----> If no valid suffix:
-                    Full reroute
+                    Full reroute required
+
+
+Important semantics
+-------------------
+
+- Bucket.attempts counts ACTUAL payment attempts only.
+- PartialBacktracker NEVER modifies Bucket.attempts.
+- Channel capacity is NOT directional liquidity.
+- Unknown directional liquidity is accepted by structural validation.
+- Exact MultiDiGraph channel keys are preserved whenever available.
+- Candidate edge information is authoritative when supplied.
+- This module does NOT execute payments.
+- This module does NOT evaluate stochastic failures.
+- This module does NOT perform full rerouting.
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, Optional
 
 
 class PartialBacktracker:
     """
-    Partial backtracking using alternative routes stored in Bucket.
+    Partial backtracking using alternative candidates stored in Bucket.
 
-    A previously failed Bucket candidate is never reused.
+    Responsibilities
+    ----------------
+    1. Resolve the failed edge.
+    2. Resolve the failure position.
+    3. Search backward for a usable Bucket branch point.
+    4. Retrieve candidate routes from Bucket.
+    5. Reject candidates already known to have failed.
+    6. Preserve exact channel keys whenever possible.
+    7. Reject reuse of the failed channel.
+    8. Validate the alternative suffix.
+    9. Prevent route loops.
+    10. Construct the new route and exact edge list.
+    11. Request full rerouting when no valid suffix exists.
 
-    Failed channel matching supports:
-
-        (u, v)
-
-    and, when candidate edge information is available:
-
-        (u, v, key)
-
-    This is important for NetworkX MultiDiGraph representations.
+    The class does NOT:
+        - execute payments
+        - call FailureModel
+        - call PaymentSimulator
+        - call Router
+        - increment Bucket.attempts
+        - modify PPO state
+        - choose PPO actions
+        - perform full rerouting
     """
 
     def __init__(
         self,
         network,
-        bucket=None
+        bucket=None,
     ):
         self.network = network
         self.bucket = bucket
@@ -76,23 +105,63 @@ class PartialBacktracker:
         failure_index=None,
         amount=0,
         bucket_id=None,
-        attempt_id=0
+        attempt_id=0,
     ):
         """
         Perform partial backtracking.
 
-        The branch point is selected based on:
+        Parameters
+        ----------
+        route : list
+            Current failed node route.
 
-        1. network feasibility
-        2. Bucket candidate availability
-        3. candidate validity
-        4. failed-candidate exclusion
-        5. loop prevention
-        6. failed-channel exclusion
+        failed_edge : tuple, optional
+            Failed channel:
+
+                (u, v)
+
+            or:
+
+                (u, v, key)
+
+        failure_index : int, optional
+            Zero-based index of failed hop.
+
+        amount : float
+            Payment amount.
+
+        bucket_id : optional
+            Bucket identifier.
+
+        attempt_id : int
+            Current payment-attempt identifier.
+
+        Returns
+        -------
+        dict
+            Structured backtracking result.
+
+        Important output fields
+        -----------------------
+        success
+        status
+        reason
+        original_route
+        new_route
+        new_edges
+        preserved_prefix
+        preserved_prefix_edges
+        alternative_suffix
+        alternative_suffix_edges
+        branch_point
+        branch_index
+        failed_edge
+        failure_index
+        full_reroute_required
         """
 
         # ------------------------------------------------------
-        # 1. Validate route
+        # 1. Validate input route
         # ------------------------------------------------------
 
         if not self._validate_route(route):
@@ -102,19 +171,49 @@ class PartialBacktracker:
                 status="invalid_route",
                 reason="invalid_route",
                 original_route=route,
-                attempt_id=attempt_id
+                attempt_id=attempt_id,
+                full_reroute_required=False,
             )
 
         route = list(route)
 
         # ------------------------------------------------------
-        # 2. Resolve failed edge
+        # 2. Validate amount
+        # ------------------------------------------------------
+
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError):
+
+            return self._result(
+                success=False,
+                status="invalid_amount",
+                reason="invalid_amount",
+                original_route=route,
+                attempt_id=attempt_id,
+                full_reroute_required=False,
+            )
+
+        if amount <= 0:
+
+            return self._result(
+                success=False,
+                status="invalid_amount",
+                reason="invalid_amount",
+                original_route=route,
+                amount=amount,
+                attempt_id=attempt_id,
+                full_reroute_required=False,
+            )
+
+        # ------------------------------------------------------
+        # 3. Resolve failed edge
         # ------------------------------------------------------
 
         resolved_failed_edge = self._resolve_failed_edge(
             route=route,
             failed_edge=failed_edge,
-            failure_index=failure_index
+            failure_index=failure_index,
         )
 
         if resolved_failed_edge is None:
@@ -124,17 +223,19 @@ class PartialBacktracker:
                 status="invalid_failure",
                 reason="failed_edge_not_resolved",
                 original_route=route,
-                attempt_id=attempt_id
+                amount=amount,
+                attempt_id=attempt_id,
+                full_reroute_required=False,
             )
 
         # ------------------------------------------------------
-        # 3. Resolve failure index
+        # 4. Resolve exact failure index
         # ------------------------------------------------------
 
         resolved_failure_index = self._resolve_failure_index(
             route=route,
             failed_edge=resolved_failed_edge,
-            failure_index=failure_index
+            failure_index=failure_index,
         )
 
         if resolved_failure_index is None:
@@ -145,11 +246,13 @@ class PartialBacktracker:
                 reason="failure_index_not_resolved",
                 original_route=route,
                 failed_edge=resolved_failed_edge,
-                attempt_id=attempt_id
+                amount=amount,
+                attempt_id=attempt_id,
+                full_reroute_required=False,
             )
 
         # ------------------------------------------------------
-        # 4. Find branch point WITH valid Bucket alternatives
+        # 5. Find nearest Bucket branch point
         # ------------------------------------------------------
 
         branch_info = self._find_bucket_branch_point(
@@ -157,7 +260,7 @@ class PartialBacktracker:
             failure_index=resolved_failure_index,
             failed_edge=resolved_failed_edge,
             amount=amount,
-            bucket_id=bucket_id
+            bucket_id=bucket_id,
         )
 
         if branch_info is None:
@@ -169,243 +272,329 @@ class PartialBacktracker:
                 original_route=route,
                 failed_edge=resolved_failed_edge,
                 failure_index=resolved_failure_index,
+                amount=amount,
+                bucket_id=bucket_id,
+                attempt_id=attempt_id,
                 full_reroute_required=True,
-                attempt_id=attempt_id
             )
 
         branch_index = branch_info["branch_index"]
         branch_node = branch_info["branch_node"]
         candidates = branch_info["candidates"]
 
-        # ------------------------------------------------------
-        # Debug
-        # ------------------------------------------------------
-
         print()
-        print("[Backtracker]")
-        print(f"  Branch node       : {branch_node}")
-        print(f"  Branch index      : {branch_index}")
-        print(f"  Failed edge       : {resolved_failed_edge}")
-        print(f"  Failure index     : {resolved_failure_index}")
-        print(f"  Bucket candidates : {len(candidates)}")
+        print("[PartialBacktracker]")
+        print(
+            f"  Branch node       : {branch_node}"
+        )
+        print(
+            f"  Branch index      : {branch_index}"
+        )
+        print(
+            f"  Failed edge       : {resolved_failed_edge}"
+        )
+        print(
+            f"  Failure index     : {resolved_failure_index}"
+        )
+        print(
+            f"  Bucket candidates : {len(candidates)}"
+        )
 
         # ------------------------------------------------------
-        # 5. Evaluate candidates
+        # 6. Evaluate candidates
         # ------------------------------------------------------
 
-        for candidate_index, candidate in enumerate(candidates):
+        for candidate_index, candidate in enumerate(
+            candidates
+        ):
 
             print()
             print(
-                f"  Evaluating alternative "
-                f"{candidate_index + 1}: {candidate}"
+                f"  Evaluating candidate "
+                f"{candidate_index + 1}"
             )
 
             # --------------------------------------------------
-            # Previously failed candidate
+            # Candidate failure state
             # --------------------------------------------------
 
-            if self._candidate_is_failed(candidate):
+            if self._candidate_is_failed(
+                candidate=candidate,
+                candidate_index=candidate_index,
+            ):
 
                 print(
-                    "    REJECTED: candidate previously failed"
+                    "    REJECTED: candidate already failed"
                 )
-
                 continue
 
             # --------------------------------------------------
-            # Extract candidate path
+            # Candidate path
             # --------------------------------------------------
 
             candidate_path = self._extract_candidate_path(
                 candidate
             )
 
-            # --------------------------------------------------
-            # Do not retry the exact current route
-            # --------------------------------------------------
-
-            if (
-                candidate_path is not None
-                and
-                self._same_route(
-                    candidate_path,
-                    route
-                )
-            ):
+            if candidate_path is None:
 
                 print(
-                    "    REJECTED: candidate is identical "
-                    "to current route"
+                    "    REJECTED: candidate path unavailable"
                 )
-
                 continue
 
             # --------------------------------------------------
-            # Normalize suffix
+            # Candidate must contain branch node
             # --------------------------------------------------
 
             suffix = self._normalize_suffix(
                 candidate=candidate,
-                branch_node=branch_node
+                branch_node=branch_node,
             )
 
             if suffix is None:
 
                 print(
-                    "    REJECTED: candidate does not contain "
-                    "the selected branch point"
+                    "    REJECTED: branch node not present"
                 )
-
                 continue
 
-            print(
-                f"    Normalized suffix: {suffix}"
+            # --------------------------------------------------
+            # Candidate must contain at least one hop
+            # --------------------------------------------------
+
+            if len(suffix) < 2:
+
+                print(
+                    "    REJECTED: suffix has no forwarding hop"
+                )
+                continue
+
+            # --------------------------------------------------
+            # Exact candidate edges
+            # --------------------------------------------------
+
+            suffix_edges = self._extract_suffix_edges(
+                candidate=candidate,
+                suffix=suffix,
+                branch_node=branch_node,
             )
 
             # --------------------------------------------------
-            # Must start at branch node
+            # Do not retry exact current route
             # --------------------------------------------------
 
-            if suffix[0] != branch_node:
+            if self._same_route(
+                candidate_path,
+                route,
+            ):
 
                 print(
-                    "    REJECTED: suffix does not start "
-                    "at branch node"
+                    "    REJECTED: candidate equals current route"
                 )
-
                 continue
 
             # --------------------------------------------------
-            # Failed edge must not be reused
+            # Failed channel must not be reused
             # --------------------------------------------------
 
             if self._candidate_contains_failed_edge(
                 candidate=candidate,
                 suffix=suffix,
-                failed_edge=resolved_failed_edge
+                suffix_edges=suffix_edges,
+                failed_edge=resolved_failed_edge,
             ):
 
                 print(
                     "    REJECTED: failed channel reused"
                 )
-
                 continue
 
             # --------------------------------------------------
-            # Prevent loops
+            # Loop prevention
             # --------------------------------------------------
 
             prefix = route[:branch_index + 1]
 
             if not self._is_loop_free(
                 prefix=prefix,
-                suffix=suffix
+                suffix=suffix,
             ):
 
                 print(
-                    "    REJECTED: route would contain a loop"
+                    "    REJECTED: reconstructed route contains loop"
                 )
-
                 continue
 
             # --------------------------------------------------
-            # Validate suffix channels
+            # Validate suffix
             # --------------------------------------------------
 
             if not self.is_suffix_valid(
                 suffix=suffix,
-                amount=amount
+                amount=amount,
+                candidate=candidate,
+                suffix_edges=suffix_edges,
             ):
 
                 print(
-                    "    REJECTED: suffix channel validation failed"
+                    "    REJECTED: suffix validation failed"
                 )
-
                 continue
 
             # --------------------------------------------------
-            # Construct complete route
+            # Build prefix edge list
+            # --------------------------------------------------
+
+            prefix_edges = self._resolve_route_edges_for_prefix(
+                route=route,
+                end_index=branch_index,
+            )
+
+            if prefix_edges is None:
+
+                print(
+                    "    REJECTED: exact prefix edges unavailable"
+                )
+                continue
+
+            # --------------------------------------------------
+            # Build complete route
             # --------------------------------------------------
 
             new_route = self._combine_route(
                 prefix=prefix,
-                suffix=suffix
+                suffix=suffix,
             )
 
-            print(
-                f"    New route candidate: {new_route}"
-            )
-
-            if not self._validate_route(new_route):
+            if not self._validate_route(
+                new_route
+            ):
 
                 print(
                     "    REJECTED: resulting route invalid"
                 )
-
                 continue
 
             # --------------------------------------------------
-            # Success
+            # Build complete exact edge list
             # --------------------------------------------------
+
+            new_edges = self._combine_edges(
+                prefix_edges=prefix_edges,
+                suffix_edges=suffix_edges,
+            )
+
+            # --------------------------------------------------
+            # Edge count must match route
+            # --------------------------------------------------
+
+            if new_edges is None:
+
+                print(
+                    "    REJECTED: exact edge reconstruction failed"
+                )
+                continue
+
+            if len(new_edges) != len(new_route) - 1:
+
+                print(
+                    "    REJECTED: route/edge length mismatch"
+                )
+                continue
+
+            # --------------------------------------------------
+            # Final route-edge consistency
+            # --------------------------------------------------
+
+            if not self._edges_match_route(
+                route=new_route,
+                edges=new_edges,
+            ):
+
+                print(
+                    "    REJECTED: route/edge correspondence invalid"
+                )
+                continue
+
+            print(
+                f"    Alternative suffix : {suffix}"
+            )
+
+            print(
+                f"    New route          : {new_route}"
+            )
+
+            print(
+                f"    New edges          : {new_edges}"
+            )
 
             print(
                 "    ACCEPTED"
             )
 
-            return {
-                "success": True,
-                "status": "alternative_found",
-                "reason": "partial_backtrack_success",
+            return self._result(
+                success=True,
+                status="alternative_found",
+                reason="partial_backtrack_success",
 
-                "original_route": route,
-                "new_route": new_route,
+                original_route=route,
+                new_route=new_route,
+                new_edges=new_edges,
 
-                "preserved_prefix": prefix,
-                "alternative_suffix": suffix,
+                preserved_prefix=prefix,
+                preserved_prefix_edges=prefix_edges,
 
-                "branch_point": branch_node,
-                "branch_index": branch_index,
+                alternative_suffix=suffix,
+                alternative_suffix_edges=suffix_edges,
 
-                "failed_edge": resolved_failed_edge,
-                "failure_index": resolved_failure_index,
+                branch_point=branch_node,
+                branch_index=branch_index,
 
-                "amount": amount,
-                "bucket_id": bucket_id,
+                failed_edge=resolved_failed_edge,
+                failure_index=resolved_failure_index,
 
-                "attempt_id": attempt_id + 1,
+                amount=amount,
+                bucket_id=bucket_id,
 
-                "full_reroute_required": False
-            }
+                attempt_id=attempt_id + 1,
+
+                full_reroute_required=False,
+            )
 
         # ------------------------------------------------------
-        # 6. No valid candidate
+        # 7. No candidate succeeded
         # ------------------------------------------------------
 
-        return {
-            "success": False,
-            "status": "full_reroute_required",
-            "reason": "no_valid_bucket_alternative",
+        return self._result(
+            success=False,
+            status="full_reroute_required",
+            reason="no_valid_bucket_alternative",
 
-            "original_route": route,
+            original_route=route,
 
-            "preserved_prefix": None,
-            "alternative_suffix": None,
-            "new_route": None,
+            preserved_prefix=None,
+            preserved_prefix_edges=None,
 
-            "branch_point": branch_node,
-            "branch_index": branch_index,
+            alternative_suffix=None,
+            alternative_suffix_edges=None,
 
-            "failed_edge": resolved_failed_edge,
-            "failure_index": resolved_failure_index,
+            new_route=None,
+            new_edges=None,
 
-            "amount": amount,
-            "bucket_id": bucket_id,
+            branch_point=branch_node,
+            branch_index=branch_index,
 
-            "attempt_id": attempt_id,
+            failed_edge=resolved_failed_edge,
+            failure_index=resolved_failure_index,
 
-            "full_reroute_required": True
-        }
+            amount=amount,
+            bucket_id=bucket_id,
+
+            attempt_id=attempt_id,
+
+            full_reroute_required=True,
+        )
 
     # ==========================================================
     # Bucket-aware Branch Point
@@ -417,13 +606,12 @@ class PartialBacktracker:
         failure_index,
         failed_edge,
         amount=0,
-        bucket_id=None
+        bucket_id=None,
     ):
         """
-        Find the nearest branch point that has at least one
-        currently valid Bucket alternative.
+        Search backward from the failure point.
 
-        Previously failed candidates are excluded.
+        The nearest node with a valid Bucket alternative is selected.
         """
 
         if failure_index is None:
@@ -435,98 +623,80 @@ class PartialBacktracker:
         if failure_index >= len(route) - 1:
             return None
 
-        start_index = failure_index
+        # ------------------------------------------------------
+        # Search from failed-edge source backward
+        # ------------------------------------------------------
 
         for index in range(
-            start_index,
+            failure_index,
             -1,
-            -1
+            -1,
         ):
 
             node = route[index]
 
-            # --------------------------------------------------
-            # Exclude failed edge at its origin
-            # --------------------------------------------------
-
             excluded_edge = None
 
             if index == failure_index:
-
-                excluded_edge = (
-                    route[failure_index],
-                    route[failure_index + 1]
-                )
+                excluded_edge = failed_edge
 
             # --------------------------------------------------
-            # Network feasibility
+            # A branch point must have an outgoing possibility.
             # --------------------------------------------------
 
             if not self._has_usable_outgoing_edge(
                 node=node,
                 amount=amount,
-                excluded_edge=excluded_edge
+                excluded_edge=excluded_edge,
             ):
-
                 continue
 
             # --------------------------------------------------
-            # Get Bucket candidates
+            # Retrieve Bucket candidates
             # --------------------------------------------------
 
             candidates = self.get_alternative_suffixes(
                 route=route,
                 branch_index=index,
                 failed_edge=failed_edge,
-                bucket_id=bucket_id
+                bucket_id=bucket_id,
             )
+
+            if not candidates:
+                continue
 
             valid_candidates = []
 
             # --------------------------------------------------
-            # Validate each candidate
+            # Validate every candidate
             # --------------------------------------------------
 
-            for candidate in candidates:
+            for candidate_index, candidate in enumerate(
+                candidates
+            ):
 
-                # ----------------------------------------------
-                # Never reuse failed candidate
-                # ----------------------------------------------
-
-                if self._candidate_is_failed(candidate):
-
+                if self._candidate_is_failed(
+                    candidate=candidate,
+                    candidate_index=candidate_index,
+                ):
                     continue
-
-                # ----------------------------------------------
-                # Extract candidate path
-                # ----------------------------------------------
 
                 candidate_path = self._extract_candidate_path(
                     candidate
                 )
 
-                # ----------------------------------------------
-                # Do not reuse current route
-                # ----------------------------------------------
-
-                if (
-                    candidate_path is not None
-                    and
-                    self._same_route(
-                        candidate_path,
-                        route
-                    )
-                ):
-
+                if candidate_path is None:
                     continue
 
-                # ----------------------------------------------
-                # Normalize suffix
-                # ----------------------------------------------
+                if self._same_route(
+                    candidate_path,
+                    route,
+                ):
+                    continue
 
                 suffix = self._normalize_suffix(
                     candidate=candidate,
-                    branch_node=node
+                    branch_node=node,
                 )
 
                 if suffix is None:
@@ -535,63 +705,49 @@ class PartialBacktracker:
                 if len(suffix) < 2:
                     continue
 
-                # ----------------------------------------------
-                # Must begin at branch
-                # ----------------------------------------------
-
                 if suffix[0] != node:
                     continue
 
-                # ----------------------------------------------
-                # Failed channel
-                # ----------------------------------------------
+                suffix_edges = self._extract_suffix_edges(
+                    candidate=candidate,
+                    suffix=suffix,
+                    branch_node=node,
+                )
 
                 if self._candidate_contains_failed_edge(
                     candidate=candidate,
                     suffix=suffix,
-                    failed_edge=failed_edge
+                    suffix_edges=suffix_edges,
+                    failed_edge=failed_edge,
                 ):
-
                     continue
-
-                # ----------------------------------------------
-                # Loop-free
-                # ----------------------------------------------
 
                 prefix = route[:index + 1]
 
                 if not self._is_loop_free(
                     prefix=prefix,
-                    suffix=suffix
+                    suffix=suffix,
                 ):
-
                     continue
-
-                # ----------------------------------------------
-                # Channel validation
-                # ----------------------------------------------
 
                 if not self.is_suffix_valid(
                     suffix=suffix,
-                    amount=amount
+                    amount=amount,
+                    candidate=candidate,
+                    suffix_edges=suffix_edges,
                 ):
-
                     continue
 
                 valid_candidates.append(
                     candidate
                 )
 
-            # --------------------------------------------------
-            # Found valid branch
-            # --------------------------------------------------
-
             if valid_candidates:
 
                 return {
                     "branch_index": index,
                     "branch_node": node,
-                    "candidates": valid_candidates
+                    "candidates": valid_candidates,
                 }
 
         return None
@@ -604,13 +760,14 @@ class PartialBacktracker:
         self,
         route,
         failure_index,
-        amount=0
+        amount=0,
     ):
         """
-        Legacy API.
-
-        Finds nearest network-feasible branch point.
+        Backward-compatible network-only branch-point search.
         """
+
+        if not self._validate_route(route):
+            return None
 
         if failure_index is None:
             return None
@@ -624,7 +781,7 @@ class PartialBacktracker:
         for index in range(
             failure_index,
             -1,
-            -1
+            -1,
         ):
 
             node = route[index]
@@ -635,13 +792,13 @@ class PartialBacktracker:
 
                 excluded_edge = (
                     route[failure_index],
-                    route[failure_index + 1]
+                    route[failure_index + 1],
                 )
 
             if self._has_usable_outgoing_edge(
                 node=node,
                 amount=amount,
-                excluded_edge=excluded_edge
+                excluded_edge=excluded_edge,
             ):
 
                 return index
@@ -657,32 +814,20 @@ class PartialBacktracker:
         route,
         branch_index,
         failed_edge,
-        bucket_id=None
+        bucket_id=None,
     ):
         """
-        Extract candidate routes from Bucket.
+        Retrieve candidates from Bucket.
 
-        Supported:
+        Preferred current interface
+        ----------------------------
+        Bucket.candidates
 
-            [A, B, F, G, E]
-
-            {
-                "path": [...]
-            }
-
-            {
-                "route": [...]
-            }
-
-            {
-                "suffix": [...]
-            }
-
-            (
-                path,
-                edges,
-                score
-            )
+        Backward-compatible interfaces
+        -------------------------------
+        get_alternative_routes(...)
+        get_routes(...)
+        routes
         """
 
         if self.bucket is None:
@@ -691,47 +836,67 @@ class PartialBacktracker:
         raw_candidates = []
 
         # ------------------------------------------------------
-        # Interface 1
+        # 1. Current Bucket candidates
         # ------------------------------------------------------
 
-        method = getattr(
+        candidates = getattr(
             self.bucket,
-            "get_alternative_routes",
-            None
+            "candidates",
+            None,
         )
 
-        if callable(method):
+        if candidates is not None:
 
             try:
-
-                result = method(
-                    bucket_id=bucket_id,
-                    route=route,
-                    branch_node=route[branch_index],
-                    failed_edge=failed_edge
-                )
-
-                if result is not None:
-                    raw_candidates = result
-
-            except TypeError:
-
-                try:
-
-                    raw_candidates = method(
-                        bucket_id
-                    )
-
-                except Exception:
-
-                    raw_candidates = []
-
+                raw_candidates = list(candidates)
             except Exception:
-
                 raw_candidates = []
 
         # ------------------------------------------------------
-        # Interface 2
+        # 2. get_alternative_routes
+        # ------------------------------------------------------
+
+        if not raw_candidates:
+
+            method = getattr(
+                self.bucket,
+                "get_alternative_routes",
+                None,
+            )
+
+            if callable(method):
+
+                try:
+
+                    result = method(
+                        bucket_id=bucket_id,
+                        route=route,
+                        branch_node=route[branch_index],
+                        failed_edge=failed_edge,
+                    )
+
+                    if result is not None:
+                        raw_candidates = list(result)
+
+                except TypeError:
+
+                    try:
+
+                        result = method(
+                            bucket_id
+                        )
+
+                        if result is not None:
+                            raw_candidates = list(result)
+
+                    except Exception:
+                        raw_candidates = []
+
+                except Exception:
+                    raw_candidates = []
+
+        # ------------------------------------------------------
+        # 3. get_routes
         # ------------------------------------------------------
 
         if not raw_candidates:
@@ -739,33 +904,37 @@ class PartialBacktracker:
             method = getattr(
                 self.bucket,
                 "get_routes",
-                None
+                None,
             )
 
             if callable(method):
 
                 try:
 
-                    raw_candidates = method(
+                    result = method(
                         bucket_id=bucket_id
                     )
+
+                    if result is not None:
+                        raw_candidates = list(result)
 
                 except TypeError:
 
                     try:
 
-                        raw_candidates = method()
+                        result = method()
+
+                        if result is not None:
+                            raw_candidates = list(result)
 
                     except Exception:
-
                         raw_candidates = []
 
                 except Exception:
-
                     raw_candidates = []
 
         # ------------------------------------------------------
-        # Interface 3
+        # 4. routes attribute
         # ------------------------------------------------------
 
         if not raw_candidates:
@@ -773,34 +942,23 @@ class PartialBacktracker:
             routes = getattr(
                 self.bucket,
                 "routes",
-                None
+                None,
             )
 
             if routes is not None:
-                raw_candidates = routes
+
+                try:
+                    raw_candidates = list(routes)
+                except Exception:
+                    raw_candidates = []
 
         # ------------------------------------------------------
-        # Interface 4
-        # ------------------------------------------------------
-
-        if not raw_candidates:
-
-            candidates = getattr(
-                self.bucket,
-                "candidates",
-                None
-            )
-
-            if candidates is not None:
-                raw_candidates = candidates
-
-        # ------------------------------------------------------
-        # Normalize dictionary container
+        # Normalize dictionary containers
         # ------------------------------------------------------
 
         if isinstance(
             raw_candidates,
-            dict
+            dict,
         ):
 
             raw_candidates = (
@@ -815,52 +973,143 @@ class PartialBacktracker:
             return []
 
         try:
-
             return list(raw_candidates)
-
         except Exception:
-
             return []
 
     # ==========================================================
-    # Candidate Status
+    # Candidate Failure State
     # ==========================================================
 
-    @staticmethod
     def _candidate_is_failed(
-        candidate
+        self,
+        candidate,
+        candidate_index=None,
     ):
         """
-        Return True if a Bucket candidate has already failed.
+        Determine whether a Bucket candidate has already failed.
 
-        Candidate dictionaries generated by top_k_paths use:
+        Current Bucket semantics
+        -------------------------
+        Bucket.failed_candidates stores failed candidates.
 
-            "success": None
+        Legacy fallback
+        ----------------
+        candidate["success"] is False.
 
-        before execution,
-
-            "success": True
-
-        after success,
-
-        and:
-
-            "success": False
-
-        after failure.
+        Important
+        ---------
+        This method does NOT modify Bucket state.
         """
 
-        if not isinstance(
+        if candidate is None:
+            return True
+
+        # ------------------------------------------------------
+        # Explicit candidate flag
+        # ------------------------------------------------------
+
+        if isinstance(
             candidate,
-            dict
+            dict,
         ):
 
-            return False
+            if candidate.get(
+                "success",
+                None,
+            ) is False:
 
-        return candidate.get(
-            "success",
-            None
-        ) is False
+                return True
+
+            if candidate.get(
+                "failed",
+                False,
+            ) is True:
+
+                return True
+
+        # ------------------------------------------------------
+        # Bucket-level failed_candidates
+        # ------------------------------------------------------
+
+        failed_candidates = getattr(
+            self.bucket,
+            "failed_candidates",
+            None,
+        )
+
+        if failed_candidates:
+
+            try:
+
+                for failed in failed_candidates:
+
+                    if self._candidate_identity_equal(
+                        candidate,
+                        failed,
+                    ):
+
+                        return True
+
+            except Exception:
+                pass
+
+        return False
+
+    # ==========================================================
+    # Candidate Identity
+    # ==========================================================
+
+    def _candidate_identity_equal(
+        self,
+        candidate_a,
+        candidate_b,
+    ):
+        """
+        Compare two candidate representations.
+
+        Prefer exact edges when both are available.
+        Otherwise compare normalized paths.
+        """
+
+        if candidate_a is candidate_b:
+            return True
+
+        path_a = self._extract_candidate_path(
+            candidate_a
+        )
+
+        path_b = self._extract_candidate_path(
+            candidate_b
+        )
+
+        if (
+            path_a is not None
+            and
+            path_b is not None
+            and
+            path_a == path_b
+        ):
+            return True
+
+        edges_a = self._extract_candidate_edges(
+            candidate_a
+        )
+
+        edges_b = self._extract_candidate_edges(
+            candidate_b
+        )
+
+        if (
+            edges_a is not None
+            and
+            edges_b is not None
+            and
+            edges_a == edges_b
+        ):
+            return True
+
+        return False
 
     # ==========================================================
     # Candidate Path Extraction
@@ -868,10 +1117,10 @@ class PartialBacktracker:
 
     @staticmethod
     def _extract_candidate_path(
-        candidate
+        candidate,
     ):
         """
-        Extract complete route/path from a candidate.
+        Extract candidate node path.
         """
 
         if candidate is None:
@@ -883,32 +1132,34 @@ class PartialBacktracker:
 
         if isinstance(
             candidate,
-            dict
+            dict,
         ):
 
-            if "path" in candidate:
+            path = None
 
-                path = candidate["path"]
+            for field in (
+                "path",
+                "route",
+                "suffix",
+            ):
 
-            elif "route" in candidate:
+                if field in candidate:
 
-                path = candidate["route"]
+                    path = candidate[field]
+                    break
 
-            elif "suffix" in candidate:
-
-                path = candidate["suffix"]
-
-            else:
-
+            if path is None:
                 return None
 
             try:
-
-                return list(path)
-
+                path = list(path)
             except Exception:
-
                 return None
+
+            if len(path) < 2:
+                return None
+
+            return path
 
         # ------------------------------------------------------
         # Tuple
@@ -916,20 +1167,23 @@ class PartialBacktracker:
 
         if isinstance(
             candidate,
-            tuple
+            tuple,
         ):
 
-            if len(candidate) == 0:
+            if not candidate:
                 return None
 
             first = candidate[0]
 
             if isinstance(
                 first,
-                (list, tuple)
+                (list, tuple),
             ):
 
-                return list(first)
+                path = list(first)
+
+                if len(path) >= 2:
+                    return path
 
             return None
 
@@ -939,32 +1193,97 @@ class PartialBacktracker:
 
         if isinstance(
             candidate,
-            list
+            list,
         ):
 
-            return list(candidate)
+            # A list of nodes.
+            if candidate and not isinstance(
+                candidate[0],
+                (dict, list, tuple),
+            ):
+
+                if len(candidate) >= 2:
+                    return list(candidate)
 
         return None
 
     # ==========================================================
-    # Candidate Normalization
+    # Candidate Edge Extraction
+    # ==========================================================
+
+    @staticmethod
+    def _extract_candidate_edges(
+        candidate,
+    ):
+        """
+        Extract exact candidate channel edges.
+
+        Supported forms
+        ---------------
+
+        dict:
+            {"edges": [(u,v,key), ...]}
+
+        tuple:
+            (path, edges, ...)
+
+        list:
+            No edge information is assumed.
+        """
+
+        if candidate is None:
+            return None
+
+        if isinstance(
+            candidate,
+            dict,
+        ):
+
+            edges = candidate.get(
+                "edges"
+            )
+
+            if edges is None:
+                return None
+
+            try:
+                return list(edges)
+            except Exception:
+                return None
+
+        if isinstance(
+            candidate,
+            tuple,
+        ):
+
+            if len(candidate) >= 2:
+
+                edges = candidate[1]
+
+                if isinstance(
+                    edges,
+                    (list, tuple),
+                ):
+
+                    try:
+                        return list(edges)
+                    except Exception:
+                        return None
+
+        return None
+
+    # ==========================================================
+    # Normalize Candidate Suffix
     # ==========================================================
 
     def _normalize_suffix(
         self,
         candidate,
-        branch_node
+        branch_node,
     ):
         """
-        Convert a Bucket candidate into a suffix beginning
-        at branch_node.
-
-        A complete candidate route that does not contain the
-        branch node is rejected.
+        Convert candidate route into a suffix beginning at branch_node.
         """
-
-        if candidate is None:
-            return None
 
         path = self._extract_candidate_path(
             candidate
@@ -976,12 +1295,12 @@ class PartialBacktracker:
         if len(path) < 2:
             return None
 
-        if branch_node not in path:
+        try:
+            branch_position = path.index(
+                branch_node
+            )
+        except ValueError:
             return None
-
-        branch_position = path.index(
-            branch_node
-        )
 
         suffix = path[
             branch_position:
@@ -996,132 +1315,205 @@ class PartialBacktracker:
         return suffix
 
     # ==========================================================
-    # Candidate Failed-Channel Check
+    # Extract Exact Suffix Edges
+    # ==========================================================
+
+    def _extract_suffix_edges(
+        self,
+        candidate,
+        suffix,
+        branch_node,
+    ):
+        """
+        Extract exact channel edges corresponding to suffix.
+
+        If candidate contains exact edges, preserve their keys.
+
+        If candidate contains only node path, construct exact
+        graph edges when possible.
+        """
+
+        if suffix is None or len(suffix) < 2:
+            return None
+
+        candidate_edges = self._extract_candidate_edges(
+            candidate
+        )
+
+        # ------------------------------------------------------
+        # Candidate provides exact edges
+        # ------------------------------------------------------
+
+        if candidate_edges is not None:
+
+            parsed_edges = []
+
+            for edge in candidate_edges:
+
+                parsed = self._normalize_edge(
+                    edge
+                )
+
+                if parsed is not None:
+                    parsed_edges.append(
+                        parsed
+                    )
+
+            if not parsed_edges:
+                return None
+
+            suffix_start = self._find_edge_sequence_start(
+                parsed_edges=parsed_edges,
+                suffix=suffix,
+            )
+
+            if suffix_start is None:
+                return None
+
+            suffix_length = len(suffix) - 1
+
+            selected = parsed_edges[
+                suffix_start:
+                suffix_start + suffix_length
+            ]
+
+            if len(selected) != suffix_length:
+                return None
+
+            if not self._edges_match_route(
+                route=suffix,
+                edges=selected,
+            ):
+                return None
+
+            return selected
+
+        # ------------------------------------------------------
+        # No exact candidate edges.
+        #
+        # Build a deterministic graph edge representation.
+        # ------------------------------------------------------
+
+        return self._resolve_edges_for_path(
+            path=suffix
+        )
+
+    # ==========================================================
+    # Find Edge Sequence
+    # ==========================================================
+
+    @staticmethod
+    def _find_edge_sequence_start(
+        parsed_edges,
+        suffix,
+    ):
+        """
+        Find the edge corresponding to suffix[0] -> suffix[1].
+        """
+
+        if len(suffix) < 2:
+            return None
+
+        first_u = suffix[0]
+        first_v = suffix[1]
+
+        for index, edge in enumerate(
+            parsed_edges
+        ):
+
+            if (
+                edge[0] == first_u
+                and
+                edge[1] == first_v
+            ):
+
+                return index
+
+        return None
+
+    # ==========================================================
+    # Failed Channel Reuse
     # ==========================================================
 
     def _candidate_contains_failed_edge(
         self,
         candidate,
         suffix,
-        failed_edge
+        suffix_edges,
+        failed_edge,
     ):
         """
-        Check whether a candidate reuses the failed channel.
+        Check whether candidate/suffix reuses the exact failed channel.
 
-        If candidate edge information is available, compare:
+        Rules
+        -----
+        If failed key is known:
+            exact same (u,v,key) is rejected.
 
-            (u, v, key)
+        If failed key is unknown:
+            same directed (u,v) is rejected.
 
-        exactly.
-
-        If no edge-key information is available, fall back to:
-
-            (u, v)
-
-        which is conservative for MultiDiGraph.
+        This allows a different parallel channel when the failed
+        channel key is explicitly known.
         """
 
         if failed_edge is None:
             return False
 
-        if len(failed_edge) < 2:
+        failed = self._normalize_edge(
+            failed_edge
+        )
+
+        if failed is None:
             return False
 
-        failed_u = failed_edge[0]
-        failed_v = failed_edge[1]
-
-        failed_key = None
-
-        if len(failed_edge) >= 3:
-            failed_key = failed_edge[2]
+        failed_u, failed_v, failed_key = failed
 
         # ------------------------------------------------------
-        # Prefer exact candidate edge information
+        # Prefer exact suffix edges
         # ------------------------------------------------------
 
-        candidate_edges = None
+        if suffix_edges is not None:
 
-        if isinstance(
-            candidate,
-            dict
-        ):
+            for edge in suffix_edges:
 
-            candidate_edges = candidate.get(
-                "edges"
-            )
+                parsed = self._normalize_edge(
+                    edge
+                )
 
-        elif isinstance(
-            candidate,
-            tuple
-        ):
-
-            if len(candidate) >= 2:
-
-                possible_edges = candidate[1]
-
-                if isinstance(
-                    possible_edges,
-                    (list, tuple)
-                ):
-
-                    candidate_edges = possible_edges
-
-        # ------------------------------------------------------
-        # Exact edge comparison
-        # ------------------------------------------------------
-
-        if candidate_edges is not None:
-
-            for edge in candidate_edges:
-
-                if not isinstance(
-                    edge,
-                    (list, tuple)
-                ):
-
+                if parsed is None:
                     continue
 
-                if len(edge) < 2:
-                    continue
-
-                u = edge[0]
-                v = edge[1]
+                u, v, key = parsed
 
                 if (
                     u != failed_u
                     or
                     v != failed_v
                 ):
-
                     continue
 
-                # If failed key is known and candidate key is
-                # also known, compare exact channel.
-                if (
-                    failed_key is not None
-                    and
-                    len(edge) >= 3
-                ):
+                # Exact failed channel known.
+                if failed_key is not None:
 
-                    if edge[2] == failed_key:
+                    if key == failed_key:
                         return True
 
-                    # Same directed endpoints but a different
-                    # channel key: this is a different channel.
+                    # Different parallel channel is allowed.
                     continue
 
-                # No exact key available -> conservative.
+                # Failed channel key unknown.
                 return True
 
             return False
 
         # ------------------------------------------------------
-        # Fallback to path-level comparison
+        # Path-level fallback
         # ------------------------------------------------------
 
         return self._contains_failed_edge(
             suffix=suffix,
-            failed_edge=failed_edge
+            failed_edge=failed_edge,
         )
 
     # ==========================================================
@@ -1131,143 +1523,282 @@ class PartialBacktracker:
     def is_suffix_valid(
         self,
         suffix,
-        amount=0
+        amount=0,
+        candidate=None,
+        suffix_edges=None,
     ):
         """
-        Validate every channel in suffix.
+        Validate every hop of an alternative suffix.
+
+        Important
+        ---------
+        Capacity is NEVER interpreted as directional liquidity.
+
+        If exact candidate edges exist, their exact channel keys
+        are validated.
+
+        If only a node path exists, a usable graph channel is
+        selected as fallback.
         """
 
-        if not suffix:
+        if suffix is None:
             return False
 
         if len(suffix) < 2:
             return False
 
+        # ------------------------------------------------------
+        # Validate nodes first
+        # ------------------------------------------------------
+
+        for node in suffix:
+
+            if self.network is None:
+                return False
+
+            try:
+
+                if node not in self.network.nodes:
+                    return False
+
+                if not self._node_is_available(
+                    self.network.nodes[node]
+                ):
+                    return False
+
+            except Exception:
+
+                return False
+
+        # ------------------------------------------------------
+        # Exact suffix edges
+        # ------------------------------------------------------
+
+        if suffix_edges is not None:
+
+            if len(suffix_edges) != len(suffix) - 1:
+                return False
+
+            if not self._edges_match_route(
+                route=suffix,
+                edges=suffix_edges,
+            ):
+                return False
+
+            for edge in suffix_edges:
+
+                parsed = self._normalize_edge(
+                    edge
+                )
+
+                if parsed is None:
+                    return False
+
+                u, v, key = parsed
+
+                if not self._exact_channel_available(
+                    u=u,
+                    v=v,
+                    key=key,
+                    amount=amount,
+                ):
+                    return False
+
+            return True
+
+        # ------------------------------------------------------
+        # Path-only fallback
+        # ------------------------------------------------------
+
         for u, v in zip(
             suffix[:-1],
-            suffix[1:]
+            suffix[1:],
         ):
-
-            if not self._edge_exists(
-                u,
-                v
-            ):
-
-                return False
-
-            if not self._nodes_available(
-                u,
-                v
-            ):
-
-                return False
 
             if not self._channel_available(
                 u,
                 v,
-                amount
+                amount,
             ):
-
                 return False
 
         return True
 
     # ==========================================================
-    # Failed Edge Resolution
+    # Exact Channel Availability
+    # ==========================================================
+
+    def _exact_channel_available(
+        self,
+        u,
+        v,
+        key,
+        amount,
+    ):
+        """
+        Validate one exact channel.
+
+        Capacity is ignored as liquidity.
+        """
+
+        if self.network is None:
+            return False
+
+        try:
+
+            if not self.network.has_edge(
+                u,
+                v,
+            ):
+                return False
+
+            if self.network.is_multigraph():
+
+                edge_data = self.network.get_edge_data(
+                    u,
+                    v,
+                )
+
+                if not edge_data:
+                    return False
+
+                data = edge_data.get(
+                    key
+                )
+
+                if data is None:
+                    return False
+
+            else:
+
+                data = self.network.get_edge_data(
+                    u,
+                    v,
+                )
+
+                if data is None:
+                    return False
+
+            return self._edge_data_usable(
+                data=data,
+                amount=amount,
+            )
+
+        except Exception:
+
+            return False
+
+    # ==========================================================
+    # Resolve Failed Edge
     # ==========================================================
 
     def _resolve_failed_edge(
         self,
         route,
         failed_edge,
-        failure_index
+        failure_index,
     ):
         """
-        Normalize failed edge to:
+        Resolve failed edge.
 
-            (u, v)
-
-        or:
-
-            (u, v, key)
+        Priority
+        --------
+        1. Explicit failed_edge.
+        2. failure_index -> route edge.
         """
 
         if failed_edge is not None:
 
-            if not isinstance(
-                failed_edge,
-                (list, tuple)
-            ):
-
-                return None
-
-            if len(failed_edge) < 2:
-                return None
-
-            if len(failed_edge) >= 3:
-
-                return (
-                    failed_edge[0],
-                    failed_edge[1],
-                    failed_edge[2]
-                )
-
-            return (
-                failed_edge[0],
-                failed_edge[1]
+            parsed = self._normalize_edge(
+                failed_edge
             )
+
+            if parsed is not None:
+
+                return parsed
+
+            return None
 
         if failure_index is not None:
 
-            if (
-                0 <= failure_index < len(route) - 1
-            ):
+            try:
 
-                return (
-                    route[failure_index],
-                    route[failure_index + 1]
-                )
+                if (
+                    0 <= failure_index < len(route) - 1
+                ):
+
+                    return (
+                        route[failure_index],
+                        route[failure_index + 1],
+                        None,
+                    )
+
+            except Exception:
+                return None
 
         return None
 
     # ==========================================================
-    # Failure Index
+    # Resolve Failure Index
     # ==========================================================
 
     def _resolve_failure_index(
         self,
         route,
         failed_edge,
-        failure_index
+        failure_index,
     ):
         """
-        Resolve failed edge position in route.
+        Resolve the exact failed-hop position.
+
+        If an explicit index matches endpoints, use it.
+
+        Otherwise search the route.
+
+        If an exact channel key is available and route-edge
+        information can be resolved, prefer the exact key.
         """
 
         if failed_edge is None:
             return None
 
-        failed_u = failed_edge[0]
-        failed_v = failed_edge[1]
+        failed_u, failed_v, failed_key = self._normalize_edge(
+            failed_edge
+        )
+
+        # ------------------------------------------------------
+        # Explicit index
+        # ------------------------------------------------------
 
         if failure_index is not None:
 
-            if (
-                0 <= failure_index < len(route) - 1
-            ):
+            try:
 
                 if (
-                    route[failure_index] == failed_u
-                    and
-                    route[failure_index + 1] == failed_v
+                    0 <= failure_index < len(route) - 1
                 ):
 
-                    return failure_index
+                    if (
+                        route[failure_index] == failed_u
+                        and
+                        route[failure_index + 1] == failed_v
+                    ):
+
+                        return failure_index
+
+            except Exception:
+                pass
+
+        # ------------------------------------------------------
+        # Endpoint search
+        # ------------------------------------------------------
+
+        matching_indices = []
 
         for index, (u, v) in enumerate(
             zip(
                 route[:-1],
-                route[1:]
+                route[1:],
             )
         ):
 
@@ -1277,42 +1808,277 @@ class PartialBacktracker:
                 v == failed_v
             ):
 
-                return index
+                matching_indices.append(
+                    index
+                )
+
+        if not matching_indices:
+            return None
+
+        # A valid route must not contain repeated nodes, so there
+        # should normally be only one matching directed hop.
+        return matching_indices[0]
+
+    # ==========================================================
+    # Route Edge Resolution
+    # ==========================================================
+
+    def _resolve_route_edges_for_prefix(
+        self,
+        route,
+        end_index,
+    ):
+        """
+        Resolve exact edges for route[0:end_index+1].
+
+        Returns the first end_index hops.
+
+        This is required to preserve exact MultiDiGraph channel
+        identity in the reconstructed route.
+        """
+
+        if end_index <= 0:
+            return []
+
+        prefix = route[
+            :end_index + 1
+        ]
+
+        return self._resolve_edges_for_path(
+            path=prefix
+        )
+
+    # ==========================================================
+    # Resolve Edges for Node Path
+    # ==========================================================
+
+    def _resolve_edges_for_path(
+        self,
+        path,
+    ):
+        """
+        Resolve graph edges for a node path.
+
+        MultiDiGraph
+        ------------
+        If multiple channels exist, the first currently usable
+        channel is selected.
+
+        This function is a FALLBACK only.
+
+        Exact candidate edges should always be preferred.
+        """
+
+        if self.network is None:
+            return None
+
+        if path is None or len(path) < 2:
+            return []
+
+        edges = []
+
+        for u, v in zip(
+            path[:-1],
+            path[1:],
+        ):
+
+            if not self.network.has_edge(
+                u,
+                v,
+            ):
+                return None
+
+            if self.network.is_multigraph():
+
+                edge_data = self.network.get_edge_data(
+                    u,
+                    v,
+                )
+
+                if not edge_data:
+                    return None
+
+                selected = None
+
+                for key, data in edge_data.items():
+
+                    if self._edge_data_usable(
+                        data=data,
+                        amount=0,
+                    ):
+
+                        selected = (
+                            u,
+                            v,
+                            key,
+                        )
+
+                        break
+
+                if selected is None:
+                    return None
+
+                edges.append(
+                    selected
+                )
+
+            else:
+
+                edges.append(
+                    (
+                        u,
+                        v,
+                        None,
+                    )
+                )
+
+        return edges
+
+    # ==========================================================
+    # Normalize Edge
+    # ==========================================================
+
+    @staticmethod
+    def _normalize_edge(
+        edge,
+    ):
+        """
+        Normalize 2-tuple/3-tuple edge.
+
+        Returns:
+            (u, v, key)
+        """
+
+        if edge is None:
+            return None
+
+        if not isinstance(
+            edge,
+            (list, tuple),
+        ):
+            return None
+
+        if len(edge) == 2:
+
+            return (
+                edge[0],
+                edge[1],
+                None,
+            )
+
+        if len(edge) >= 3:
+
+            return (
+                edge[0],
+                edge[1],
+                edge[2],
+            )
 
         return None
 
     # ==========================================================
-    # Failed Edge Reuse
+    # Combine Edges
+    # ==========================================================
+
+    @staticmethod
+    def _combine_edges(
+        prefix_edges,
+        suffix_edges,
+    ):
+        """
+        Combine exact prefix and suffix edge sequences.
+
+        Since the branch node is shared, no edge is duplicated.
+        """
+
+        if prefix_edges is None:
+            return None
+
+        if suffix_edges is None:
+            return None
+
+        return (
+            list(prefix_edges)
+            +
+            list(suffix_edges)
+        )
+
+    # ==========================================================
+    # Edge/Route Consistency
+    # ==========================================================
+
+    @staticmethod
+    def _edges_match_route(
+        route,
+        edges,
+    ):
+        """
+        Verify exact endpoint correspondence between route and edges.
+
+        Channel keys are not compared to node route because the
+        route contains nodes only.
+        """
+
+        if route is None or edges is None:
+            return False
+
+        if len(edges) != len(route) - 1:
+            return False
+
+        for index, edge in enumerate(
+            edges
+        ):
+
+            parsed = PartialBacktracker._normalize_edge(
+                edge
+            )
+
+            if parsed is None:
+                return False
+
+            u, v, _ = parsed
+
+            if (
+                u != route[index]
+                or
+                v != route[index + 1]
+            ):
+
+                return False
+
+        return True
+
+    # ==========================================================
+    # Failed Edge Reuse - Path Fallback
     # ==========================================================
 
     @staticmethod
     def _contains_failed_edge(
         suffix,
-        failed_edge
+        failed_edge,
     ):
         """
-        Path-level fallback check.
+        Path-level failed-edge check.
 
-        This checks directed endpoints:
-
-            u -> v
-
-        and is used only when exact candidate edge-key
-        information is unavailable.
+        If failed channel key is unavailable, directed endpoints
+        are used.
         """
 
-        if failed_edge is None:
+        if suffix is None or failed_edge is None:
             return False
 
-        if len(failed_edge) < 2:
+        failed = PartialBacktracker._normalize_edge(
+            failed_edge
+        )
+
+        if failed is None:
             return False
 
-        failed_u = failed_edge[0]
-        failed_v = failed_edge[1]
+        failed_u, failed_v, _ = failed
 
         for u, v in zip(
             suffix[:-1],
-            suffix[1:]
+            suffix[1:],
         ):
 
             if (
@@ -1332,21 +2098,14 @@ class PartialBacktracker:
     @staticmethod
     def _same_route(
         route_a,
-        route_b
+        route_b,
     ):
-        """
-        Compare two routes.
-        """
-
         if route_a is None or route_b is None:
             return False
 
         try:
-
             return list(route_a) == list(route_b)
-
         except Exception:
-
             return False
 
     # ==========================================================
@@ -1356,42 +2115,41 @@ class PartialBacktracker:
     def _is_loop_free(
         self,
         prefix,
-        suffix
+        suffix,
     ):
         """
-        Check complete route for repeated nodes.
+        Validate complete reconstructed route.
         """
 
         combined = self._combine_route(
-            prefix,
-            suffix
+            prefix=prefix,
+            suffix=suffix,
         )
 
-        return len(combined) == len(
-            set(combined)
-        )
+        if not combined:
+            return False
+
+        try:
+
+            return len(combined) == len(
+                set(combined)
+            )
+
+        except TypeError:
+
+            return False
 
     # ==========================================================
-    # Combine
+    # Combine Routes
     # ==========================================================
 
     @staticmethod
     def _combine_route(
         prefix,
-        suffix
+        suffix,
     ):
         """
-        Combine:
-
-            A -> B
-
-        with:
-
-            B -> F -> G -> E
-
-        into:
-
-            A -> B -> F -> G -> E
+        Combine prefix and suffix at their shared branch node.
         """
 
         prefix = list(prefix)
@@ -1406,11 +2164,16 @@ class PartialBacktracker:
         if prefix[-1] == suffix[0]:
 
             return (
-                prefix +
+                prefix
+                +
                 suffix[1:]
             )
 
-        return prefix + suffix
+        return (
+            prefix
+            +
+            suffix
+        )
 
     # ==========================================================
     # Edge Exists
@@ -1419,16 +2182,18 @@ class PartialBacktracker:
     def _edge_exists(
         self,
         u,
-        v
+        v,
     ):
         if self.network is None:
             return False
 
         try:
 
-            return self.network.has_edge(
-                u,
-                v
+            return bool(
+                self.network.has_edge(
+                    u,
+                    v,
+                )
             )
 
         except Exception:
@@ -1442,8 +2207,11 @@ class PartialBacktracker:
     def _nodes_available(
         self,
         u,
-        v
+        v,
     ):
+        if self.network is None:
+            return False
+
         try:
 
             u_data = self.network.nodes[u]
@@ -1453,33 +2221,44 @@ class PartialBacktracker:
 
             return False
 
-        u_available = u_data.get(
-            "available",
-            u_data.get(
-                "online",
-                u_data.get(
-                    "is_online",
-                    True
-                )
-            )
-        )
-
-        v_available = v_data.get(
-            "available",
-            v_data.get(
-                "online",
-                v_data.get(
-                    "is_online",
-                    True
-                )
-            )
-        )
-
         return (
-            bool(u_available)
+            self._node_is_available(u_data)
             and
-            bool(v_available)
+            self._node_is_available(v_data)
         )
+
+    @staticmethod
+    def _node_is_available(
+        data,
+    ):
+        """
+        Explicit False means unavailable.
+
+        Missing attributes mean available.
+        """
+
+        if data.get(
+            "available",
+            True,
+        ) is False:
+
+            return False
+
+        if data.get(
+            "is_online",
+            True,
+        ) is False:
+
+            return False
+
+        if data.get(
+            "online",
+            True,
+        ) is False:
+
+            return False
+
+        return True
 
     # ==========================================================
     # Channel Availability
@@ -1489,19 +2268,22 @@ class PartialBacktracker:
         self,
         u,
         v,
-        amount
+        amount,
     ):
         """
-        Check at least one usable channel u -> v.
+        Check whether at least one usable channel exists.
 
-        Supports DiGraph and MultiDiGraph.
+        Capacity is deliberately ignored as liquidity.
         """
+
+        if self.network is None:
+            return False
 
         try:
 
             edge_data = self.network.get_edge_data(
                 u,
-                v
+                v,
             )
 
         except Exception:
@@ -1516,8 +2298,8 @@ class PartialBacktracker:
             for _, data in edge_data.items():
 
                 if self._edge_data_usable(
-                    data,
-                    amount
+                    data=data,
+                    amount=amount,
                 ):
 
                     return True
@@ -1525,97 +2307,112 @@ class PartialBacktracker:
             return False
 
         return self._edge_data_usable(
-            edge_data,
-            amount
+            data=edge_data,
+            amount=amount,
         )
 
     # ==========================================================
     # Edge Data Validation
     # ==========================================================
 
+    @staticmethod
     def _edge_data_usable(
-        self,
         data,
-        amount
+        amount,
     ):
+        """
+        Validate structural/runtime channel usability.
+
+        IMPORTANT
+        ---------
+        capacity is NOT directional liquidity.
+
+        Directional liquidity is checked only from:
+
+            balance_uv
+            liquidity_uv
+            liquidity
+            estimated_liquidity
+
+        Unknown liquidity is accepted.
+        """
+
         if not data:
             return False
 
-        if not data.get(
+        if data.get(
             "available",
-            True
-        ):
+            True,
+        ) is False:
 
             return False
 
         # ------------------------------------------------------
-        # Capacity
+        # Directional liquidity only
         # ------------------------------------------------------
 
-        capacity = data.get(
-            "capacity",
-            None
-        )
+        directional_liquidity = None
 
-        if capacity is not None:
-
-            try:
-
-                if float(capacity) < float(amount):
-                    return False
-
-            except (
-                TypeError,
-                ValueError
-            ):
-
-                return False
-
-        # ------------------------------------------------------
-        # Directional balance
-        # ------------------------------------------------------
-
-        balance = data.get(
+        for field in (
             "balance_uv",
-            None
-        )
-
-        if balance is not None:
-
-            try:
-
-                if float(balance) < float(amount):
-                    return False
-
-            except (
-                TypeError,
-                ValueError
-            ):
-
-                return False
-
-        # ------------------------------------------------------
-        # Generic liquidity
-        # ------------------------------------------------------
-
-        liquidity = data.get(
+            "liquidity_uv",
             "liquidity",
-            None
-        )
+            "estimated_liquidity",
+        ):
 
-        if liquidity is not None:
+            value = data.get(
+                field,
+                None,
+            )
+
+            if value is None:
+                continue
 
             try:
 
-                if float(liquidity) < float(amount):
+                value = float(value)
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                continue
+
+            if value < 0:
+                continue
+
+            directional_liquidity = value
+            break
+
+        # ------------------------------------------------------
+        # Known liquidity
+        # ------------------------------------------------------
+
+        if directional_liquidity is not None:
+
+            try:
+
+                if directional_liquidity < float(
+                    amount
+                ):
+
                     return False
 
             except (
                 TypeError,
-                ValueError
+                ValueError,
             ):
 
                 return False
+
+        # ------------------------------------------------------
+        # Unknown liquidity
+        # ------------------------------------------------------
+
+        # Unknown directional liquidity does NOT imply zero.
+        # Stochastic forwarding failure belongs to FailureModel,
+        # not to structural backtracking validation.
 
         return True
 
@@ -1627,12 +2424,22 @@ class PartialBacktracker:
         self,
         node,
         amount=0,
-        excluded_edge=None
+        excluded_edge=None,
     ):
+        """
+        Check whether node has an outgoing usable channel.
+
+        If the failed edge has an exact key, another parallel
+        channel is allowed.
+        """
+
         if self.network is None:
             return False
 
         try:
+
+            if node not in self.network:
+                return False
 
             neighbors = self.network.successors(
                 node
@@ -1644,20 +2451,96 @@ class PartialBacktracker:
 
         for neighbor in neighbors:
 
+            # --------------------------------------------------
+            # Excluded endpoint
+            # --------------------------------------------------
+
             if excluded_edge is not None:
 
-                if (
-                    node == excluded_edge[0]
-                    and
-                    neighbor == excluded_edge[1]
-                ):
+                failed = self._normalize_edge(
+                    excluded_edge
+                )
 
-                    continue
+                if failed is not None:
+
+                    failed_u, failed_v, failed_key = failed
+
+                    if (
+                        node == failed_u
+                        and
+                        neighbor == failed_v
+                    ):
+
+                        # Exact failed channel:
+                        # check whether another parallel channel
+                        # remains usable.
+                        if (
+                            failed_key is not None
+                            and
+                            self._has_another_usable_channel(
+                                u=node,
+                                v=neighbor,
+                                amount=amount,
+                                excluded_key=failed_key,
+                            )
+                        ):
+
+                            return True
+
+                        # If failed key is unknown, the entire
+                        # directed endpoint is excluded.
+                        continue
 
             if self._channel_available(
                 node,
                 neighbor,
-                amount
+                amount,
+            ):
+
+                return True
+
+        return False
+
+    # ==========================================================
+    # Another Parallel Channel
+    # ==========================================================
+
+    def _has_another_usable_channel(
+        self,
+        u,
+        v,
+        amount,
+        excluded_key,
+    ):
+        """
+        Check whether another usable parallel channel exists.
+        """
+
+        if not self._is_multigraph():
+            return False
+
+        try:
+
+            edge_data = self.network.get_edge_data(
+                u,
+                v,
+            )
+
+        except Exception:
+
+            return False
+
+        if not edge_data:
+            return False
+
+        for key, data in edge_data.items():
+
+            if key == excluded_key:
+                continue
+
+            if self._edge_data_usable(
+                data=data,
+                amount=amount,
             ):
 
                 return True
@@ -1670,11 +2553,18 @@ class PartialBacktracker:
 
     @staticmethod
     def _validate_route(
-        route
+        route,
     ):
+        """
+        Basic node-route validation.
+
+        Repeated nodes are rejected because the intended payment
+        route must be loop-free.
+        """
+
         if not isinstance(
             route,
-            (list, tuple)
+            (list, tuple),
         ):
 
             return False
@@ -1684,7 +2574,10 @@ class PartialBacktracker:
 
         try:
 
-            if len(route) != len(set(route)):
+            if len(route) != len(
+                set(route)
+            ):
+
                 return False
 
         except TypeError:
@@ -1704,13 +2597,15 @@ class PartialBacktracker:
         if self.network is None:
             return False
 
-        return bool(
-            getattr(
-                self.network,
-                "is_multigraph",
-                lambda: False
-            )()
-        )
+        try:
+
+            return bool(
+                self.network.is_multigraph()
+            )
+
+        except Exception:
+
+            return False
 
     # ==========================================================
     # Result Helper
@@ -1722,23 +2617,29 @@ class PartialBacktracker:
         status,
         reason,
         original_route,
-        **kwargs
+        **kwargs,
     ):
+        """
+        Build normalized result dictionary.
+        """
+
         result = {
-            "success": success,
+            "success": bool(success),
             "status": status,
             "reason": reason,
             "original_route": (
                 list(original_route)
                 if isinstance(
                     original_route,
-                    (list, tuple)
+                    (list, tuple),
                 )
                 else original_route
-            )
+            ),
         }
 
-        result.update(kwargs)
+        result.update(
+            kwargs
+        )
 
         return result
 
@@ -1758,10 +2659,17 @@ if __name__ == "__main__":
 
     import networkx as nx
 
+    print("=" * 78)
+    print("PARTIAL BACKTRACKING MODULE TEST")
+    print("=" * 78)
+
+    # ----------------------------------------------------------
+    # Build graph
+    # ----------------------------------------------------------
+
     G = nx.MultiDiGraph()
 
     edges = [
-
         ("A", "B"),
         ("B", "C"),
         ("C", "D"),
@@ -1769,7 +2677,7 @@ if __name__ == "__main__":
 
         ("B", "F"),
         ("F", "G"),
-        ("G", "E")
+        ("G", "E"),
     ]
 
     for u, v in edges:
@@ -1779,54 +2687,72 @@ if __name__ == "__main__":
             v,
             capacity=10000,
             balance_uv=10000,
-            available=True
+            available=True,
         )
 
-        G.nodes[u]["available"] = True
-        G.nodes[v]["available"] = True
+    for node in G.nodes:
+
+        G.nodes[node]["available"] = True
+        G.nodes[node]["is_online"] = True
+
+    # ----------------------------------------------------------
+    # Bucket test object
+    # ----------------------------------------------------------
 
     class TestBucket:
 
-        def get_alternative_routes(
-            self,
-            bucket_id=None,
-            route=None,
-            branch_node=None,
-            failed_edge=None
-        ):
+        def __init__(self):
 
-            return [
+            self.attempts = 0
 
+            self.failed_candidates = []
+
+            self.candidates = [
                 {
                     "route": [
                         "A",
                         "B",
                         "F",
                         "G",
-                        "E"
-                    ]
+                        "E",
+                    ],
+                    "edges": [
+                        ("A", "B", 0),
+                        ("B", "F", 0),
+                        ("F", "G", 0),
+                        ("G", "E", 0),
+                    ],
                 }
-
             ]
+
+    bucket = TestBucket()
 
     backtracker = PartialBacktracker(
         network=G,
-        bucket=TestBucket()
+        bucket=bucket,
     )
+
+    # ----------------------------------------------------------
+    # Current failed route
+    # ----------------------------------------------------------
 
     route = [
         "A",
         "B",
         "C",
         "D",
-        "E"
+        "E",
     ]
 
     failed_edge = (
         "C",
         "D",
-        0
+        0,
     )
+
+    # ----------------------------------------------------------
+    # Execute
+    # ----------------------------------------------------------
 
     result = backtracker.backtrack(
         route=route,
@@ -1834,13 +2760,17 @@ if __name__ == "__main__":
         failure_index=2,
         amount=1000,
         bucket_id="B001",
-        attempt_id=0
+        attempt_id=0,
     )
 
+    # ----------------------------------------------------------
+    # Print result
+    # ----------------------------------------------------------
+
     print()
-    print("=" * 70)
-    print("PARTIAL BACKTRACKING TEST")
-    print("=" * 70)
+    print("-" * 78)
+    print("RESULT")
+    print("-" * 78)
 
     print(
         f"Status              : "
@@ -1860,6 +2790,11 @@ if __name__ == "__main__":
     print(
         f"Branch point        : "
         f"{result.get('branch_point')}"
+    )
+
+    print(
+        f"Branch index        : "
+        f"{result.get('branch_index')}"
     )
 
     print(
@@ -1883,13 +2818,28 @@ if __name__ == "__main__":
     )
 
     print(
+        f"Prefix edges        : "
+        f"{result.get('preserved_prefix_edges')}"
+    )
+
+    print(
         f"Alternative suffix  : "
         f"{result.get('alternative_suffix')}"
     )
 
     print(
+        f"Suffix edges        : "
+        f"{result.get('alternative_suffix_edges')}"
+    )
+
+    print(
         f"New route           : "
         f"{result.get('new_route')}"
+    )
+
+    print(
+        f"New edges           : "
+        f"{result.get('new_edges')}"
     )
 
     print(
@@ -1902,20 +2852,75 @@ if __name__ == "__main__":
         f"{result.get('attempt_id')}"
     )
 
-    print("=" * 70)
+    print(
+        f"Bucket attempts     : "
+        f"{bucket.attempts}"
+    )
 
-    if (
-        result.get("success")
-        and
-        result.get("status") == "alternative_found"
-    ):
+    print("-" * 78)
 
-        print(
-            "PARTIAL BACKTRACKING STATUS : SUCCESS"
-        )
+    # ----------------------------------------------------------
+    # Assertions
+    # ----------------------------------------------------------
 
-    else:
+    assert result["success"] is True
+    assert result["status"] == "alternative_found"
 
-        print(
-            "PARTIAL BACKTRACKING STATUS : FAILED"
-        )
+    assert result["branch_point"] == "B"
+    assert result["branch_index"] == 1
+
+    assert result["failed_edge"] == (
+        "C",
+        "D",
+        0,
+    )
+
+    assert result["failure_index"] == 2
+
+    assert result["preserved_prefix"] == [
+        "A",
+        "B",
+    ]
+
+    assert result["alternative_suffix"] == [
+        "B",
+        "F",
+        "G",
+        "E",
+    ]
+
+    assert result["new_route"] == [
+        "A",
+        "B",
+        "F",
+        "G",
+        "E",
+    ]
+
+    assert result["new_edges"] == [
+        ("A", "B", 0),
+        ("B", "F", 0),
+        ("F", "G", 0),
+        ("G", "E", 0),
+    ]
+
+    # Bucket.attempts must NOT be changed by backtracking.
+    assert bucket.attempts == 0
+
+    print()
+    print(
+        "PARTIAL BACKTRACKING STATUS : SUCCESS"
+    )
+    print(
+        "Bucket.attempts unchanged     : PASS"
+    )
+    print(
+        "Exact channel keys preserved  : PASS"
+    )
+    print(
+        "Route/edge consistency        : PASS"
+    )
+    print(
+        "Capacity != liquidity rule    : PASS"
+    )
+    print("=" * 78)

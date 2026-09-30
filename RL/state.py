@@ -47,7 +47,7 @@ M = 5
 # 7   geographic_distance
 # 8   inter_country
 # 9   inter_continent
-# 10  carbon_intensity
+# 10  regcolor
 #
 # Therefore:
 #
@@ -79,7 +79,7 @@ FEATURE_NAMES = (
     "geographic_distance",
     "inter_country",
     "inter_continent",
-    "carbon_intensity"
+    "regcolor"
 )
 
 FEATURE_DIM = len(
@@ -104,7 +104,7 @@ LOG_FEATURES = {
     "capacity",
     "delay",
     "geographic_distance",
-    "carbon_intensity"
+    "regcolor"
 }
 
 
@@ -856,7 +856,7 @@ class State:
 
             carbon = self._safe_float(
                 geo.get(
-                    "carbon_intensity",
+                    "regcolor",
                     0.0
                 )
             )
@@ -904,7 +904,7 @@ class State:
             "inter_continent":
                 inter_continent,
 
-            "carbon_intensity":
+            "regcolor":
                 carbon
         }
 
@@ -1347,7 +1347,7 @@ def fit_normalization_stats(
 
             carbon = State._safe_float(
                 geo.get(
-                    "carbon_intensity",
+                    "regcolor",
                     0.0
                 )
             )
@@ -1379,7 +1379,7 @@ def fit_normalization_stats(
                 "geographic_distance":
                     distance,
 
-                "carbon_intensity":
+                "regcolor":
                     carbon
             }
 

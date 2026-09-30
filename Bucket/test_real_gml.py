@@ -1,21 +1,49 @@
-# Bucket/test_real_gml.py
-
 """
-Test the complete Bucket module using the real
+Bucket/test_real_gml.py
+
+Integration test for the Bucket module using the real
 Lightning Network topology:
 
     20190501.gml.geo
 
-Tested components:
+Tested components
+-----------------
+1. Real GML loading
+2. Graph normalization
+3. Real Top-K candidate generation
+4. CandidateManager
+5. Bucket creation
+6. Candidate validation
+7. Forced channel failure
+8. Bucket Backtracker
+9. Candidate fallback
+10. Final Bucket statistics
 
-    1. GML loading
-    2. Candidate generation
-    3. CandidateManager
-    4. Bucket
-    5. Backtracker
-    6. Channel failure
-    7. Candidate fallback
-    8. Final Bucket statistics
+Important
+---------
+This test uses the existing Pathfinding module for candidate
+generation.
+
+It does NOT use:
+- PPO / RL
+- PaymentSimulator
+- FailureModel
+- PartialBacktracker
+- Onion routing
+
+The purpose of this test is specifically to verify:
+
+    Real GML
+        ↓
+    Pathfinding Top-K
+        ↓
+    CandidateManager
+        ↓
+    Bucket
+        ↓
+    Backtracker
+        ↓
+    Alternative Candidate
 """
 
 import random
@@ -26,6 +54,9 @@ import networkx as nx
 from Bucket.bucket import Bucket
 from Bucket.candidate_manager import CandidateManager
 from Bucket.backtrack import Backtracker
+
+from Pathfinding.top_k_paths import top_k_paths
+from Pathfinding.heuristics import lnd_cost
 
 
 # ==========================================================
@@ -39,21 +70,34 @@ GML_FILE = (
 
 K_CANDIDATES = 5
 
-PAYMENT_AMOUNT = 50_000
+PAYMENT_AMOUNT = 10_000
 
-MAX_HOPS = 8
+MAX_HOPS = 12
+
+ETA = 0.5
+
+LAMBDA_H = 1.0
 
 SEED = 42
 
 
 # ==========================================================
-# Real GML Test Class
+# Real GML Bucket Test
 # ==========================================================
 
 class BucketRealGMLTest:
     """
-    Test the complete Bucket module on the real
-    Lightning Network GML topology.
+    Integration test for:
+
+        Pathfinding
+            ↓
+        CandidateManager
+            ↓
+        Bucket
+            ↓
+        Backtracker
+
+    using the real Lightning Network GML snapshot.
     """
 
     def __init__(
@@ -62,20 +106,36 @@ class BucketRealGMLTest:
         k=K_CANDIDATES,
         amount=PAYMENT_AMOUNT,
         max_hops=MAX_HOPS,
+        eta=ETA,
+        lambda_h=LAMBDA_H,
         seed=SEED
     ):
 
-        self.gml_path = Path(gml_path)
+        self.gml_path = Path(
+            gml_path
+        )
 
-        self.k = k
+        self.k = int(k)
 
-        self.amount = amount
+        self.amount = float(amount)
 
-        self.max_hops = max_hops
+        self.max_hops = int(max_hops)
 
-        self.rng = random.Random(seed)
+        self.eta = float(eta)
+
+        self.lambda_h = float(lambda_h)
+
+        self.seed = seed
+
+        self.rng = random.Random(
+            seed
+        )
 
         self.G = None
+
+        self.source = None
+
+        self.target = None
 
         self.candidates = []
 
@@ -84,6 +144,8 @@ class BucketRealGMLTest:
         self.bucket = None
 
         self.backtracker = None
+
+        self.forced_failed_edge = None
 
     # ======================================================
     # 1. Load GML
@@ -103,19 +165,18 @@ class BucketRealGMLTest:
             )
 
         print(
-            f"Loading:\n{self.gml_path}"
+            f"Loading:\n"
+            f"  {self.gml_path}"
         )
 
-        # NetworkX reads GML directly.
         G = nx.read_gml(
             self.gml_path,
             label=None
         )
 
-        # Convert to MultiDiGraph so that the
-        # Bucket module can use:
-        #
-        # G.edges[u, v, k]
+        # --------------------------------------------------
+        # Normalize to MultiDiGraph
+        # --------------------------------------------------
 
         if isinstance(
             G,
@@ -123,6 +184,24 @@ class BucketRealGMLTest:
         ):
 
             self.G = G
+
+        elif isinstance(
+            G,
+            nx.MultiGraph
+        ):
+
+            self.G = nx.MultiDiGraph(
+                G
+            )
+
+        elif isinstance(
+            G,
+            nx.DiGraph
+        ):
+
+            self.G = nx.MultiDiGraph(
+                G
+            )
 
         else:
 
@@ -149,46 +228,65 @@ class BucketRealGMLTest:
         return self.G
 
     # ======================================================
-    # 2. Normalize Channel Attributes
+    # 2. Normalize Graph Attributes
     # ======================================================
 
     def _normalize_graph_attributes(self):
         """
-        Make sure the attributes required by the
-        Bucket module exist.
+        Normalize only attributes required for Bucket testing.
 
-        The real GML snapshot may not contain all
-        simulation-specific attributes such as:
+        IMPORTANT
+        ---------
+        Unknown directional liquidity remains unknown.
 
-            available
-            balance_uv
-            capacity
+        We intentionally DO NOT create:
+
+            balance_uv = capacity
+
+        because channel capacity is not directional liquidity.
         """
+
+        # --------------------------------------------------
+        # Node attributes
+        # --------------------------------------------------
 
         for node in self.G.nodes:
 
-            self.G.nodes[node].setdefault(
+            data = self.G.nodes[node]
+
+            data.setdefault(
                 "online",
                 True
             )
-
-        for u, v, k, data in self.G.edges(
-            keys=True,
-            data=True
-        ):
-
-            # ------------------------------------------
-            # Channel availability
-            # ------------------------------------------
 
             data.setdefault(
                 "available",
                 True
             )
 
-            # ------------------------------------------
-            # Capacity
-            # ------------------------------------------
+        # --------------------------------------------------
+        # Channel attributes
+        # --------------------------------------------------
+
+        for (
+            u,
+            v,
+            k,
+            data
+        ) in self.G.edges(
+            keys=True,
+            data=True
+        ):
+
+            data.setdefault(
+                "available",
+                True
+            )
+
+            # Capacity may exist in the GML file.
+            #
+            # It is retained as channel capacity but is NOT
+            # used as directional liquidity.
 
             capacity = self._get_number(
                 data,
@@ -197,28 +295,47 @@ class BucketRealGMLTest:
                     "capacity_sat",
                     "channel_capacity"
                 ],
-                default=1_000_000
+                default=None
             )
 
-            data["capacity"] = capacity
+            if capacity is not None:
 
-            # ------------------------------------------
+                data["capacity"] = capacity
+
+            # ------------------------------------------------
             # Directional liquidity
-            # ------------------------------------------
+            # ------------------------------------------------
+            #
+            # DO NOT add:
+            #
+            # balance_uv = capacity
+            #
+            # because that would turn unknown liquidity into
+            # artificial full liquidity.
+            #
+            # If the real GML contains a directional balance,
+            # preserve it.
+            #
 
-            data.setdefault(
-                "balance_uv",
-                capacity
-            )
+            if "balance_uv" in data:
 
-            data.setdefault(
-                "balance_vu",
-                capacity
-            )
+                data["balance_uv"] = (
+                    self._safe_float_or_none(
+                        data["balance_uv"]
+                    )
+                )
 
-            # ------------------------------------------
+            if "balance_vu" in data:
+
+                data["balance_vu"] = (
+                    self._safe_float_or_none(
+                        data["balance_vu"]
+                    )
+                )
+
+            # ------------------------------------------------
             # Failure statistics
-            # ------------------------------------------
+            # ------------------------------------------------
 
             data.setdefault(
                 "failure_count",
@@ -231,14 +348,41 @@ class BucketRealGMLTest:
             )
 
     # ======================================================
-    # Utility: Numeric Attribute
+    # Utility: Safe Number
     # ======================================================
 
     @staticmethod
+    def _safe_float_or_none(
+        value
+    ):
+
+        try:
+
+            value = float(value)
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            return None
+
+        if value < 0:
+
+            return 0.0
+
+        return value
+
+    # ======================================================
+    # Utility: Numeric Attribute
+    # ======================================================
+
+    @classmethod
     def _get_number(
+        cls,
         data,
         keys,
-        default=0
+        default=None
     ):
 
         for key in keys:
@@ -246,23 +390,18 @@ class BucketRealGMLTest:
             if key not in data:
                 continue
 
-            try:
+            value = cls._safe_float_or_none(
+                data[key]
+            )
 
-                return float(
-                    data[key]
-                )
+            if value is not None:
 
-            except (
-                TypeError,
-                ValueError
-            ):
+                return value
 
-                continue
-
-        return float(default)
+        return default
 
     # ======================================================
-    # 3. Find Source and Target
+    # 3. Find Source / Target
     # ======================================================
 
     def find_source_target(self):
@@ -271,33 +410,69 @@ class BucketRealGMLTest:
             "\n===== 2. SELECT SOURCE / TARGET ====="
         )
 
-        nodes = list(
-            self.G.nodes()
-        )
+        # --------------------------------------------------
+        # Prefer largest strongly connected component
+        # --------------------------------------------------
 
-        if len(nodes) < 2:
+        try:
+
+            components = (
+                list(
+                    nx.strongly_connected_components(
+                        self.G
+                    )
+                )
+            )
+
+        except nx.NetworkXNotImplemented:
+
+            components = []
+
+        if components:
+
+            largest_component = max(
+                components,
+                key=len
+            )
+
+            candidate_nodes = list(
+                largest_component
+            )
+
+        else:
+
+            candidate_nodes = list(
+                self.G.nodes()
+            )
+
+        if len(candidate_nodes) < 2:
 
             raise RuntimeError(
                 "Graph does not contain "
-                "enough nodes."
+                "enough connected nodes."
             )
 
-        # Prefer high-degree nodes because they
-        # are more likely to have multiple
-        # alternative routes.
+        # --------------------------------------------------
+        # Prefer high-degree nodes
+        # --------------------------------------------------
 
         degree_nodes = sorted(
-            nodes,
+            candidate_nodes,
             key=lambda n: self.G.degree(n),
             reverse=True
         )
+
+        search_nodes = degree_nodes[
+            : min(100, len(degree_nodes))
+        ]
 
         source = None
 
         target = None
 
-        # Search among high-degree nodes.
-        search_nodes = degree_nodes[:50]
+        # --------------------------------------------------
+        # Find a pair with directed connectivity
+        # --------------------------------------------------
 
         for s in search_nodes:
 
@@ -328,6 +503,10 @@ class BucketRealGMLTest:
                 "source/target pair."
             )
 
+        self.source = source
+
+        self.target = target
+
         print(
             f"Source: {source}"
         )
@@ -346,10 +525,13 @@ class BucketRealGMLTest:
             f"{self.G.degree(target)}"
         )
 
-        return source, target
+        return (
+            source,
+            target
+        )
 
     # ======================================================
-    # 4. Generate Candidate Paths
+    # 4. Generate Candidates Using Pathfinding
     # ======================================================
 
     def generate_candidates(
@@ -359,140 +541,138 @@ class BucketRealGMLTest:
     ):
 
         print(
-            "\n===== 3. GENERATE CANDIDATES ====="
+            "\n===== 3. GENERATE TOP-K CANDIDATES ====="
         )
 
-        # NetworkX's simple path generator is used
-        # only to create alternative paths.
-        #
-        # CandidateManager remains responsible for
-        # candidate management.
-
-        paths = nx.shortest_simple_paths(
-            nx.DiGraph(self.G),
-            source,
-            target
+        print(
+            "Using Pathfinding.top_k_paths()"
         )
 
-        candidates = []
+        print(
+            f"Amount   : {self.amount}"
+        )
 
-        for path in paths:
+        print(
+            f"K        : {self.k}"
+        )
 
-            if len(path) - 1 > self.max_hops:
+        print(
+            f"Max hops : {self.max_hops}"
+        )
 
-                continue
+        print(
+            f"ETA      : {self.eta}"
+        )
 
-            edges = []
+        print(
+            f"Lambda_h : {self.lambda_h}"
+        )
 
-            total_score = 0.0
+        # --------------------------------------------------
+        # Generate candidates through the real Pathfinding
+        # implementation.
+        # --------------------------------------------------
 
-            valid = True
-
-            for u, v in zip(
-                path[:-1],
-                path[1:]
-            ):
-
-                if not self.G.has_edge(
-                    u,
-                    v
-                ):
-
-                    valid = False
-
-                    break
-
-                # Select the first available channel
-                # between u and v.
-
-                selected_key = None
-
-                selected_data = None
-
-                for key, data in self.G[
-                    u
-                ][v].items():
-
-                    if data.get(
-                        "available",
-                        True
-                    ):
-
-                        selected_key = key
-
-                        selected_data = data
-
-                        break
-
-                if selected_key is None:
-
-                    valid = False
-
-                    break
-
-                edges.append(
-                    (
-                        u,
-                        v,
-                        selected_key
-                    )
-                )
-
-                # Simple path score:
-                # number of hops.
-                #
-                # CandidateManager can later rank
-                # candidates using this score.
-
-                total_score += 1.0
-
-            if not valid:
-                continue
-
-            candidates.append(
-                (
-                    path,
-                    edges,
-                    total_score
-                )
-            )
-
-            if len(candidates) >= self.k:
-                break
-
-        self.candidates = candidates
+        self.candidates = top_k_paths(
+            G=self.G,
+            source=source,
+            target=target,
+            amount=self.amount,
+            heuristic_fn=lnd_cost,
+            eta=self.eta,
+            k=self.k,
+            max_hops=self.max_hops,
+            lambda_h=self.lambda_h
+        )
 
         if not self.candidates:
 
             raise RuntimeError(
-                "No candidate paths were found."
+                "Pathfinding returned no "
+                "candidate paths."
             )
 
         print(
-            f"Generated candidates: "
+            "\nGenerated candidates: "
             f"{len(self.candidates)}"
         )
 
-        for i, candidate in enumerate(
+        # --------------------------------------------------
+        # Candidate validation
+        # --------------------------------------------------
+
+        for index, candidate in enumerate(
             self.candidates
         ):
 
-            path, edges, score = candidate
+            if not isinstance(
+                candidate,
+                dict
+            ):
+
+                raise TypeError(
+                    "Pathfinding candidate must "
+                    "be a dictionary."
+                )
+
+            path = candidate.get(
+                "path"
+            )
+
+            edges = candidate.get(
+                "edges"
+            )
+
+            cost = candidate.get(
+                "cost"
+            )
+
+            if path is None:
+
+                raise ValueError(
+                    f"Candidate {index + 1} "
+                    "has no path."
+                )
+
+            if edges is None:
+
+                raise ValueError(
+                    f"Candidate {index + 1} "
+                    "has no edges."
+                )
+
+            if len(path) - 1 > self.max_hops:
+
+                raise AssertionError(
+                    f"Candidate {index + 1} "
+                    "exceeds max_hops."
+                )
 
             print(
-                f"\nCandidate {i + 1}"
+                f"\nCandidate {index + 1}"
             )
 
             print(
-                f"  Path : {path}"
+                f"  Path       : {path}"
             )
 
             print(
-                f"  Hops : {len(path) - 1}"
+                f"  Hops       : "
+                f"{len(path) - 1}"
             )
 
             print(
-                f"  Score: {score}"
+                f"  Cost       : {cost}"
+            )
+
+            print(
+                f"  Total fee  : "
+                f"{candidate.get('total_fee')}"
+            )
+
+            print(
+                f"  Reliability: "
+                f"{candidate.get('reliability')}"
             )
 
         return self.candidates
@@ -517,8 +697,14 @@ class BucketRealGMLTest:
             f"{len(self.manager.candidates)}"
         )
 
-        # Filter candidates according to the
-        # requested payment amount.
+        # --------------------------------------------------
+        # Filter
+        # --------------------------------------------------
+        #
+        # CandidateManager is responsible for candidate-level
+        # filtering. Unknown liquidity must not automatically
+        # be interpreted as zero.
+        #
 
         self.manager.filter_candidates(
             self.G,
@@ -530,7 +716,16 @@ class BucketRealGMLTest:
             f"{len(self.manager.candidates)}"
         )
 
-        # Rank candidates.
+        if not self.manager.candidates:
+
+            raise RuntimeError(
+                "CandidateManager removed all "
+                "candidate paths."
+            )
+
+        # --------------------------------------------------
+        # Rank
+        # --------------------------------------------------
 
         self.manager.rank_candidates()
 
@@ -538,17 +733,35 @@ class BucketRealGMLTest:
             "\nRanked candidates:"
         )
 
-        for i, candidate in enumerate(
+        for index, candidate in enumerate(
             self.manager.candidates
         ):
 
-            path, edges, score = candidate
+            if isinstance(
+                candidate,
+                dict
+            ):
 
-            print(
-                f"  Rank {i + 1}: "
-                f"path={path}, "
-                f"score={score}"
-            )
+                path = candidate.get(
+                    "path"
+                )
+
+                cost = candidate.get(
+                    "cost"
+                )
+
+                print(
+                    f"  Rank {index + 1}: "
+                    f"path={path}, "
+                    f"cost={cost}"
+                )
+
+            else:
+
+                print(
+                    f"  Rank {index + 1}: "
+                    f"{candidate}"
+                )
 
         return self.manager
 
@@ -565,10 +778,19 @@ class BucketRealGMLTest:
             "\n===== 5. CREATE BUCKET ====="
         )
 
-        self.bucket = self.manager.create_bucket(
-            tx_id=tx_id,
-            k=self.k
+        self.bucket = (
+            self.manager.create_bucket(
+                tx_id=tx_id,
+                k=self.k
+            )
         )
+
+        if self.bucket is None:
+
+            raise RuntimeError(
+                "CandidateManager failed "
+                "to create Bucket."
+            )
 
         print(
             f"Bucket ID: "
@@ -585,20 +807,37 @@ class BucketRealGMLTest:
             f"{len(self.bucket.candidates)}"
         )
 
-        for i, candidate in enumerate(
+        if not self.bucket.candidates:
+
+            raise RuntimeError(
+                "Bucket contains no candidates."
+            )
+
+        for index, candidate in enumerate(
             self.bucket.candidates
         ):
 
-            print(
-                f"  Candidate "
-                f"{i + 1}: "
-                f"{candidate[0]}"
-            )
+            if isinstance(
+                candidate,
+                dict
+            ):
+
+                print(
+                    f"  Candidate {index + 1}: "
+                    f"{candidate.get('path')}"
+                )
+
+            else:
+
+                print(
+                    f"  Candidate {index + 1}: "
+                    f"{candidate}"
+                )
 
         return self.bucket
 
     # ======================================================
-    # 7. Force Channel Failure
+    # 7. Force First Candidate Failure
     # ======================================================
 
     def force_first_candidate_failure(self):
@@ -606,6 +845,12 @@ class BucketRealGMLTest:
         print(
             "\n===== 6. FORCE CHANNEL FAILURE ====="
         )
+
+        if self.bucket is None:
+
+            raise RuntimeError(
+                "Bucket has not been created."
+            )
 
         if not self.bucket.candidates:
 
@@ -617,7 +862,23 @@ class BucketRealGMLTest:
             self.bucket.candidates[0]
         )
 
-        path, edges, score = first_candidate
+        if not isinstance(
+            first_candidate,
+            dict
+        ):
+
+            raise TypeError(
+                "Bucket candidates must use "
+                "the dictionary format."
+            )
+
+        edges = first_candidate.get(
+            "edges"
+        )
+
+        path = first_candidate.get(
+            "path"
+        )
 
         if not edges:
 
@@ -627,6 +888,13 @@ class BucketRealGMLTest:
 
         failed_edge = edges[0]
 
+        if len(failed_edge) != 3:
+
+            raise RuntimeError(
+                "Expected directed edge "
+                "format (u, v, key)."
+            )
+
         u, v, k = failed_edge
 
         channel = self.G.edges[
@@ -635,26 +903,40 @@ class BucketRealGMLTest:
             k
         ]
 
+        # --------------------------------------------------
+        # Force channel unavailable.
+        # --------------------------------------------------
+
         channel["available"] = False
+
+        self.forced_failed_edge = (
+            u,
+            v,
+            k
+        )
 
         print(
             "Forced failure:"
         )
 
         print(
-            f"  Candidate rank: 1"
+            "  Candidate rank: 1"
         )
 
         print(
             f"  Channel: "
-            f"{failed_edge}"
+            f"{self.forced_failed_edge}"
         )
 
         print(
             f"  Path: {path}"
         )
 
-        return failed_edge
+        print(
+            "  available: False"
+        )
+
+        return self.forced_failed_edge
 
     # ======================================================
     # 8. Backtracking Test
@@ -666,9 +948,18 @@ class BucketRealGMLTest:
             "\n===== 7. BACKTRACKING ====="
         )
 
+        if self.bucket is None:
+
+            raise RuntimeError(
+                "Bucket has not been created."
+            )
+
         self.backtracker = Backtracker(
-            max_attempts=len(
-                self.bucket.candidates
+            max_attempts=max(
+                1,
+                len(
+                    self.bucket.candidates
+                )
             )
         )
 
@@ -676,6 +967,10 @@ class BucketRealGMLTest:
             f"Initial candidate rank: "
             f"{self.bucket.current_index + 1}"
         )
+
+        # --------------------------------------------------
+        # Iterate through Bucket candidates.
+        # --------------------------------------------------
 
         while not self.bucket.finished():
 
@@ -687,32 +982,91 @@ class BucketRealGMLTest:
 
                 break
 
-            path, edges, score = candidate
+            if not isinstance(
+                candidate,
+                dict
+            ):
+
+                raise TypeError(
+                    "Bucket candidate must "
+                    "be a dictionary."
+                )
+
+            path = candidate.get(
+                "path"
+            )
+
+            edges = candidate.get(
+                "edges"
+            )
+
+            rank = (
+                self.bucket.current_index + 1
+            )
 
             print(
-                f"\nTrying Candidate "
-                f"{self.bucket.current_index + 1}"
+                f"\nTrying Candidate {rank}"
             )
 
             print(
                 f"Path: {path}"
             )
 
-            # ------------------------------------------
-            # Validate current candidate
-            # ------------------------------------------
+            # ------------------------------------------------
+            # Validate candidate
+            # ------------------------------------------------
 
             valid = True
 
             failed_channel = None
 
-            for u, v, k in edges:
+            failure_reason = None
+
+            for edge in edges:
+
+                if len(edge) != 3:
+
+                    valid = False
+
+                    failed_channel = edge
+
+                    failure_reason = (
+                        "invalid_edge"
+                    )
+
+                    break
+
+                u, v, k = edge
+
+                if not self.G.has_edge(
+                    u,
+                    v,
+                    k
+                ):
+
+                    valid = False
+
+                    failed_channel = (
+                        u,
+                        v,
+                        k
+                    )
+
+                    failure_reason = (
+                        "missing_channel"
+                    )
+
+                    break
 
                 channel = self.G.edges[
                     u,
                     v,
                     k
                 ]
+
+                # --------------------------------------------
+                # Availability
+                # --------------------------------------------
 
                 if not channel.get(
                     "available",
@@ -727,12 +1081,45 @@ class BucketRealGMLTest:
                         k
                     )
 
+                    failure_reason = (
+                        "channel_unavailable"
+                    )
+
                     break
 
-                if channel.get(
-                    "balance_uv",
-                    0
-                ) < self.amount:
+                # --------------------------------------------
+                # Known directional liquidity
+                # --------------------------------------------
+                #
+                # IMPORTANT:
+                # Missing balance_uv means UNKNOWN,
+                # not zero.
+                #
+
+                liquidity = None
+
+                for key in (
+                    "estimated_liquidity",
+                    "liquidity_uv",
+                    "balance_uv"
+                ):
+
+                    if key not in channel:
+                        continue
+
+                    liquidity = (
+                        self._safe_float_or_none(
+                            channel[key]
+                        )
+                    )
+
+                    if liquidity is not None:
+                        break
+
+                if (
+                    liquidity is not None
+                    and liquidity < self.amount
+                ):
 
                     valid = False
 
@@ -742,11 +1129,15 @@ class BucketRealGMLTest:
                         k
                     )
 
+                    failure_reason = (
+                        "insufficient_liquidity"
+                    )
+
                     break
 
-            # ------------------------------------------
-            # Success
-            # ------------------------------------------
+            # ------------------------------------------------
+            # Candidate success
+            # ------------------------------------------------
 
             if valid:
 
@@ -755,17 +1146,27 @@ class BucketRealGMLTest:
                 )
 
                 print(
-                    "\nSUCCESS"
+                    "\nCandidate ACCEPTED"
+                )
+
+                print(
+                    f"Selected rank: "
+                    f"{self.bucket.selected_candidate_rank}"
                 )
 
                 break
 
-            # ------------------------------------------
-            # Failure
-            # ------------------------------------------
+            # ------------------------------------------------
+            # Candidate failure
+            # ------------------------------------------------
 
             print(
                 "Candidate FAILED"
+            )
+
+            print(
+                f"Failure reason: "
+                f"{failure_reason}"
             )
 
             print(
@@ -792,15 +1193,23 @@ class BucketRealGMLTest:
 
         return self.bucket
 
-    
+    # ======================================================
     # 9. Final Report
-   
+    # ======================================================
 
     def print_report(self):
 
         print(
             "\n===== 8. FINAL BUCKET REPORT ====="
         )
+
+        if self.bucket is None:
+
+            print(
+                "Bucket does not exist."
+            )
+
+            return
 
         info = self.bucket.info()
 
@@ -840,6 +1249,11 @@ class BucketRealGMLTest:
         )
 
         print(
+            f"Current index: "
+            f"{info['current_index']}"
+        )
+
+        print(
             f"Selected candidate index: "
             f"{info['selected_candidate_index']}"
         )
@@ -849,90 +1263,325 @@ class BucketRealGMLTest:
             f"{info['selected_candidate_rank']}"
         )
 
-        if info[
+        # --------------------------------------------------
+        # Selected candidate
+        # --------------------------------------------------
+
+        selected = info[
             "selected_candidate"
-        ] is not None:
+        ]
 
-            path = info[
-                "selected_candidate"
-            ][0]
+        if selected is not None:
 
-            print(
-                f"Selected path: "
-                f"{path}"
-            )
+            if isinstance(
+                selected,
+                dict
+            ):
+
+                print(
+                    f"Selected path: "
+                    f"{selected.get('path')}"
+                )
+
+                print(
+                    f"Selected cost: "
+                    f"{selected.get('cost')}"
+                )
+
+            else:
+
+                print(
+                    f"Selected candidate: "
+                    f"{selected}"
+                )
+
+        # --------------------------------------------------
+        # Failed channels
+        # --------------------------------------------------
 
         print(
             "\nFailed channels:"
         )
 
-        for channel in info[
+        if not info[
             "failed_channels"
         ]:
 
             print(
-                f"  {channel}"
+                "  None"
             )
+
+        else:
+
+            for channel in info[
+                "failed_channels"
+            ]:
+
+                print(
+                    f"  {channel}"
+                )
+
+        # --------------------------------------------------
+        # Failed candidates
+        # --------------------------------------------------
 
         print(
             "\nFailed candidates:"
         )
 
-        for i, candidate in enumerate(
-            info["failed_candidates"]
-        ):
+        if not info[
+            "failed_candidates"
+        ]:
 
             print(
-                f"  Candidate "
-                f"{i + 1}: "
-                f"{candidate[0]}"
+                "  None"
             )
 
-   
-    # 10. Run Complete Test
-    
+        else:
+
+            for index, candidate in enumerate(
+                info["failed_candidates"]
+            ):
+
+                if isinstance(
+                    candidate,
+                    dict
+                ):
+
+                    print(
+                        f"  Candidate "
+                        f"{index + 1}: "
+                        f"{candidate.get('path')}"
+                    )
+
+                else:
+
+                    print(
+                        f"  Candidate "
+                        f"{index + 1}: "
+                        f"{candidate}"
+                    )
+
+    # ======================================================
+    # 10. Validation
+    # ======================================================
+
+    def validate_result(self):
+
+        print(
+            "\n===== 9. VALIDATION ====="
+        )
+
+        if self.bucket is None:
+
+            raise AssertionError(
+                "Bucket was not created."
+            )
+
+        # --------------------------------------------------
+        # Candidate existence
+        # --------------------------------------------------
+
+        if len(
+            self.bucket.candidates
+        ) < 2:
+
+            raise AssertionError(
+                "At least two candidates are "
+                "required for fallback testing."
+            )
+
+        # --------------------------------------------------
+        # First candidate must be recorded
+        # as failed because we forced its
+        # first channel unavailable.
+        # --------------------------------------------------
+
+        if not self.bucket.failed_candidates:
+
+            raise AssertionError(
+                "No failed candidate was recorded."
+            )
+
+        if self.forced_failed_edge is not None:
+
+            if (
+                self.forced_failed_edge
+                not in self.bucket.failed_channels
+            ):
+
+                raise AssertionError(
+                    "Forced failed channel was "
+                    "not recorded by Bucket."
+                )
+
+        # --------------------------------------------------
+        # Backtracker attempt
+        # --------------------------------------------------
+
+        if self.backtracker is None:
+
+            raise AssertionError(
+                "Backtracker was not created."
+            )
+
+        if self.backtracker.attempts < 1:
+
+            raise AssertionError(
+                "Backtracker did not perform "
+                "any backtracking attempt."
+            )
+
+        # --------------------------------------------------
+        # Selected candidate
+        # --------------------------------------------------
+
+        if self.bucket.status != "completed":
+
+            raise AssertionError(
+                "Bucket did not complete "
+                "successfully after fallback."
+            )
+
+        if self.bucket.selected_candidate is None:
+
+            raise AssertionError(
+                "No selected candidate was recorded."
+            )
+
+        if (
+            self.bucket.selected_candidate_rank
+            is None
+        ):
+
+            raise AssertionError(
+                "Selected candidate rank "
+                "was not recorded."
+            )
+
+        if (
+            self.bucket.selected_candidate_rank
+            <= 1
+        ):
+
+            raise AssertionError(
+                "The first candidate was forced "
+                "to fail, so a later candidate "
+                "should have been selected."
+            )
+
+        print(
+            "Candidate generation : PASS"
+        )
+
+        print(
+            "CandidateManager      : PASS"
+        )
+
+        print(
+            "Bucket creation       : PASS"
+        )
+
+        print(
+            "Forced failure        : PASS"
+        )
+
+        print(
+            "Backtracking          : PASS"
+        )
+
+        print(
+            "Candidate fallback    : PASS"
+        )
+
+        print(
+            "Final state           : PASS"
+        )
+
+    # ======================================================
+    # 11. Run Complete Test
+    # ======================================================
 
     def run(self):
 
         print(
-            "=========================================="
+            "======================================================"
         )
 
         print(
-            " REAL GML BUCKET MODULE TEST"
+            " REAL GML BUCKET INTEGRATION TEST"
         )
 
         print(
-            "=========================================="
+            "======================================================"
         )
 
-        # 1. Load real topology
+        print(
+            f"Snapshot : {self.gml_path.name}"
+        )
+
+        print(
+            f"Amount   : {self.amount}"
+        )
+
+        print(
+            f"K        : {self.k}"
+        )
+
+        print(
+            f"Max hops : {self.max_hops}"
+        )
+
+        print(
+            f"ETA      : {self.eta}"
+        )
+
+        print(
+            f"Lambda_h : {self.lambda_h}"
+        )
+
+        print(
+            f"Seed     : {self.seed}"
+        )
+
+        # --------------------------------------------------
+        # 1. Load graph
+        # --------------------------------------------------
 
         self.load_graph()
 
-        # 2. Find source / target
+        # --------------------------------------------------
+        # 2. Source / target
+        # --------------------------------------------------
 
         source, target = (
             self.find_source_target()
         )
 
-        # 3. Generate candidate paths
+        # --------------------------------------------------
+        # 3. Pathfinding Top-K
+        # --------------------------------------------------
 
         self.generate_candidates(
             source,
             target
         )
 
+        # --------------------------------------------------
         # 4. CandidateManager
+        # --------------------------------------------------
 
         self.prepare_candidates()
 
+        # --------------------------------------------------
         # 5. Bucket
+        # --------------------------------------------------
 
         self.create_bucket()
 
-        # Need at least two candidates
-        # to test backtracking.
+        # --------------------------------------------------
+        # Require at least two candidates
+        # --------------------------------------------------
 
         if len(
             self.bucket.candidates
@@ -944,35 +1593,48 @@ class BucketRealGMLTest:
                 "backtracking."
             )
 
-        # 6. Force failure
+        # --------------------------------------------------
+        # 6. Force first candidate failure
+        # --------------------------------------------------
 
         self.force_first_candidate_failure()
 
+        # --------------------------------------------------
         # 7. Backtracking
+        # --------------------------------------------------
 
         self.test_backtracking()
 
-        # 8. Final report
+        # --------------------------------------------------
+        # 8. Report
+        # --------------------------------------------------
 
         self.print_report()
 
+        # --------------------------------------------------
+        # 9. Validation
+        # --------------------------------------------------
+
+        self.validate_result()
+
         print(
-            "\n=========================================="
+            "\n======================================================"
         )
 
         print(
-            " TEST FINISHED"
+            " BUCKET TEST STATUS : SUCCESS"
         )
 
         print(
-            "=========================================="
+            "======================================================"
         )
 
         return self.bucket
 
 
-
+# ==========================================================
 # Main
+# ==========================================================
 
 if __name__ == "__main__":
 

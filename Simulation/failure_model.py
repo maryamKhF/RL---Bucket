@@ -9,6 +9,7 @@ Responsibilities
 2. Evaluate node/channel/liquidity failures during payment execution.
 3. Return the exact failed element and failure position.
 4. Provide failure information required by Partial Backtracking.
+5. Reset temporary runtime failure state between episodes.
 
 Design
 ------
@@ -20,8 +21,6 @@ The model is intentionally separated from:
     - Partial Backtracking
     - PPO
     - Onion routing
-
-Those modules consume the structured failure information returned here.
 """
 
 from datetime import datetime
@@ -42,20 +41,15 @@ def assign_failure_probabilities(
     """
     Assign channel-specific failure probabilities.
 
-    Parameters
-    ----------
-    G : networkx.Graph / MultiGraph
-        Lightning Network graph.
+    Also initializes runtime channel state.
 
-    average_rate : float
-        Base channel failure probability.
+    Static attributes:
+        failure_probability
 
-    seed : int
-        Seed used for reproducible probability assignment.
-
-    Notes
-    -----
-    The function initializes channel runtime state as well.
+    Runtime attributes:
+        available
+        failure_count
+        last_failure
     """
 
     if average_rate < 0:
@@ -69,10 +63,6 @@ def assign_failure_probabilities(
         )
 
     rng = np.random.default_rng(seed)
-
-    # --------------------------------------------------------
-    # MultiGraph / MultiDiGraph
-    # --------------------------------------------------------
 
     if G.is_multigraph():
 
@@ -94,14 +84,10 @@ def assign_failure_probabilities(
 
             data["failure_probability"] = probability
 
-            # Runtime channel state
+            # Runtime state
             data["available"] = True
             data["failure_count"] = 0
             data["last_failure"] = None
-
-    # --------------------------------------------------------
-    # Graph / DiGraph
-    # --------------------------------------------------------
 
     else:
 
@@ -152,10 +138,6 @@ def _calculate_failure_probability(
         ""
     )
 
-    # --------------------------------------------------------
-    # Geographic factor
-    # --------------------------------------------------------
-
     if country_u == country_v:
 
         factor = 0.7
@@ -167,14 +149,12 @@ def _calculate_failure_probability(
             u,
             v
         ):
+
             factor = 2.0
 
         else:
-            factor = 1.0
 
-    # --------------------------------------------------------
-    # Small stochastic variation
-    # --------------------------------------------------------
+            factor = 1.0
 
     probability = (
         average_rate
@@ -234,20 +214,31 @@ def _intercontinental(
         0
     )
 
+    try:
+
+        longitude_distance = abs(
+            float(longitude_u)
+            -
+            float(longitude_v)
+        )
+
+        latitude_distance = abs(
+            float(latitude_u)
+            -
+            float(latitude_v)
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return False
+
     return (
-        abs(
-            longitude_u
-            -
-            longitude_v
-        )
-        > 45
+        longitude_distance > 45
         and
-        abs(
-            latitude_u
-            -
-            latitude_v
-        )
-        > 10
+        latitude_distance > 10
     )
 
 
@@ -259,8 +250,6 @@ class FailureModel:
     """
     Runtime failure evaluator for Lightning payment simulation.
 
-    The graph G is the single source of truth.
-
     Failure categories
     ------------------
     1. node_failure
@@ -268,8 +257,8 @@ class FailureModel:
     3. liquidity_failure
     4. missing_channel
 
-    The evaluator stops at the first failure because the exact
-    failure position is required by Partial Backtracking.
+    Temporary channel failures are stored in the graph and can
+    be reset between PPO episodes.
     """
 
     def __init__(
@@ -278,39 +267,126 @@ class FailureModel:
         liquidity_failure_probability=0.05,
         seed=42
     ):
-        """
-        Parameters
-        ----------
-        node_failure_probability : float
-            Probability of temporary node failure.
-
-        liquidity_failure_probability : float
-            Probability of a stochastic liquidity failure when
-            the deterministic liquidity check passes.
-
-        seed : int
-            Random seed for reproducibility.
-        """
 
         if not 0 <= node_failure_probability <= 1:
+
             raise ValueError(
                 "node_failure_probability must be in [0, 1]."
             )
 
         if not 0 <= liquidity_failure_probability <= 1:
+
             raise ValueError(
                 "liquidity_failure_probability must be in [0, 1]."
             )
 
-        self.node_failure_probability = (
-            float(node_failure_probability)
+        self.node_failure_probability = float(
+            node_failure_probability
         )
 
-        self.liquidity_failure_probability = (
-            float(liquidity_failure_probability)
+        self.liquidity_failure_probability = float(
+            liquidity_failure_probability
         )
 
-        self.rng = random.Random(seed)
+        self.seed = int(seed)
+
+        self.rng = random.Random(
+            self.seed
+        )
+
+    # ========================================================
+    # Reset Runtime State
+    # ========================================================
+
+    def reset_runtime_state(
+        self,
+        G,
+        reset_counters=False,
+        reset_rng=False
+    ):
+        """
+        Reset temporary runtime failure state.
+
+        Parameters
+        ----------
+        G : networkx graph
+            Network graph.
+
+        reset_counters : bool
+            If True, failure counters are reset to zero.
+
+        reset_rng : bool
+            If True, RNG is re-seeded.
+
+        Notes
+        -----
+        Static failure_probability values are preserved.
+
+        This method is intended to be called by RoutingEnv.reset().
+        """
+
+        if G is None:
+
+            raise ValueError(
+                "G cannot be None."
+            )
+
+        # ----------------------------------------------------
+        # Reset channel runtime state
+        # ----------------------------------------------------
+
+        if G.is_multigraph():
+
+            for _, _, _, data in G.edges(
+                keys=True,
+                data=True
+            ):
+
+                data["available"] = True
+
+                if reset_counters:
+
+                    data["failure_count"] = 0
+                    data["last_failure"] = None
+
+        else:
+
+            for _, _, data in G.edges(
+                data=True
+            ):
+
+                data["available"] = True
+
+                if reset_counters:
+
+                    data["failure_count"] = 0
+                    data["last_failure"] = None
+
+        # ----------------------------------------------------
+        # Reset node runtime state if present
+        # ----------------------------------------------------
+
+        for _, data in G.nodes(
+            data=True
+        ):
+
+            if "available" in data:
+
+                data["available"] = True
+
+            if "is_online" in data:
+
+                data["is_online"] = True
+
+        # ----------------------------------------------------
+        # Optional RNG reset
+        # ----------------------------------------------------
+
+        if reset_rng:
+
+            self.rng.seed(
+                self.seed
+            )
 
     # ========================================================
     # Node Failure
@@ -321,14 +397,6 @@ class FailureModel:
         G,
         node
     ):
-        """
-        Check whether a node is unavailable.
-
-        Returns
-        -------
-        bool
-            True if node failure occurs.
-        """
 
         if node not in G.nodes:
 
@@ -336,7 +404,6 @@ class FailureModel:
 
         data = G.nodes[node]
 
-        # Persistent network state
         if data.get(
             "available",
             True
@@ -344,7 +411,6 @@ class FailureModel:
 
             return True
 
-        # Compatibility with possible node state
         if data.get(
             "is_online",
             True
@@ -352,7 +418,6 @@ class FailureModel:
 
             return True
 
-        # Stochastic node failure
         return (
             self.rng.random()
             <
@@ -370,14 +435,6 @@ class FailureModel:
         v,
         key=None
     ):
-        """
-        Check the exact directed channel u -> v.
-
-        Returns
-        -------
-        bool
-            True if the channel has failed.
-        """
 
         edge = self._get_edge(
             G,
@@ -390,7 +447,6 @@ class FailureModel:
 
             return True
 
-        # Persistent unavailable state
         if edge.get(
             "available",
             True
@@ -421,10 +477,9 @@ class FailureModel:
                 + 1
             )
 
-            edge["last_failure"] = (
-                datetime.now()
-            )
+            edge["last_failure"] = datetime.now()
 
+            # Temporary runtime failure.
             edge["available"] = False
 
         return failed
@@ -441,13 +496,6 @@ class FailureModel:
         amount,
         key=None
     ):
-        """
-        Check whether the directed channel u -> v
-        can forward the requested amount.
-
-        The check is based primarily on directional
-        balance_uv rather than only total capacity.
-        """
 
         edge = self._get_edge(
             G,
@@ -460,10 +508,6 @@ class FailureModel:
 
             return True
 
-        # ----------------------------------------------------
-        # Channel capacity
-        # ----------------------------------------------------
-
         capacity = edge.get(
             "capacity",
             None
@@ -472,18 +516,19 @@ class FailureModel:
         if capacity is not None:
 
             try:
-                if amount > float(capacity):
+
+                if amount > float(
+                    capacity
+                ):
+
                     return True
 
             except (
                 TypeError,
                 ValueError
             ):
-                pass
 
-        # ----------------------------------------------------
-        # Directional liquidity
-        # ----------------------------------------------------
+                pass
 
         balance_uv = edge.get(
             "balance_uv",
@@ -497,6 +542,7 @@ class FailureModel:
                 if amount > float(
                     balance_uv
                 ):
+
                     return True
 
             except (
@@ -505,10 +551,6 @@ class FailureModel:
             ):
 
                 pass
-
-        # ----------------------------------------------------
-        # Optional generic liquidity field
-        # ----------------------------------------------------
 
         liquidity = edge.get(
             "liquidity",
@@ -522,6 +564,7 @@ class FailureModel:
                 if amount > float(
                     liquidity
                 ):
+
                     return True
 
             except (
@@ -530,10 +573,6 @@ class FailureModel:
             ):
 
                 pass
-
-        # ----------------------------------------------------
-        # Stochastic liquidity failure
-        # ----------------------------------------------------
 
         return (
             self.rng.random()
@@ -553,12 +592,6 @@ class FailureModel:
         amount,
         key=None
     ):
-        """
-        Evaluate one forwarding edge.
-
-        Returns a structured result suitable for
-        Partial Backtracking.
-        """
 
         edge = self._get_edge(
             G,
@@ -580,10 +613,6 @@ class FailureModel:
                 ),
             }
 
-        # ----------------------------------------------------
-        # Channel availability
-        # ----------------------------------------------------
-
         if edge.get(
             "available",
             True
@@ -599,10 +628,6 @@ class FailureModel:
                     key
                 ),
             }
-
-        # ----------------------------------------------------
-        # Node state
-        # ----------------------------------------------------
 
         if self.check_node_failure(
             G,
@@ -628,10 +653,6 @@ class FailureModel:
                 "failed_edge": None,
             }
 
-        # ----------------------------------------------------
-        # Channel failure
-        # ----------------------------------------------------
-
         if self.check_channel_failure(
             G,
             u,
@@ -649,10 +670,6 @@ class FailureModel:
                     key
                 ),
             }
-
-        # ----------------------------------------------------
-        # Liquidity
-        # ----------------------------------------------------
 
         if self.check_liquidity_failure(
             G,
@@ -691,58 +708,6 @@ class FailureModel:
         network,
         route_edges=None
     ):
-        """
-        Evaluate a complete payment route.
-
-        Parameters
-        ----------
-        route : list
-            Ordered list of nodes.
-
-        amount : float
-            Payment amount.
-
-        network : NetworkX graph
-            Current Lightning graph.
-
-        route_edges : list, optional
-            Exact edge descriptors.
-
-            Each item can be:
-                (u, v)
-                (u, v, key)
-
-            If omitted, the first matching edge is selected.
-
-        Returns
-        -------
-        dict
-
-        Example successful result
-        -------------------------
-        {
-            "success": True,
-            "reason": None,
-            "failed_node": None,
-            "failed_edge": None,
-            "failure_index": None,
-            "visited_edges": [...]
-        }
-
-        Example failure result
-        ----------------------
-        {
-            "success": False,
-            "reason": "channel_failure",
-            "failed_node": None,
-            "failed_edge": (u, v, key),
-            "failure_index": 3,
-            "visited_edges": [...]
-        }
-
-        The failure_index is the position of the failed
-        forwarding edge in the route.
-        """
 
         if network is None:
 
@@ -774,10 +739,6 @@ class FailureModel:
 
         visited_edges = []
 
-        # ----------------------------------------------------
-        # Build edge list if not explicitly supplied
-        # ----------------------------------------------------
-
         if route_edges is None:
 
             route_edges = self._resolve_route_edges(
@@ -796,9 +757,16 @@ class FailureModel:
                 "visited_edges": [],
             }
 
-        # ----------------------------------------------------
-        # Evaluate each forwarding step
-        # ----------------------------------------------------
+        if len(route_edges) != len(route) - 1:
+
+            return {
+                "success": False,
+                "reason": "invalid_route_edges",
+                "failed_node": None,
+                "failed_edge": None,
+                "failure_index": 0,
+                "visited_edges": [],
+            }
 
         for index, edge_info in enumerate(
             route_edges
@@ -866,15 +834,6 @@ class FailureModel:
         G,
         route
     ):
-        """
-        Resolve exact graph edges for a node route.
-
-        For MultiGraph, the first available edge is selected.
-
-        The routing module should eventually provide the exact
-        selected channel key, so this fallback is mainly for
-        compatibility/testing.
-        """
 
         edges = []
 
@@ -917,11 +876,7 @@ class FailureModel:
 
                 if selected_key is None:
 
-                    selected_key = next(
-                        iter(
-                            edge_data
-                        )
-                    )
+                    return None
 
                 edges.append(
                     (
@@ -951,14 +906,22 @@ class FailureModel:
     def _parse_edge(
         edge_info
     ):
-        """
-        Normalize edge representation.
-        """
 
         if edge_info is None:
+
             return None
 
-        if len(edge_info) == 2:
+        try:
+
+            length = len(
+                edge_info
+            )
+
+        except TypeError:
+
+            return None
+
+        if length == 2:
 
             u, v = edge_info
 
@@ -968,7 +931,7 @@ class FailureModel:
                 None
             )
 
-        if len(edge_info) == 3:
+        if length == 3:
 
             u, v, key = edge_info
 
@@ -991,17 +954,6 @@ class FailureModel:
         v,
         key=None
     ):
-        """
-        Return the exact edge data.
-
-        Direction is preserved.
-
-        For MultiGraph:
-            G[u][v][key]
-
-        For Graph:
-            G[u][v]
-        """
 
         if not G.has_edge(
             u,
@@ -1012,13 +964,34 @@ class FailureModel:
 
         if G.is_multigraph():
 
-            edge_data = G.get_edge_data(
+            if key is None:
+
+                edge_data = G.get_edge_data(
+                    u,
+                    v
+                )
+
+                if not edge_data:
+
+                    return None
+
+                # Fallback to first available edge.
+                for _, data in edge_data.items():
+
+                    if data.get(
+                        "available",
+                        True
+                    ):
+
+                        return data
+
+                return None
+
+            return G.get_edge_data(
                 u,
                 v,
                 key=key
             )
-
-            return edge_data
 
         return G.get_edge_data(
             u,

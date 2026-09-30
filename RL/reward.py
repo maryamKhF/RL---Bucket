@@ -9,166 +9,285 @@ def calculate_reward(
     carbon_intensity,
     fee=0.0,
     delay=0.0,
-    scale=100.0
+    partial_backtrack_count=0,
+    full_reroute_count=0,
+    attempt_count=1,
+    scale=100.0,
+    fee_reference=1000.0,
+    delay_reference=10.0,
+    carbon_reference=100.0,
+    path_reference=10.0,
 ):
     """
-    Calculate routing reward for the PPO agent.
+    Calculate routing reward for PPO.
 
-    Main objectives:
-        1. Payment success
-        2. Shorter routing path
-        3. Lower fee
-        4. Lower delay
-        5. Lower carbon intensity
+    PPO controls only eta.
 
-    Parameters
-    ----------
-    success : bool
-        Whether the payment was successfully completed.
+    Top-K is fixed to 5 and is NOT part of the reward.
 
-    path_length : int
-        Number of edges in the selected route.
+    Reward components for a successful payment:
 
-    carbon_intensity : float
-        Carbon intensity associated with the selected route.
+        - path efficiency
+        - transaction fee
+        - delay
+        - carbon intensity
+        - partial backtracking
+        - full rerouting
+        - additional attempts
 
-    fee : float
-        Total routing/payment fee.
+    Reward range:
 
-    delay : float
-        Total routing delay.
+        approximately [-1, 1]
 
-    scale : float
-        Reward scaling factor.
+    Successful payments receive a positive reward.
 
-    Returns
-    -------
-    float
-        Reward approximately in [-1, 1].
+    Failed payments receive a dominant negative reward.
     """
 
     # =====================================================
-    # Numerical safety
+    # NUMERICAL SAFETY
     # =====================================================
 
     path_length = max(
         int(path_length),
-        0
+        0,
     )
 
     fee = max(
         float(fee),
-        0.0
+        0.0,
     )
 
     delay = max(
         float(delay),
-        0.0
+        0.0,
     )
 
     carbon = max(
         float(carbon_intensity),
-        0.0
+        0.0,
     )
 
+    partial_backtrack_count = max(
+        int(partial_backtrack_count),
+        0,
+    )
+
+    full_reroute_count = max(
+        int(full_reroute_count),
+        0,
+    )
+
+    attempt_count = max(
+        int(attempt_count),
+        1,
+    )
+
+    fee_reference = max(
+        float(fee_reference),
+        1.0,
+    )
+
+    delay_reference = max(
+        float(delay_reference),
+        1.0,
+    )
+
+    carbon_reference = max(
+        float(carbon_reference),
+        1.0,
+    )
+
+    path_reference = max(
+        float(path_reference),
+        1.0,
+    )
+
+    # scale is retained for compatibility with the existing
+    # configuration, but is NOT used to dilute recovery costs.
     scale = max(
         float(scale),
-        1.0
+        1.0,
     )
 
+
     # =====================================================
-    # FAILED PAYMENT
+    # FAILURE
     # =====================================================
 
     if not success:
-
-        # Payment failure is the dominant negative signal.
-        #
-        # The penalty is bounded so that the reward remains
-        # within approximately [-1, 1].
 
         failure_penalty = (
             1.0
             +
             0.05 * path_length
+            +
+            0.10 * partial_backtrack_count
+            +
+            0.20 * full_reroute_count
+            +
+            0.05 * max(
+                attempt_count - 1,
+                0,
+            )
         )
 
         reward = -np.tanh(
             failure_penalty
         )
 
-        return float(reward)
+        return float(
+            reward
+        )
+
 
     # =====================================================
-    # SUCCESSFUL PAYMENT
+    # SUCCESS
     # =====================================================
 
     # -----------------------------------------------------
-    # Path efficiency
+    # Normalize routing metrics
     # -----------------------------------------------------
 
-    # Shorter paths receive a larger score.
-    path_score = 1.0 / max(
-        path_length,
-        1
+    path_ratio = (
+        path_length
+        /
+        path_reference
     )
+
+    fee_ratio = (
+        fee
+        /
+        fee_reference
+    )
+
+    delay_ratio = (
+        delay
+        /
+        delay_reference
+    )
+
+    carbon_ratio = (
+        carbon
+        /
+        carbon_reference
+    )
+
 
     # -----------------------------------------------------
-    # Normalize routing criteria
+    # Bounded quality scores
     # -----------------------------------------------------
 
-    # The following terms are normalized relative to the
-    # reward scale so that one metric does not dominate
-    # the others.
-
-    path_penalty = (
-        1.0
-        -
-        path_score
+    path_score = np.exp(
+        -path_ratio
     )
 
-    fee_penalty = (
-        fee / scale
+    fee_score = np.exp(
+        -fee_ratio
     )
 
-    delay_penalty = (
-        delay / scale
+    delay_score = np.exp(
+        -delay_ratio
     )
 
-    carbon_penalty = (
-        carbon / scale
+    carbon_score = np.exp(
+        -carbon_ratio
     )
+
 
     # =====================================================
-    # Combined successful-payment score
+    # ROUTING QUALITY
     # =====================================================
 
-    # Successful payment receives a positive base reward.
-    # The remaining terms distinguish better and worse
-    # successful routes.
+    quality = (
+        0.30 * path_score
+        +
+        0.30 * fee_score
+        +
+        0.20 * delay_score
+        +
+        0.20 * carbon_score
+    )
 
-    success_bonus = 1.0
+    quality = float(
+        np.clip(
+            quality,
+            0.0,
+            1.0,
+        )
+    )
+
+
+    # =====================================================
+    # RECOVERY COST
+    # =====================================================
+
+    # These penalties are deliberately NOT divided by
+    # "scale". They must remain visible to PPO.
+
+    backtrack_penalty = (
+        0.05
+        *
+        partial_backtrack_count
+    )
+
+    reroute_penalty = (
+        0.10
+        *
+        full_reroute_count
+    )
+
+    additional_attempt_penalty = (
+        0.02
+        *
+        max(
+            attempt_count - 1,
+            0,
+        )
+    )
+
+    recovery_penalty = (
+        backtrack_penalty
+        +
+        reroute_penalty
+        +
+        additional_attempt_penalty
+    )
+
+
+    # =====================================================
+    # FINAL SUCCESS REWARD
+    # =====================================================
+
+    # Base successful-payment reward:
+    #
+    #     0.60
+    #
+    # Route quality contribution:
+    #
+    #     0.00 ... 0.40
+    #
+    # Therefore an uncomplicated successful payment
+    # normally falls in:
+    #
+    #     0.60 ... 1.00
 
     raw_reward = (
-        success_bonus
+        0.60
         +
-        0.5 * path_score
+        0.40 * quality
         -
-        0.20 * path_penalty
-        -
-        0.20 * fee_penalty
-        -
-        0.20 * delay_penalty
-        -
-        0.20 * carbon_penalty
+        recovery_penalty
     )
 
-    # =====================================================
-    # Normalize reward
-    # =====================================================
 
-    reward = np.tanh(
-        raw_reward
+    reward = float(
+        np.clip(
+            raw_reward,
+            -1.0,
+            1.0,
+        )
     )
 
-    return float(reward)
+
+    return reward

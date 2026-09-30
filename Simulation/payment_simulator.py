@@ -1,5 +1,5 @@
 """
-payment_simulator.py
+Simulation/payment_simulator.py
 
 Execute a selected payment route over a simulated
 Lightning Network.
@@ -14,25 +14,20 @@ Responsibilities
 6. Provide exact failure information required by
    Partial Backtracking.
 
-Separation of responsibilities
--------------------------------
-Router / PPO:
-    Selects the route.
+Fee handling
+------------
+The simulator supports both normalized attributes:
 
-FailureModel:
-    Evaluates node, channel and liquidity failures.
+    fee_base
+    fee_rate
 
-NetworkDynamics:
-    Maintains network state and performs settlement.
+and native Lightning/GML attributes:
 
-PaymentSimulator:
-    Executes the selected route and collects metrics.
+    fee_base_msat
+    fee_proportional_millionths
 
-Bucket / PartialBacktracker:
-    Handle alternative routes after a failure.
-
-OnionRouter:
-    Handles simulated onion forwarding.
+This keeps PaymentSimulator compatible with both the
+prepared graph and the original Lightning GML snapshot.
 """
 
 import time
@@ -714,36 +709,46 @@ class PaymentSimulator:
             # Fee
             # ------------------------------------------------
 
-            fee_base = data.get(
-                "fee_base",
-                0
-            )
-
-            fee_rate = data.get(
-                "fee_rate",
-                0
+            fee_base, fee_rate = (
+                self._get_fee_components(
+                    data
+                )
             )
 
             fee += (
-                float(fee_base)
+                fee_base
                 +
-                float(fee_rate)
+                fee_rate
                 *
-                amount
+                float(amount)
                 /
-                1_000_000
+                1_000_000.0
             )
 
             # ------------------------------------------------
             # Delay
             # ------------------------------------------------
 
-            delay += float(
+            delay_value = data.get(
+                "delay",
                 data.get(
-                    "delay",
+                    "cltv_expiry_delta",
                     0
                 )
             )
+
+            try:
+
+                delay += float(
+                    delay_value
+                )
+
+            except (
+                TypeError,
+                ValueError
+            ):
+
+                pass
 
             # ------------------------------------------------
             # Geographic metrics
@@ -753,14 +758,14 @@ class PaymentSimulator:
 
             target = self.G.nodes[v]
 
-            source_carbon = float(
+            source_carbon = self._safe_float(
                 source.get(
                     "carbon_intensity",
                     0
                 )
             )
 
-            target_carbon = float(
+            target_carbon = self._safe_float(
                 target.get(
                     "carbon_intensity",
                     0
@@ -811,6 +816,122 @@ class PaymentSimulator:
             "inter_continent_hops":
                 inter_continent
         }
+
+    # ========================================================
+    # Fee Extraction
+    # ========================================================
+
+    @staticmethod
+    def _get_fee_components(
+        data
+    ):
+        """
+        Extract the two Lightning fee components.
+
+        Supported normalized representation:
+
+            fee_base
+            fee_rate
+
+        Supported native Lightning/GML representation:
+
+            fee_base_msat
+            fee_proportional_millionths
+
+        Returns
+        -------
+        tuple
+            (base_fee, proportional_rate)
+
+        Important
+        ---------
+        The units are kept consistent with the existing
+        Pathfinding implementation.
+
+        Therefore:
+
+            fee =
+                base
+                +
+                rate * amount / 1,000,000
+        """
+
+        if not data:
+            return 0.0, 0.0
+
+        # ----------------------------------------------------
+        # Base fee
+        # ----------------------------------------------------
+
+        if "fee_base" in data:
+
+            base = data.get(
+                "fee_base",
+                0.0
+            )
+
+        else:
+
+            base = data.get(
+                "fee_base_msat",
+                0.0
+            )
+
+        # ----------------------------------------------------
+        # Proportional fee
+        # ----------------------------------------------------
+
+        if "fee_rate" in data:
+
+            rate = data.get(
+                "fee_rate",
+                0.0
+            )
+
+        else:
+
+            rate = data.get(
+                "fee_proportional_millionths",
+                0.0
+            )
+
+        base = PaymentSimulator._safe_float(
+            base
+        )
+
+        rate = PaymentSimulator._safe_float(
+            rate
+        )
+
+        return base, rate
+
+    # ========================================================
+    # Safe Float
+    # ========================================================
+
+    @staticmethod
+    def _safe_float(
+        value,
+        default=0.0
+    ):
+        """
+        Safely convert a value to float.
+        """
+
+        try:
+
+            return float(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            return float(
+                default
+            )
 
     # ========================================================
     # Result Factory
@@ -877,7 +998,15 @@ class PaymentSimulator:
         if edge is None:
             return None
 
-        if len(edge) == 2:
+        try:
+
+            length = len(edge)
+
+        except TypeError:
+
+            return None
+
+        if length == 2:
 
             u, v = edge
 
@@ -887,7 +1016,7 @@ class PaymentSimulator:
                 None
             )
 
-        if len(edge) == 3:
+        if length == 3:
 
             u, v, key = edge
 
@@ -911,6 +1040,8 @@ class PaymentSimulator:
     ):
         """
         Get exact edge data from the graph.
+
+        For MultiDiGraph, the supplied key is preferred.
         """
 
         if not self.G.has_edge(
@@ -921,14 +1052,6 @@ class PaymentSimulator:
 
         if self.G.is_multigraph():
 
-            if key is not None:
-
-                return self.G.get_edge_data(
-                    u,
-                    v,
-                    key=key
-                )
-
             edge_data = self.G.get_edge_data(
                 u,
                 v
@@ -937,7 +1060,23 @@ class PaymentSimulator:
             if not edge_data:
                 return None
 
-            # Fallback: select first edge
+            # ------------------------------------------------
+            # Exact edge requested
+            # ------------------------------------------------
+
+            if key is not None:
+
+                exact = edge_data.get(
+                    key
+                )
+
+                if exact is not None:
+                    return exact
+
+            # ------------------------------------------------
+            # Fallback
+            # ------------------------------------------------
+
             first_key = next(
                 iter(edge_data)
             )
@@ -970,21 +1109,6 @@ def simulate_payment(
 
     This preserves the old API style while using the new
     FailureModel and NetworkDynamics architecture.
-
-    Example
-    -------
-    simulator = PaymentSimulator(
-        G,
-        failure_model,
-        network_dynamics
-    )
-
-    result = simulator.simulate_payment(
-        path,
-        edges,
-        amount,
-        tx_id
-    )
     """
 
     if failure_model is None:

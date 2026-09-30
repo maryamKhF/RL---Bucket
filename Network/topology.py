@@ -75,10 +75,13 @@ def geo_features(
     )
 
 
+    # The real snapshot does not contain numeric
+    # carbon-intensity data. regcolor is the selected
+    # node-level environmental proxy.
     carbon = (
-        node_u["carbon_intensity"]
+        float(node_u.get("regcolor", 0.0))
         +
-        node_v["carbon_intensity"]
+        float(node_v.get("regcolor", 0.0))
     ) / 2
 
 

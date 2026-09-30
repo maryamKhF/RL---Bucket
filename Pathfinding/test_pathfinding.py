@@ -23,13 +23,13 @@ if str(PROJECT_ROOT) not in sys.path:
 # ==========================================================
 
 from Pathfinding.top_k_paths import top_k_paths
+
 from Pathfinding.heuristics import (
     lnd_cost,
-    adaptive_heuristic,
-    modified_cost,
+    adaptive_edge_cost,
     channel_fee,
-    estimated_liquidity,
-    reliability_penalty,
+    validate_eta,
+    validate_lambda_h,
 )
 
 
@@ -42,28 +42,18 @@ GML_FILE = PROJECT_ROOT / "20190501.gml.geo"
 K = 5
 MAX_HOPS = 12
 
-# ----------------------------------------------------------
-# PPO adaptive parameter
-# ----------------------------------------------------------
-
+# PPO adaptive parameter.
+# Current invariant:
+#     0 <= ETA <= 1
 ETA = 0.5
 
-# ----------------------------------------------------------
-# Weight of adaptive heuristic
-# ----------------------------------------------------------
-
+# Weight of the normalized adaptive penalty.
 LAMBDA_H = 1.0
 
-# ----------------------------------------------------------
-# Payment amount
-# ----------------------------------------------------------
-
+# Payment amount.
 AMOUNT = 10_000
 
-# ----------------------------------------------------------
-# Reproducibility
-# ----------------------------------------------------------
-
+# Reproducibility.
 RANDOM_SEED = 42
 
 
@@ -75,9 +65,7 @@ def print_separator(
     char="=",
     length=78,
 ):
-    print(
-        char * length
-    )
+    print(char * length)
 
 
 def print_header(
@@ -94,17 +82,10 @@ def safe_float(
     default=0.0,
 ):
     try:
+        value = float(value)
 
-        value = float(
-            value
-        )
-
-        if not math.isfinite(
-            value
-        ):
-            return float(
-                default
-            )
+        if not math.isfinite(value):
+            return float(default)
 
         return value
 
@@ -112,9 +93,133 @@ def safe_float(
         TypeError,
         ValueError,
     ):
-        return float(
-            default
-        )
+        return float(default)
+
+
+# ==========================================================
+# Directional Liquidity Helper
+# ==========================================================
+
+def get_directional_liquidity(
+    data,
+):
+    """
+    Return explicitly available directional liquidity.
+
+    IMPORTANT:
+
+        Channel capacity is NOT interpreted as directional
+        liquidity.
+
+    The function only accepts attributes that explicitly
+    represent directional/local liquidity.
+
+    If no such attribute exists, liquidity is UNKNOWN.
+    """
+
+    explicit_keys = (
+        "liquidity",
+        "liquidity_msat",
+        "local_balance",
+        "local_balance_msat",
+    )
+
+    for key in explicit_keys:
+
+        if key not in data:
+            continue
+
+        value = data.get(key)
+
+        if value is None:
+            continue
+
+        try:
+            value = float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        if not math.isfinite(value):
+            continue
+
+        if value < 0:
+            continue
+
+        return value
+
+    return None
+
+
+# ==========================================================
+# Channel Reliability Helper
+# ==========================================================
+
+def get_channel_reliability(
+    data,
+):
+    """
+    Return an explicitly available channel reliability.
+
+    The current test does NOT assume a specific reliability
+    model inside heuristics.py.
+
+    Supported explicit attributes:
+
+        reliability
+        reliability_score
+        success_rate
+
+    If the dataset does not contain one of these attributes,
+    reliability is reported as UNKNOWN.
+
+    This is intentionally conservative: missing reliability
+    information is not converted into an artificial value.
+    """
+
+    explicit_keys = (
+        "reliability",
+        "reliability_score",
+        "success_rate",
+    )
+
+    for key in explicit_keys:
+
+        if key not in data:
+            continue
+
+        value = data.get(key)
+
+        if value is None:
+            continue
+
+        try:
+            value = float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        if not math.isfinite(value):
+            continue
+
+        if not (
+            0.0
+            <=
+            value
+            <=
+            1.0
+        ):
+            continue
+
+        return value
+
+    return None
 
 
 # ==========================================================
@@ -132,8 +237,8 @@ def load_graph():
         MultiGraph
         MultiDiGraph
 
-    Internally, the test converts the graph to MultiDiGraph
-    so that channel keys are preserved.
+    The test converts the graph to MultiDiGraph so that
+    channel keys are preserved.
     """
 
     print_header(
@@ -474,7 +579,7 @@ def print_graph_statistics(
         data=True,
     ):
 
-        liquidity = estimated_liquidity(
+        liquidity = get_directional_liquidity(
             data
         )
 
@@ -507,7 +612,7 @@ def print_graph_statistics(
     )
 
     print(
-        "  Completely unknown    : "
+        "  Completely unknown     : "
         f"{unknown_liquidity:,}"
     )
 
@@ -836,8 +941,16 @@ def validate_candidate_metadata(
     route,
 ):
     """
-    Validate that adaptive routing metadata returned by
-    top_k_paths is internally consistent.
+    Validate adaptive-routing metadata returned by
+    top_k_paths.
+
+    Current invariant:
+
+        0 <= eta <= 1
+
+    lambda_h must satisfy:
+
+        lambda_h >= 0
     """
 
     if "eta" not in route:
@@ -868,12 +981,15 @@ def validate_candidate_metadata(
 
         return False, "invalid_eta"
 
-    if not (
-        -1.0
-        <=
-        eta
-        <=
-        1.0
+    try:
+
+        validate_eta(
+            eta
+        )
+
+    except (
+        TypeError,
+        ValueError,
     ):
 
         return False, "eta_out_of_range"
@@ -884,9 +1000,18 @@ def validate_candidate_metadata(
 
         return False, "invalid_lambda_h"
 
-    if lambda_h < 0.0:
+    try:
 
-        return False, "negative_lambda_h"
+        validate_lambda_h(
+            lambda_h
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return False, "negative_or_invalid_lambda_h"
 
     return True, "OK"
 
@@ -1013,16 +1138,24 @@ def print_route(
                 AMOUNT,
             )
 
-            reliability = (
-                1.0
-                -
-                reliability_penalty(
-                    data
-                )
+            reliability = get_channel_reliability(
+                data
             )
 
-            liquidity = estimated_liquidity(
+            liquidity = get_directional_liquidity(
                 data
+            )
+
+            reliability_text = (
+                "unknown"
+                if reliability is None
+                else f"{reliability:.6f}"
+            )
+
+            liquidity_text = (
+                "unknown"
+                if liquidity is None
+                else f"{liquidity:.4f}"
             )
 
             print(
@@ -1033,9 +1166,8 @@ def print_route(
 
             print(
                 f"       fee={fee:.4f}, "
-                f"reliability={reliability:.6f}, "
-                f"liquidity="
-                f"{'unknown' if liquidity is None else f'{liquidity:.4f}'}"
+                f"reliability={reliability_text}, "
+                f"liquidity={liquidity_text}"
             )
 
         else:
@@ -1089,6 +1221,21 @@ def print_route(
         (
             "Carbon",
             "carbon_intensity",
+        ),
+
+        (
+            "Raw heuristic",
+            "raw_heuristic",
+        ),
+
+        (
+            "Adaptive penalty",
+            "adaptive_penalty",
+        ),
+
+        (
+            "Total adaptive penalty",
+            "total_adaptive_penalty",
         ),
     ]
 
@@ -1335,7 +1482,7 @@ def validate_k(
 
 
 # ==========================================================
-# Validate Adaptive Cost on First Route
+# Validate Adaptive Cost
 # ==========================================================
 
 def validate_adaptive_cost(
@@ -1343,15 +1490,23 @@ def validate_adaptive_cost(
     route,
 ):
     """
-    Independently recompute the adaptive cost of the first
-    candidate route.
+    Independently recompute the total adaptive cost of a
+    candidate route using the SAME shared adaptive_edge_cost()
+    helper used by the current Pathfinding implementation.
 
-    This verifies that the returned route cost is consistent
-    with:
+    Current edge-level model:
 
-        LND cost
-        +
-        lambda_h * adaptive heuristic
+        native_cost *
+        (1 + lambda_h * normalized_adaptive_penalty)
+
+    where:
+
+        normalized_adaptive_penalty =
+            abs(raw_heuristic) /
+            (1 + abs(raw_heuristic))
+
+    This validation intentionally does NOT use the obsolete
+    additive formulation.
     """
 
     path = route.get(
@@ -1393,33 +1548,136 @@ def validate_adaptive_cost(
 
         return False, "invalid_lambda_h"
 
+    try:
+
+        validate_eta(
+            eta
+        )
+
+        validate_lambda_h(
+            lambda_h
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+
+        return (
+            False,
+            f"invalid_parameters:{exc}",
+        )
+
     recomputed_cost = 0.0
 
     for u, v, key in edges:
 
+        if not G.has_edge(
+            u,
+            v,
+        ):
+
+            return (
+                False,
+                f"missing_edge:{u}->{v}",
+            )
+
+        if key not in G[u][v]:
+
+            return (
+                False,
+                f"missing_channel:{u}->{v}:{key}",
+            )
+
         data = G[u][v][key]
 
-        base_cost = lnd_cost(
-            G,
-            u,
-            v,
-            data,
-            AMOUNT,
-        )
+        # --------------------------------------------------
+        # Shared adaptive cost helper
+        # --------------------------------------------------
 
-        h = adaptive_heuristic(
-            G,
-            u,
-            v,
-            eta,
-        )
-
-        edge_cost = modified_cost(
-            native_cost=base_cost,
-            geo_penalty=h,
+        result = adaptive_edge_cost(
+            G=G,
+            u=u,
+            v=v,
+            data=data,
+            amount=AMOUNT,
             eta=eta,
+            heuristic_fn=lnd_cost,
             lambda_h=lambda_h,
         )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+
+            return (
+                False,
+                "adaptive_edge_cost_invalid_return_type",
+            )
+
+        native_cost = safe_float(
+            result.get(
+                "native_cost"
+            ),
+            default=float("nan"),
+        )
+
+        raw_h = safe_float(
+            result.get(
+                "raw_heuristic"
+            ),
+            default=float("nan"),
+        )
+
+        penalty = safe_float(
+            result.get(
+                "adaptive_penalty"
+            ),
+            default=float("nan"),
+        )
+
+        edge_cost = safe_float(
+            result.get(
+                "cost"
+            ),
+            default=float("nan"),
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in (
+                native_cost,
+                raw_h,
+                penalty,
+                edge_cost,
+            )
+        ):
+
+            return (
+                False,
+                f"non_finite_edge_cost:"
+                f"{u}->{v}:{key}",
+            )
+
+        # --------------------------------------------------
+        # Edge-level penalty invariant
+        # --------------------------------------------------
+
+        if not (
+            0.0
+            <=
+            penalty
+            <
+            1.0
+        ):
+
+            return (
+                False,
+                f"edge_penalty_out_of_range:"
+                f"{u}->{v}:{key}:"
+                f"{penalty}",
+            )
 
         recomputed_cost += edge_cost
 
@@ -1454,6 +1712,175 @@ def validate_adaptive_cost(
 
 
 # ==========================================================
+# Validate Edge-Level Adaptive Formula
+# ==========================================================
+
+def validate_edge_level_adaptive_formula(
+    G,
+    route,
+):
+    """
+    Verify the mathematical invariant of the shared adaptive
+    edge-cost helper.
+
+        penalty =
+            abs(raw_h) / (1 + abs(raw_h))
+
+        cost =
+            native_cost *
+            (1 + lambda_h * penalty)
+    """
+
+    edges = route.get(
+        "edges"
+    )
+
+    if not edges:
+
+        return False, "empty_edges"
+
+    eta = safe_float(
+        route.get(
+            "eta"
+        ),
+        default=float("nan"),
+    )
+
+    lambda_h = safe_float(
+        route.get(
+            "lambda_h",
+            1.0,
+        ),
+        default=float("nan"),
+    )
+
+    if not math.isfinite(
+        eta
+    ):
+
+        return False, "invalid_eta"
+
+    if not math.isfinite(
+        lambda_h
+    ):
+
+        return False, "invalid_lambda_h"
+
+    try:
+
+        validate_eta(
+            eta
+        )
+
+        validate_lambda_h(
+            lambda_h
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+
+        return (
+            False,
+            f"invalid_parameters:{exc}",
+        )
+
+    for u, v, key in edges:
+
+        data = G[u][v][key]
+
+        result = adaptive_edge_cost(
+            G=G,
+            u=u,
+            v=v,
+            data=data,
+            amount=AMOUNT,
+            eta=eta,
+            heuristic_fn=lnd_cost,
+            lambda_h=lambda_h,
+        )
+
+        native_cost = safe_float(
+            result.get(
+                "native_cost"
+            ),
+            default=float("nan"),
+        )
+
+        raw_h = safe_float(
+            result.get(
+                "raw_heuristic"
+            ),
+            default=float("nan"),
+        )
+
+        reported_penalty = safe_float(
+            result.get(
+                "adaptive_penalty"
+            ),
+            default=float("nan"),
+        )
+
+        reported_cost = safe_float(
+            result.get(
+                "cost"
+            ),
+            default=float("nan"),
+        )
+
+        expected_penalty = (
+            abs(raw_h)
+            /
+            (
+                1.0
+                +
+                abs(raw_h)
+            )
+        )
+
+        expected_cost = (
+            native_cost
+            *
+            (
+                1.0
+                +
+                lambda_h
+                *
+                expected_penalty
+            )
+        )
+
+        if not math.isclose(
+            reported_penalty,
+            expected_penalty,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+
+            return (
+                False,
+                "penalty_formula_mismatch:"
+                f"edge={u}->{v}:{key}",
+            )
+
+        if not math.isclose(
+            reported_cost,
+            expected_cost,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+
+            return (
+                False,
+                "cost_formula_mismatch:"
+                f"edge={u}->{v}:{key}",
+            )
+
+    return True, "OK"
+
+
+# ==========================================================
 # Main Test
 # ==========================================================
 
@@ -1467,6 +1894,29 @@ def main():
     )
 
     print_separator()
+
+    # ======================================================
+    # Validate configuration
+    # ======================================================
+
+    try:
+
+        validate_eta(
+            ETA
+        )
+
+        validate_lambda_h(
+            LAMBDA_H
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+
+        raise RuntimeError(
+            f"Invalid test configuration: {exc}"
+        ) from exc
 
     # ======================================================
     # 1. Load graph
@@ -1559,37 +2009,6 @@ def main():
             lambda_h=LAMBDA_H,
         )
 
-    except TypeError as exc:
-
-        print()
-        print(
-            "WARNING:"
-        )
-
-        print(
-            "The current top_k_paths() signature does "
-            "not accept lambda_h."
-        )
-
-        print(
-            "Retrying without explicit lambda_h."
-        )
-
-        print(
-            f"TypeError: {exc}"
-        )
-
-        routes = top_k_paths(
-            G=G,
-            source=source,
-            target=target,
-            amount=AMOUNT,
-            heuristic_fn=lnd_cost,
-            eta=ETA,
-            k=K,
-            max_hops=MAX_HOPS,
-        )
-
     except Exception as exc:
 
         print()
@@ -1616,6 +2035,16 @@ def main():
         print(
             f"Message        : "
             f"{exc}"
+        )
+
+        print()
+        print(
+            "The test intentionally does not hide this exception."
+        )
+
+        print(
+            "The current top_k_paths() API and this test "
+            "must remain consistent."
         )
 
         raise
@@ -1798,6 +2227,7 @@ def main():
     )
 
     adaptive_pass = 0
+    formula_pass = 0
 
     for rank, route in enumerate(
         routes,
@@ -1809,25 +2239,52 @@ def main():
             route,
         )
 
+        formula_valid, formula_reason = (
+            validate_edge_level_adaptive_formula(
+                G,
+                route,
+            )
+        )
+
         print(
             f"Route #{rank:<3}: "
-            f"{'PASS' if valid else 'FAIL'}"
+            f"shared_cost="
+            f"{'PASS' if valid else 'FAIL':<5} "
+            f"formula="
+            f"{'PASS' if formula_valid else 'FAIL'}"
         )
 
         if not valid:
 
             print(
-                f"    Reason: {reason}"
+                f"    Shared-cost reason: "
+                f"{reason}"
             )
 
         else:
 
             adaptive_pass += 1
 
+        if not formula_valid:
+
+            print(
+                f"    Formula reason: "
+                f"{formula_reason}"
+            )
+
+        else:
+
+            formula_pass += 1
+
     print()
     print(
-        f"Adaptive cost validation : "
+        f"Shared adaptive cost     : "
         f"{adaptive_pass}/{len(routes)}"
+    )
+
+    print(
+        f"Adaptive formula         : "
+        f"{formula_pass}/{len(routes)}"
     )
 
     # ======================================================
@@ -1876,16 +2333,30 @@ def main():
         structural_pass
         ==
         len(routes)
+
         and
+
         metadata_pass
         ==
         len(routes)
+
         and
+
         ordered
+
         and
+
         k_valid
+
         and
+
         adaptive_pass
+        ==
+        len(routes)
+
+        and
+
+        formula_pass
         ==
         len(routes)
     )
@@ -1947,8 +2418,13 @@ def main():
     )
 
     print(
-        f"  Adaptive cost         : "
+        f"  Shared adaptive cost  : "
         f"{'PASS' if adaptive_pass == len(routes) else 'FAIL'}"
+    )
+
+    print(
+        f"  Adaptive formula      : "
+        f"{'PASS' if formula_pass == len(routes) else 'FAIL'}"
     )
 
     print()
@@ -1974,6 +2450,31 @@ def main():
 
     print(
         "  It does NOT perform Partial Backtracking."
+    )
+
+    print()
+    print(
+        "Current verified pathfinding chain:"
+    )
+
+    print(
+        "  ETA"
+    )
+
+    print(
+        "    -> Adaptive Heuristic"
+    )
+
+    print(
+        "    -> Normalized Adaptive Penalty"
+    )
+
+    print(
+        "    -> Adaptive Edge Cost"
+    )
+
+    print(
+        "    -> Top-K Candidate Routes"
     )
 
     print()

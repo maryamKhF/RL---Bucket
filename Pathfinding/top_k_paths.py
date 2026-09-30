@@ -1,44 +1,50 @@
-# Pathfinding/top_k_paths.py
+"""
+Top-K candidate routing for the adaptive routing model.
+
+The exact same adaptive edge-cost function used by Dijkstra
+is used here.
+
+Unified objective:
+
+    C'(e) =
+        C_LND(e)
+        *
+        (
+            1 + lambda_h * penalty(e, eta)
+        )
+
+PPO controls eta only.
+
+K is an explicit routing parameter and is never modified
+inside this module.
+"""
 
 import math
+
 import networkx as nx
 
 from .heuristics import (
     lnd_cost,
-    adaptive_heuristic,
+    adaptive_edge_cost,
     channel_fee,
+    channel_delay,
+    validate_eta,
+    validate_lambda_h,
 )
 
 
 # ==========================================================
-# Learned / Observed Directional Liquidity
+# Directional Liquidity
 # ==========================================================
 
 def _estimated_liquidity(data):
-    """
-    Return learned/observed directional liquidity.
-
-    Priority:
-        1. estimated_liquidity
-        2. liquidity_uv
-        3. balance_uv
-
-    Important:
-        capacity is NOT interpreted as liquidity.
-
-    Returns:
-        float
-            Known directional liquidity.
-
-        None
-            Unknown liquidity.
-    """
 
     for field in (
         "estimated_liquidity",
         "liquidity_uv",
         "balance_uv",
     ):
+
         if field not in data:
             continue
 
@@ -49,7 +55,10 @@ def _estimated_liquidity(data):
 
         try:
             value = float(value)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             continue
 
         if (
@@ -65,29 +74,23 @@ def _estimated_liquidity(data):
 # Channel Feasibility
 # ==========================================================
 
-def _channel_can_carry(data, amount):
-    """
-    Check known directional liquidity.
+def _channel_can_carry(
+    data,
+    amount,
+):
 
-    liquidity < amount
-        -> channel is rejected
-
-    liquidity >= amount
-        -> channel is accepted
-
-    liquidity unknown
-        -> channel is accepted
-
-    Actual payment feasibility is evaluated later by
-    FailureModel / PaymentSimulator.
-    """
-
-    liquidity = _estimated_liquidity(data)
+    liquidity = _estimated_liquidity(
+        data
+    )
 
     if liquidity is None:
         return True
 
-    return liquidity >= float(amount)
+    return (
+        liquidity
+        >=
+        float(amount)
+    )
 
 
 # ==========================================================
@@ -95,17 +98,6 @@ def _channel_can_carry(data, amount):
 # ==========================================================
 
 def _channel_reliability(data):
-    """
-    Estimate forwarding reliability.
-
-    Priority:
-        1. success/failure history
-        2. failure_probability
-        3. default failure probability = 0.01
-
-    Returns:
-        reliability in [0, 1]
-    """
 
     success = _safe_float(
         data.get(
@@ -174,106 +166,7 @@ def _channel_reliability(data):
 
 
 # ==========================================================
-# Adaptive Heuristic Penalty
-# ==========================================================
-
-def _adaptive_penalty(
-    G,
-    u,
-    v,
-    eta,
-):
-    """
-    Convert the raw adaptive heuristic into a stable,
-    non-negative routing penalty.
-
-    The original adaptive heuristic can be negative:
-
-        h(u,v) < 0
-
-    Passing that value directly into the routing cost can
-    create an artificial near-zero edge cost because
-    modified_cost() clips negative final costs.
-
-    Therefore:
-
-        raw_h = adaptive_heuristic(...)
-
-        penalty = abs(raw_h)
-
-    This preserves the magnitude of the adaptive signal
-    while guaranteeing a non-negative penalty.
-
-    A bounded normalization is then applied:
-
-        normalized =
-            penalty / (1 + penalty)
-
-    Therefore:
-
-        0 <= normalized < 1
-
-    This prevents carbon-related values from completely
-    dominating the native LND cost.
-
-    Returns:
-        raw_heuristic
-        normalized_penalty
-    """
-
-    raw_h = adaptive_heuristic(
-        G,
-        u,
-        v,
-        eta,
-    )
-
-    if not _valid_number(raw_h):
-        raise ValueError(
-            "Adaptive heuristic must be finite."
-        )
-
-    raw_h = float(raw_h)
-
-    magnitude = abs(
-        raw_h
-    )
-
-    normalized_penalty = (
-        magnitude
-        /
-        (
-            1.0
-            +
-            magnitude
-        )
-    )
-
-    if not _valid_number(
-        normalized_penalty
-    ):
-        raise ValueError(
-            "Adaptive penalty is not finite."
-        )
-
-    normalized_penalty = min(
-        max(
-            normalized_penalty,
-            0.0,
-        ),
-        1.0,
-    )
-
-    return (
-        raw_h,
-        float(
-            normalized_penalty
-        ),
-    )
-
-
-# ==========================================================
-# Edge Cost
+# Adaptive Edge Cost
 # ==========================================================
 
 def _adaptive_edge_cost(
@@ -287,176 +180,40 @@ def _adaptive_edge_cost(
     lambda_h=1.0,
 ):
     """
-    Calculate adaptive routing cost.
+    Compatibility wrapper around the unified adaptive cost.
 
-    Native cost:
+    Returns:
 
-        C_LND(e)
-
-    Adaptive signal:
-
-        h(u,v)
-
-    Stable non-negative penalty:
-
-        p(u,v) =
-            |h(u,v)| / (1 + |h(u,v)|)
-
-    Final cost:
-
-        C'(e) =
-            C_LND(e)
-            *
-            (
-                1
-                +
-                lambda_h * p(u,v)
-            )
-
-    This formulation guarantees:
-
-        C'(e) >= C_LND(e) > 0
-
-    and therefore avoids the previous problem where a
-    negative adaptive heuristic could make the final edge
-    cost collapse to approximately zero.
-
-    PPO controls eta only.
+        cost
+        raw_heuristic
+        adaptive_penalty
     """
 
-    # ------------------------------------------------------
-    # Native LND cost
-    # ------------------------------------------------------
-
-    if heuristic_fn is not None:
-
-        try:
-
-            native_cost = heuristic_fn(
-                G,
-                u,
-                v,
-                data,
-                amount,
-            )
-
-        except (
-            TypeError,
-            ValueError,
-            KeyError,
-        ):
-
-            native_cost = lnd_cost(
-                G,
-                u,
-                v,
-                data,
-                amount,
-            )
-
-    else:
-
-        native_cost = lnd_cost(
-            G,
-            u,
-            v,
-            data,
-            amount,
-        )
-
-    if not _valid_cost(
-        native_cost
-    ):
-        return None, None, None
-
-    native_cost = float(
-        native_cost
+    result = adaptive_edge_cost(
+        G=G,
+        u=u,
+        v=v,
+        data=data,
+        amount=amount,
+        eta=eta,
+        heuristic_fn=(
+            heuristic_fn
+            if heuristic_fn is not None
+            else lnd_cost
+        ),
+        lambda_h=lambda_h,
     )
 
-    # ------------------------------------------------------
-    # Adaptive heuristic
-    # ------------------------------------------------------
-
-    try:
-
-        raw_h, penalty = (
-            _adaptive_penalty(
-                G=G,
-                u=u,
-                v=v,
-                eta=eta,
-            )
-        )
-
-    except (
-        TypeError,
-        ValueError,
-        KeyError,
-    ):
-
-        return None, None, None
-
-    # ------------------------------------------------------
-    # Lambda validation
-    # ------------------------------------------------------
-
-    try:
-
-        lambda_h = float(
-            lambda_h
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return None, None, None
-
-    if (
-        not math.isfinite(
-            lambda_h
-        )
-        or
-        lambda_h < 0.0
-    ):
-        return None, None, None
-
-    # ------------------------------------------------------
-    # Adaptive cost
-    # ------------------------------------------------------
-
-    try:
-
-        cost = (
-            native_cost
-            *
-            (
-                1.0
-                +
-                lambda_h
-                *
-                penalty
-            )
-        )
-
-    except (
-        TypeError,
-        ValueError,
-        OverflowError,
-    ):
-
-        return None, None, None
-
-    if not _valid_cost(
-        cost
-    ):
-        return None, None, None
-
     return (
-        float(cost),
-        float(raw_h),
-        float(penalty),
+        float(
+            result["cost"]
+        ),
+        float(
+            result["raw_heuristic"]
+        ),
+        float(
+            result["adaptive_penalty"]
+        ),
     )
 
 
@@ -473,25 +230,23 @@ def _build_routing_graph(
     lambda_h=1.0,
 ):
     """
-    Build a simplified directed graph for node-level
-    candidate route generation.
+    Build a simplified directed node-level graph.
 
-    For MultiDiGraph:
+    For parallel channels between the same node pair,
+    the cheapest usable channel is retained.
 
-        multiple channels between the same node pair
-        are reduced to the cheapest usable channel.
-
-    The original channel key and channel data are preserved.
-
-    Important:
-        eta affects the edge cost used for candidate ranking.
+    The exact channel key and channel data are preserved.
     """
 
-    H = nx.DiGraph()
+    eta = validate_eta(
+        eta
+    )
 
-    # ------------------------------------------------------
-    # Copy nodes
-    # ------------------------------------------------------
+    lambda_h = validate_lambda_h(
+        lambda_h
+    )
+
+    H = nx.DiGraph()
 
     for node, node_data in G.nodes(
         data=True
@@ -499,14 +254,8 @@ def _build_routing_graph(
 
         H.add_node(
             node,
-            **dict(
-                node_data
-            ),
+            **dict(node_data),
         )
-
-    # ------------------------------------------------------
-    # MultiGraph / MultiDiGraph
-    # ------------------------------------------------------
 
     if isinstance(
         G,
@@ -532,10 +281,6 @@ def _build_routing_graph(
                 raw_data
             )
 
-            # ----------------------------------------------
-            # Channel availability
-            # ----------------------------------------------
-
             if not bool(
                 data.get(
                     "available",
@@ -543,10 +288,6 @@ def _build_routing_graph(
                 )
             ):
                 continue
-
-            # ----------------------------------------------
-            # Node availability
-            # ----------------------------------------------
 
             if not _node_available(
                 G,
@@ -560,41 +301,42 @@ def _build_routing_graph(
             ):
                 continue
 
-            # ----------------------------------------------
-            # Directional liquidity
-            # ----------------------------------------------
-
             if not _channel_can_carry(
                 data,
                 amount,
             ):
                 continue
 
-            # ----------------------------------------------
-            # Adaptive cost
-            # ----------------------------------------------
+            try:
 
-            (
-                weight,
-                raw_h,
-                adaptive_penalty,
-            ) = _adaptive_edge_cost(
-                G=G,
-                u=u,
-                v=v,
-                data=data,
-                amount=amount,
-                eta=eta,
-                heuristic_fn=heuristic_fn,
-                lambda_h=lambda_h,
-            )
+                (
+                    weight,
+                    raw_h,
+                    adaptive_penalty,
+                ) = _adaptive_edge_cost(
+                    G=G,
+                    u=u,
+                    v=v,
+                    data=data,
+                    amount=amount,
+                    eta=eta,
+                    heuristic_fn=heuristic_fn,
+                    lambda_h=lambda_h,
+                )
 
-            if weight is None:
+            except (
+                TypeError,
+                ValueError,
+                KeyError,
+                AttributeError,
+            ):
+
                 continue
 
-            # ----------------------------------------------
-            # Channel fee
-            # ----------------------------------------------
+            if not _valid_cost(
+                weight
+            ):
+                continue
 
             try:
 
@@ -616,11 +358,7 @@ def _build_routing_graph(
             ):
                 continue
 
-            # ----------------------------------------------
-            # Delay
-            # ----------------------------------------------
-
-            delay = _channel_delay(
+            delay = channel_delay(
                 data
             )
 
@@ -629,31 +367,16 @@ def _build_routing_graph(
             ):
                 continue
 
-            # ----------------------------------------------
-            # Reliability
-            # ----------------------------------------------
-
             reliability = (
                 _channel_reliability(
                     data
                 )
             )
 
-            if not _valid_metric(
-                reliability
-            ):
-                continue
-
-            # ----------------------------------------------
-            # Edge attributes
-            # ----------------------------------------------
-
             edge_attributes = {
 
                 "weight":
-                    float(
-                        weight
-                    ),
+                    float(weight),
 
                 "channel_key":
                     key,
@@ -662,39 +385,23 @@ def _build_routing_graph(
                     data,
 
                 "fee":
-                    float(
-                        fee
-                    ),
+                    float(fee),
 
                 "delay":
-                    float(
-                        delay
-                    ),
+                    float(delay),
 
                 "reliability":
-                    float(
-                        reliability
-                    ),
+                    float(reliability),
 
                 "eta":
-                    float(
-                        eta
-                    ),
+                    float(eta),
 
                 "raw_heuristic":
-                    float(
-                        raw_h
-                    ),
+                    float(raw_h),
 
                 "adaptive_penalty":
-                    float(
-                        adaptive_penalty
-                    ),
+                    float(adaptive_penalty),
             }
-
-            # ----------------------------------------------
-            # Keep cheapest usable channel
-            # ----------------------------------------------
 
             if not H.has_edge(
                 u,
@@ -709,11 +416,9 @@ def _build_routing_graph(
 
             else:
 
-                existing_weight = (
-                    H[u][v][
-                        "weight"
-                    ]
-                )
+                existing_weight = H[u][v][
+                    "weight"
+                ]
 
                 if (
                     weight
@@ -724,10 +429,6 @@ def _build_routing_graph(
                     H[u][v].update(
                         edge_attributes
                     )
-
-    # ------------------------------------------------------
-    # Ordinary Graph / DiGraph
-    # ------------------------------------------------------
 
     else:
 
@@ -769,22 +470,35 @@ def _build_routing_graph(
             ):
                 continue
 
-            (
-                weight,
-                raw_h,
-                adaptive_penalty,
-            ) = _adaptive_edge_cost(
-                G=G,
-                u=u,
-                v=v,
-                data=data,
-                amount=amount,
-                eta=eta,
-                heuristic_fn=heuristic_fn,
-                lambda_h=lambda_h,
-            )
+            try:
 
-            if weight is None:
+                (
+                    weight,
+                    raw_h,
+                    adaptive_penalty,
+                ) = _adaptive_edge_cost(
+                    G=G,
+                    u=u,
+                    v=v,
+                    data=data,
+                    amount=amount,
+                    eta=eta,
+                    heuristic_fn=heuristic_fn,
+                    lambda_h=lambda_h,
+                )
+
+            except (
+                TypeError,
+                ValueError,
+                KeyError,
+                AttributeError,
+            ):
+
+                continue
+
+            if not _valid_cost(
+                weight
+            ):
                 continue
 
             try:
@@ -807,7 +521,7 @@ def _build_routing_graph(
             ):
                 continue
 
-            delay = _channel_delay(
+            delay = channel_delay(
                 data
             )
 
@@ -822,17 +536,10 @@ def _build_routing_graph(
                 )
             )
 
-            if not _valid_metric(
-                reliability
-            ):
-                continue
-
             edge_attributes = {
 
                 "weight":
-                    float(
-                        weight
-                    ),
+                    float(weight),
 
                 "channel_key":
                     data.get(
@@ -844,34 +551,22 @@ def _build_routing_graph(
                     data,
 
                 "fee":
-                    float(
-                        fee
-                    ),
+                    float(fee),
 
                 "delay":
-                    float(
-                        delay
-                    ),
+                    float(delay),
 
                 "reliability":
-                    float(
-                        reliability
-                    ),
+                    float(reliability),
 
                 "eta":
-                    float(
-                        eta
-                    ),
+                    float(eta),
 
                 "raw_heuristic":
-                    float(
-                        raw_h
-                    ),
+                    float(raw_h),
 
                 "adaptive_penalty":
-                    float(
-                        adaptive_penalty
-                    ),
+                    float(adaptive_penalty),
             }
 
             if (
@@ -890,23 +585,20 @@ def _build_routing_graph(
                 H.add_edge(
                     u,
                     v,
-                    **edge_attributes
+                    **edge_attributes,
                 )
 
     return H
 
 
 # ==========================================================
-# Complete Path Metrics
+# Path Metrics
 # ==========================================================
 
 def _path_metrics(
     H,
     path,
 ):
-    """
-    Calculate aggregate candidate-path metrics.
-    """
 
     total_cost = 0.0
     total_fee = 0.0
@@ -986,24 +678,16 @@ def _path_metrics(
     return {
 
         "cost":
-            float(
-                total_cost
-            ),
+            float(total_cost),
 
         "total_fee":
-            float(
-                total_fee
-            ),
+            float(total_fee),
 
         "total_delay":
-            float(
-                total_delay
-            ),
+            float(total_delay),
 
         "reliability":
-            float(
-                reliability
-            ),
+            float(reliability),
 
         "failure_probability":
             float(
@@ -1025,20 +709,13 @@ def _path_metrics(
 
 
 # ==========================================================
-# Convert Node Path to Channel Path
+# Path → Channel Edges
 # ==========================================================
 
 def _path_edges(
     H,
     path,
 ):
-    """
-    Convert a node path into exact channel edges:
-
-        (u, v, channel_key)
-
-    The original channel key is preserved.
-    """
 
     edges = []
 
@@ -1066,7 +743,7 @@ def _path_edges(
 
 
 # ==========================================================
-# Validate Candidate Route
+# Candidate Validation
 # ==========================================================
 
 def _valid_candidate_path(
@@ -1075,9 +752,6 @@ def _valid_candidate_path(
     target,
     max_hops,
 ):
-    """
-    Validate a node-level candidate path.
-    """
 
     if not isinstance(
         path,
@@ -1102,7 +776,6 @@ def _valid_candidate_path(
     if hops > max_hops:
         return False
 
-    # No repeated nodes.
     if len(
         set(path)
     ) != len(path):
@@ -1112,7 +785,7 @@ def _valid_candidate_path(
 
 
 # ==========================================================
-# K Candidate Routes
+# Top-K
 # ==========================================================
 
 def top_k_paths(
@@ -1127,67 +800,15 @@ def top_k_paths(
     lambda_h=1.0,
 ):
     """
-    Generate K candidate routing paths.
+    Generate K candidate paths.
 
-    Pipeline:
+    Important invariants:
 
-        Network State
-              |
-              v
-             PPO
-              |
-              v
-             eta
-              |
-              v
-      Adaptive Heuristic
-              |
-              v
-      Adaptive Penalty
-              |
-              v
-       Modified Edge Cost
-              |
-              v
-       K Candidate Paths
-              |
-              v
-            Bucket
-              |
-              v
-       Payment Simulation
-
-    PPO controls eta only.
-
-    k remains an explicit fixed routing parameter.
-    The function never changes k dynamically.
-
-    Returns
-    -------
-
-    list of dict
-
-        Each candidate contains:
-
-            path
-            edges
-            cost
-            hop_count
-            total_fee
-            total_delay
-            reliability
-            failure_probability
-            eta
-            lambda_h
-            raw_heuristic
-            adaptive_penalty
-            candidate
-            success
+        - eta controls the adaptive routing criterion.
+        - k is explicit and is never changed internally.
+        - source, target and amount are unchanged.
+        - the adaptive cost is identical to Dijkstra.
     """
-
-    # ======================================================
-    # Basic validation
-    # ======================================================
 
     if source == target:
         return []
@@ -1198,168 +819,59 @@ def top_k_paths(
     if target not in G:
         return []
 
-    # ------------------------------------------------------
-    # Amount
-    # ------------------------------------------------------
-
     try:
-
-        amount = float(
-            amount
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
+        amount = float(amount)
+    except (TypeError, ValueError):
         return []
 
     if (
-        not math.isfinite(
-            amount
-        )
-        or
-        amount <= 0.0
+        not math.isfinite(amount)
+        or amount <= 0.0
     ):
         return []
 
-    # ------------------------------------------------------
-    # K
-    # ------------------------------------------------------
-
     try:
-
-        k = int(
-            k
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
+        k = int(k)
+    except (TypeError, ValueError):
         return []
 
     if k <= 0:
         return []
 
-    # ------------------------------------------------------
-    # Maximum hops
-    # ------------------------------------------------------
-
     try:
-
-        max_hops = int(
-            max_hops
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
+        max_hops = int(max_hops)
+    except (TypeError, ValueError):
         return []
 
     if max_hops <= 0:
         return []
 
-    # ------------------------------------------------------
-    # Eta
-    # ------------------------------------------------------
-
-    try:
-
-        eta = float(
-            eta
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        raise ValueError(
-            "eta must be numeric"
-        )
-
-    if not math.isfinite(
+    eta = validate_eta(
         eta
-    ):
+    )
 
-        raise ValueError(
-            "eta must be finite"
-        )
-
-    if not (
-        -1.0
-        <=
-        eta
-        <=
-        1.0
-    ):
-
-        raise ValueError(
-            "eta must be in [-1, 1], "
-            f"got {eta}"
-        )
-
-    # ------------------------------------------------------
-    # Lambda
-    # ------------------------------------------------------
-
-    try:
-
-        lambda_h = float(
-            lambda_h
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        raise ValueError(
-            "lambda_h must be numeric"
-        )
-
-    if (
-        not math.isfinite(
-            lambda_h
-        )
-        or
-        lambda_h < 0.0
-    ):
-
-        raise ValueError(
-            "lambda_h must be finite "
-            "and >= 0"
-        )
-
-    # ======================================================
-    # Build simplified routing graph
-    # ======================================================
+    lambda_h = validate_lambda_h(
+        lambda_h
+    )
 
     H = _build_routing_graph(
         G=G,
         amount=amount,
         eta=eta,
         max_hops=max_hops,
-        heuristic_fn=heuristic_fn,
+        heuristic_fn=(
+            heuristic_fn
+            if heuristic_fn is not None
+            else lnd_cost
+        ),
         lambda_h=lambda_h,
     )
 
     if (
         source not in H
-        or
-        target not in H
+        or target not in H
     ):
-
         return []
-
-    # ======================================================
-    # Candidate generation
-    # ======================================================
 
     try:
 
@@ -1380,16 +892,11 @@ def top_k_paths(
         return []
 
     results = []
-
     seen_paths = set()
 
     try:
 
         for path in path_generator:
-
-            # ------------------------------------------------
-            # Validate path
-            # ------------------------------------------------
 
             if not _valid_candidate_path(
                 path,
@@ -1397,7 +904,6 @@ def top_k_paths(
                 target,
                 max_hops,
             ):
-
                 continue
 
             path_tuple = tuple(
@@ -1411,56 +917,35 @@ def top_k_paths(
                 path_tuple
             )
 
-            # ------------------------------------------------
-            # Convert node path to exact channels
-            # ------------------------------------------------
-
             edges = _path_edges(
                 H,
                 path,
             )
 
             if len(edges) != (
-                len(path)
-                -
-                1
+                len(path) - 1
             ):
-
                 continue
-
-            # ------------------------------------------------
-            # Aggregate metrics
-            # ------------------------------------------------
 
             metrics = _path_metrics(
                 H,
                 path,
             )
 
-            # ------------------------------------------------
-            # Candidate
-            # ------------------------------------------------
-
             candidate = {
 
                 "path":
-                    list(
-                        path
-                    ),
+                    list(path),
 
                 "edges":
                     edges,
 
                 "cost":
-                    metrics[
-                        "cost"
-                    ],
+                    metrics["cost"],
 
                 "hop_count":
                     int(
-                        len(path)
-                        -
-                        1
+                        len(path) - 1
                     ),
 
                 "total_fee":
@@ -1484,14 +969,10 @@ def top_k_paths(
                     ],
 
                 "eta":
-                    float(
-                        eta
-                    ),
+                    float(eta),
 
                 "lambda_h":
-                    float(
-                        lambda_h
-                    ),
+                    float(lambda_h),
 
                 "raw_heuristic":
                     metrics[
@@ -1506,7 +987,6 @@ def top_k_paths(
                 "candidate":
                     True,
 
-                # PaymentSimulator updates this.
                 "success":
                     None,
             }
@@ -1521,53 +1001,17 @@ def top_k_paths(
     except nx.NetworkXNoPath:
         pass
 
-    # ======================================================
-    # Explicit deterministic ranking
-    # ======================================================
-
     results.sort(
         key=lambda item: (
             item["cost"],
             item["hop_count"],
             item["total_fee"],
             -item["reliability"],
-            tuple(
-                item["path"]
-            ),
+            tuple(item["path"]),
         )
     )
 
     return results
-
-
-# ==========================================================
-# Channel Delay
-# ==========================================================
-
-def _channel_delay(
-    data,
-):
-    """
-    Extract channel delay.
-
-    Supported attributes:
-
-        delay
-        cltv_expiry_delta
-    """
-
-    return max(
-        0.0,
-        _safe_float(
-            data.get(
-                "delay",
-                data.get(
-                    "cltv_expiry_delta",
-                    0.0,
-                ),
-            )
-        ),
-    )
 
 
 # ==========================================================
@@ -1578,21 +1022,11 @@ def _node_available(
     G,
     node,
 ):
-    """
-    Check node availability.
-
-    Both attributes are supported:
-
-        available
-        is_online
-    """
 
     if node not in G:
         return False
 
-    data = G.nodes[
-        node
-    ]
+    data = G.nodes[node]
 
     if not bool(
         data.get(
@@ -1621,25 +1055,13 @@ def _safe_float(
     value,
     default=0.0,
 ):
-    """
-    Convert value to finite float.
-
-    Invalid or non-finite values return default.
-    """
 
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
-        if not math.isfinite(
-            value
-        ):
-
-            return float(
-                default
-            )
+        if not math.isfinite(value):
+            return float(default)
 
         return value
 
@@ -1648,26 +1070,18 @@ def _safe_float(
         ValueError,
     ):
 
-        return float(
-            default
-        )
+        return float(default)
 
 
-def _valid_number(
-    value,
-):
-    """
-    Check whether value is finite.
-    """
+def _valid_metric(value):
 
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
-        return math.isfinite(
-            value
+        return (
+            math.isfinite(value)
+            and value >= 0.0
         )
 
     except (
@@ -1678,58 +1092,15 @@ def _valid_number(
         return False
 
 
-def _valid_metric(
-    value,
-):
-    """
-    Check whether a metric is finite and non-negative.
-    """
+def _valid_cost(value):
 
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
         return (
-            math.isfinite(
-                value
-            )
-            and
-            value >= 0.0
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return False
-
-
-def _valid_cost(
-    value,
-):
-    """
-    Check whether routing cost is finite and non-negative.
-
-    NetworkX weighted shortest-path algorithms require
-    numerical edge weights and shortest_simple_paths does
-    not support negative weights.
-    """
-
-    try:
-
-        value = float(
-            value
-        )
-
-        return (
-            math.isfinite(
-                value
-            )
-            and
-            value >= 0.0
+            math.isfinite(value)
+            and value >= 0.0
         )
 
     except (

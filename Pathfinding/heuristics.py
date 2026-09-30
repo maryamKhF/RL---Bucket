@@ -15,7 +15,13 @@ def channel_fee(data, amount):
         Base forwarding fee.
 
     fee_rate:
-        Proportional fee in ppm.
+        Proportional forwarding fee in ppm.
+
+    Important:
+        The original unit convention of the input dataset is
+        preserved here. Unit conversion between sat and msat
+        should be handled consistently across the simulator
+        and routing modules.
     """
 
     amount = float(amount)
@@ -23,7 +29,10 @@ def channel_fee(data, amount):
     fee_base = float(
         data.get(
             "fee_base",
-            data.get("fee_base_msat", 0.0)
+            data.get(
+                "fee_base_msat",
+                0.0
+            )
         )
     )
 
@@ -53,19 +62,31 @@ def liquidity_penalty(data, amount):
     Optional liquidity penalty.
 
     Important:
-        capacity is NOT interpreted as directional balance.
+        Channel capacity is NOT interpreted as directional
+        liquidity.
 
-    Only learned/observed directional liquidity can be used.
+    Only learned or observed directional liquidity can be used.
+
+    Priority:
+        1. estimated_liquidity
+        2. liquidity_uv
+        3. balance_uv
+        4. unknown
     """
 
     estimated_liquidity = data.get(
         "estimated_liquidity",
         data.get(
             "liquidity_uv",
-            data.get("balance_uv", None)
+            data.get(
+                "balance_uv",
+                None
+            )
         )
     )
 
+    # Liquidity is unknown.
+    # Unknown does not mean zero.
     if estimated_liquidity is None:
         return 0.0
 
@@ -76,7 +97,11 @@ def liquidity_penalty(data, amount):
     if estimated_liquidity <= 0:
         return math.inf
 
-    return float(amount) / estimated_liquidity
+    return (
+        float(amount)
+        /
+        estimated_liquidity
+    )
 
 
 # ==========================================================
@@ -85,12 +110,12 @@ def liquidity_penalty(data, amount):
 
 def reliability_penalty(data):
     """
-    Empirical channel failure probability.
+    Estimate channel failure probability.
 
-    If previous success/failure observations exist,
-    estimate the probability from those observations.
+    If empirical success/failure observations exist,
+    use the observed failure ratio.
 
-    Otherwise use the initial prior.
+    Otherwise use the initial failure probability prior.
     """
 
     success = float(
@@ -110,7 +135,12 @@ def reliability_penalty(data):
     total = success + failure
 
     if total > 0:
-        return failure / total
+
+        return (
+            failure
+            /
+            total
+        )
 
     return float(
         data.get(
@@ -132,13 +162,17 @@ def lnd_cost(
         amount
 ):
     """
-    Base LND-like routing cost.
+    Native LND-like routing cost.
 
-    This is the native routing cost C_LND(e).
+    C_LND(e) =
+        forwarding_fee
+        + 0.5 * delay
+        + 1
 
-    PPO does NOT directly select the route.
-    PPO only produces eta, which is later used
-    to modify this cost through the heuristic h.
+    PPO does not directly select a route.
+
+    PPO produces eta, which is subsequently used by the
+    adaptive heuristic to modify this native routing cost.
     """
 
     fee = channel_fee(
@@ -177,9 +211,9 @@ def cln_cost(
         amount
 ):
     """
-    CLN-like base routing cost.
+    CLN-like routing cost.
 
-    Kept for baseline evaluation.
+    Used only for baseline comparison.
     """
 
     fee = channel_fee(
@@ -218,9 +252,9 @@ def ecl_cost(
         amount
 ):
     """
-    ECL-like base routing cost.
+    ECL-like routing cost.
 
-    Kept for baseline evaluation.
+    Used only for baseline comparison.
     """
 
     fee = channel_fee(
@@ -256,20 +290,71 @@ def node_carbon_intensity(
         node
 ):
     """
-    Return carbon intensity of a node.
+    Return the numeric carbon-intensity value of a node.
 
-    README defines the heuristic using
-    intCO2 of the source and destination nodes.
+    Modeling rule:
+
+        carbon_intensity(node) = rgb_color(node)
+
+    Larger rgb_color means higher carbon intensity.
+
+    The graph_builder stores the original rgb_color attribute
+    and also mirrors it into carbon_intensity.
+
+    Priority:
+        1. rgb_color
+        2. carbon_intensity
+        3. 0.0
     """
+
+    if node not in G:
+
+        raise KeyError(
+            f"Node {node} does not exist in graph."
+        )
 
     node_data = G.nodes[node]
 
-    value = node_data.get(
+    # Primary source:
+    # rgb_color from the dataset.
+    rgb_value = node_data.get(
+        "rgb_color",
+        None
+    )
+
+    if rgb_value is not None:
+
+        try:
+
+            return float(
+                rgb_value
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            pass
+
+    # Backward compatibility.
+    carbon_value = node_data.get(
         "carbon_intensity",
         0.0
     )
 
-    return float(value)
+    try:
+
+        return float(
+            carbon_value
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return 0.0
 
 
 # ==========================================================
@@ -283,22 +368,28 @@ def adaptive_heuristic(
         eta
 ):
     """
-    Adaptive routing heuristic defined in README.
+    Adaptive routing heuristic defined by the README.
 
     h(u,v) =
         eta * ((intCO2[u] + intCO2[v]) / 2)
         +
         (1 - eta) * (intCO2[v] - intCO2[u])
 
-    eta is produced dynamically by PPO.
+    Carbon intensity is obtained directly from rgb_color.
+
+    eta is dynamically produced by PPO.
 
     Valid range:
+
         -1 <= eta <= 1
     """
 
-    eta = float(eta)
+    eta = float(
+        eta
+    )
 
     if not -1.0 <= eta <= 1.0:
+
         raise ValueError(
             f"eta must be in [-1, 1], got {eta}"
         )
@@ -314,17 +405,27 @@ def adaptive_heuristic(
     )
 
     average_carbon = (
-        carbon_u + carbon_v
+        carbon_u
+        +
+        carbon_v
     ) / 2.0
 
     carbon_difference = (
-        carbon_v - carbon_u
+        carbon_v
+        -
+        carbon_u
     )
 
-    return (
+    h = (
         eta * average_carbon
         +
-        (1.0 - eta) * carbon_difference
+        (1.0 - eta)
+        *
+        carbon_difference
+    )
+
+    return float(
+        h
     )
 
 
@@ -339,13 +440,15 @@ def geographic_penalty(
         data=None
 ):
     """
-    Return the geographic information of an edge.
+    Return geographic information of an edge.
 
-    The adaptive heuristic itself is NOT based on the
-    previous composite geographic penalty.
+    This function is kept for compatibility with existing
+    evaluation code.
 
-    This function is retained for compatibility with
-    existing evaluation code.
+    It is NOT the adaptive routing heuristic.
+
+    The adaptive routing heuristic is implemented separately
+    in adaptive_heuristic().
     """
 
     features = geo_features(
@@ -355,6 +458,7 @@ def geographic_penalty(
     )
 
     return {
+
         "distance_km":
             float(
                 features.get(
@@ -400,32 +504,28 @@ def modified_cost(
         lambda_h=1.0
 ):
     """
-    Final modified routing cost.
+    Calculate the final adaptive routing cost.
 
-    README:
-        C'(e) = C_LND(e) + lambda_h * h(e)
+    C'(e) =
+        C_LND(e)
+        +
+        lambda_h * h(e)
 
-    Important:
-        geo_penalty is actually the adaptive heuristic h(e).
+    Here geo_penalty is retained as the historical parameter
+    name for compatibility, but its actual meaning is:
 
-    Parameters
-    ----------
-    native_cost:
-        Base LND routing cost C_LND(e).
+        geo_penalty = adaptive heuristic h(e)
 
-    geo_penalty:
-        Adaptive heuristic h(e).
-
-    eta:
-        PPO-generated adaptive parameter.
-
-    lambda_h:
-        Weight of the heuristic component.
+    eta is validated here because the modified cost belongs
+    to the adaptive routing mechanism.
     """
 
-    eta = float(eta)
+    eta = float(
+        eta
+    )
 
     if not -1.0 <= eta <= 1.0:
+
         raise ValueError(
             f"eta must be in [-1, 1], got {eta}"
         )
@@ -434,12 +534,17 @@ def modified_cost(
         geo_penalty
     )
 
+    lambda_h = float(
+        lambda_h
+    )
+
     cost = (
         float(native_cost)
         +
-        float(lambda_h) * h
+        lambda_h * h
     )
 
+    # Routing costs must remain positive.
     return max(
         1e-9,
         cost
@@ -460,8 +565,7 @@ def adaptive_lnd_cost(
         lambda_h=1.0
 ):
     """
-    Complete routing cost used by the
-    PPO + LND/Dijkstra architecture.
+    Complete PPO + adaptive heuristic + LND routing cost.
 
     Flow:
 
@@ -471,7 +575,10 @@ def adaptive_lnd_cost(
         eta
          |
          v
-        h(u,v)
+        rgb_color
+         |
+         v
+        adaptive heuristic h(u,v)
          |
          v
         C_LND + lambda_h * h
@@ -518,11 +625,10 @@ def enhanced_cost(
         reliability_weight=0.5
 ):
     """
-    Extended cost for optional experiments.
+    Extended routing cost for auxiliary experiments.
 
-    This is NOT the main PPO heuristic from README.
-
-    It is retained only for auxiliary experiments/baselines.
+    This is NOT the main PPO adaptive heuristic defined
+    in the README.
     """
 
     base = (
@@ -546,7 +652,10 @@ def enhanced_cost(
         data
     )
 
-    if math.isinf(liquidity):
+    if math.isinf(
+        liquidity
+    ):
+
         return math.inf
 
     return (
@@ -568,12 +677,21 @@ def evaluate_path(
         amount
 ):
     """
-    Calculate complete path metrics.
+    Calculate complete metrics for a route.
 
-    Liquidity is based only on known/learned
-    directional liquidity.
+    Liquidity is based only on known/learned directional
+    liquidity.
 
-    Snapshot capacity is NOT treated as balance.
+    Snapshot capacity is never interpreted as directional
+    balance.
+
+    Returned metrics:
+        fee
+        delay
+        min_liquidity
+        reliability
+        distance_km
+        carbon_intensity
     """
 
     total_fee = 0.0
@@ -590,18 +708,18 @@ def evaluate_path(
 
         data = G[u][v][k]
 
-        # ----------------------------------------------
+        # --------------------------------------------------
         # Fee
-        # ----------------------------------------------
+        # --------------------------------------------------
 
         total_fee += channel_fee(
             data,
             amount
         )
 
-        # ----------------------------------------------
+        # --------------------------------------------------
         # Delay
-        # ----------------------------------------------
+        # --------------------------------------------------
 
         total_delay += float(
             data.get(
@@ -613,9 +731,9 @@ def evaluate_path(
             )
         )
 
-        # ----------------------------------------------
+        # --------------------------------------------------
         # Learned / observed directional liquidity
-        # ----------------------------------------------
+        # --------------------------------------------------
 
         estimated_liquidity = data.get(
             "estimated_liquidity",
@@ -630,19 +748,34 @@ def evaluate_path(
 
         if estimated_liquidity is not None:
 
-            known_liquidities.append(
-                float(
-                    estimated_liquidity
-                )
-            )
+            try:
 
-        # ----------------------------------------------
+                known_liquidities.append(
+                    float(
+                        estimated_liquidity
+                    )
+                )
+
+            except (
+                TypeError,
+                ValueError
+            ):
+
+                pass
+
+        # --------------------------------------------------
         # Reliability
-        # ----------------------------------------------
+        # --------------------------------------------------
+
+        failure_probability = reliability_penalty(
+            data
+        )
 
         failure_probability = min(
             max(
-                reliability_penalty(data),
+                float(
+                    failure_probability
+                ),
                 0.0
             ),
             1.0
@@ -654,9 +787,9 @@ def evaluate_path(
             failure_probability
         )
 
-        # ----------------------------------------------
-        # Geographic metrics
-        # ----------------------------------------------
+        # --------------------------------------------------
+        # Geographic / carbon metrics
+        # --------------------------------------------------
 
         try:
 
@@ -673,12 +806,25 @@ def evaluate_path(
                 )
             )
 
-            total_carbon += float(
-                features.get(
-                    "carbon_intensity",
-                    0.0
-                )
+            # Use the node-based rgb_color values directly
+            # rather than relying on a separately invented
+            # carbon value in the topology module.
+
+            carbon_u = node_carbon_intensity(
+                G,
+                u
             )
+
+            carbon_v = node_carbon_intensity(
+                G,
+                v
+            )
+
+            total_carbon += (
+                carbon_u
+                +
+                carbon_v
+            ) / 2.0
 
         except (
             KeyError,
@@ -689,7 +835,7 @@ def evaluate_path(
             pass
 
     # ------------------------------------------------------
-    # Minimum known liquidity
+    # Minimum Known Liquidity
     # ------------------------------------------------------
 
     if known_liquidities:

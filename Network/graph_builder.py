@@ -10,37 +10,44 @@ from .channel import Channel
 
 class LNGraphBuilder:
     """
-    Builds a NetworkX MultiDiGraph
-    from:
+    Builds a NetworkX MultiDiGraph from:
+
         1. Real Lightning Network JSON snapshot
         2. In-memory JSON-like data
         3. Synthetic Lightning topology
+
+    Important modeling rules
+    ------------------------
+    - rgb_color is used as the numeric carbon-intensity value.
+    - Larger rgb_color means higher carbon intensity.
+    - Channel capacity is NOT treated as directional liquidity.
+    - If directional balance/liquidity is not provided by the input,
+      it remains unknown (None).
+    - Learned/observed liquidity can be added later by the routing
+      and learning modules.
     """
 
-   
+    # ==========================================================
     # Load Real LN Snapshot from JSON File
-    
+    # ==========================================================
 
     def from_json(self, path):
 
         data = json.loads(
-            Path(path)
-            .read_text(
+            Path(path).read_text(
                 encoding="utf-8"
             )
         )
 
         return self.from_data(data)
 
-
-    
+    # ==========================================================
     # Load Real LN Snapshot from In-Memory Data
-   
+    # ==========================================================
 
     def from_data(self, data):
 
         G = nx.MultiDiGraph()
-
 
         nodes = data.get(
             "nodes",
@@ -50,7 +57,6 @@ class LNGraphBuilder:
             )
         )
 
-
         channels = data.get(
             "channels",
             data.get(
@@ -59,9 +65,9 @@ class LNGraphBuilder:
             )
         )
 
-
+        # ======================================================
         # Add Nodes
-        
+        # ======================================================
 
         for n in nodes:
 
@@ -72,17 +78,14 @@ class LNGraphBuilder:
                 )
             )
 
-
             if nid is None:
                 continue
 
+            nid = str(nid)
 
-            nid = str(
-                nid
-            )
-
-
-            # Node attributes
+            # --------------------------------------------------
+            # Geographic information
+            # --------------------------------------------------
 
             latitude = n.get(
                 "latitude",
@@ -92,7 +95,6 @@ class LNGraphBuilder:
                 )
             )
 
-
             longitude = n.get(
                 "longitude",
                 n.get(
@@ -101,24 +103,88 @@ class LNGraphBuilder:
                 )
             )
 
-
             country = n.get(
                 "country",
                 "US"
             )
 
+            # --------------------------------------------------
+            # Carbon intensity
+            #
+            # rgb_color is treated as a numeric carbon value.
+            #
+            # Larger rgb_color
+            #       ->
+            # higher carbon intensity
+            # --------------------------------------------------
 
-            carbon_intensity = n.get(
-                "carbon_intensity",
-                300.0
+            rgb_color = n.get(
+                "rgb_color",
+                None
             )
 
+            if rgb_color is not None:
+
+                try:
+                    rgb_color = float(
+                        rgb_color
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    rgb_color = None
+
+            # Backward compatibility:
+            # if rgb_color is unavailable, use explicitly
+            # provided carbon_intensity.
+            #
+            # No artificial default such as 300 is introduced
+            # for real snapshot data.
+
+            if rgb_color is not None:
+
+                carbon_intensity = rgb_color
+
+            else:
+
+                carbon_value = n.get(
+                    "carbon_intensity",
+                    None
+                )
+
+                if carbon_value is not None:
+
+                    try:
+                        carbon_intensity = float(
+                            carbon_value
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError
+                    ):
+
+                        carbon_intensity = 0.0
+
+                else:
+
+                    carbon_intensity = 0.0
+
+            # --------------------------------------------------
+            # Online status
+            # --------------------------------------------------
 
             online = n.get(
                 "online",
                 True
             )
 
+            # --------------------------------------------------
+            # Create Node
+            # --------------------------------------------------
 
             node = Node(
 
@@ -145,17 +211,24 @@ class LNGraphBuilder:
                 )
             )
 
+            # Keep rgb_color explicitly as a node attribute.
+            #
+            # This allows the graph to retain the original
+            # carbon-related field from the dataset.
+
+            node_attributes = {
+                **node.__dict__,
+                "rgb_color": rgb_color
+            }
 
             G.add_node(
-
                 nid,
-
-                **node.__dict__
-
+                **node_attributes
             )
 
-
+        # ======================================================
         # Add Channels
+        # ======================================================
 
         for i, e in enumerate(channels):
 
@@ -167,10 +240,8 @@ class LNGraphBuilder:
                 "target"
             )
 
-
             if source is None or target is None:
                 continue
-
 
             u = str(
                 source
@@ -180,7 +251,6 @@ class LNGraphBuilder:
                 target
             )
 
-
             if (
                 u not in G
                 or
@@ -188,28 +258,41 @@ class LNGraphBuilder:
             ):
                 continue
 
-
-            # Capacity
+            # --------------------------------------------------
+            # Channel Capacity
+            #
+            # Capacity is retained as an advertised/static
+            # channel attribute.
+            #
+            # IMPORTANT:
+            # capacity is NOT directional liquidity.
+            # --------------------------------------------------
 
             capacity = e.get(
                 "capacity",
                 e.get(
                     "capacity_sat",
-                    1_000_000
+                    None
                 )
             )
 
+            if capacity is not None:
 
-            capacity = float(
-                capacity
-            )
+                try:
+                    capacity = float(
+                        capacity
+                    )
 
+                except (
+                    TypeError,
+                    ValueError
+                ):
 
-            
+                    capacity = None
+
+            # --------------------------------------------------
             # Channel ID
-            #
-            # Real LN snapshot:
-            # scid -> channel_id
+            # --------------------------------------------------
 
             channel_id = e.get(
                 "channel_id",
@@ -219,112 +302,188 @@ class LNGraphBuilder:
                 )
             )
 
-
             channel_id = str(
                 channel_id
             )
 
-
+            # --------------------------------------------------
             # Base Fee
             #
             # fee_base_msat -> fee_base
+            # --------------------------------------------------
 
             fee_base = e.get(
                 "fee_base",
                 e.get(
                     "fee_base_msat",
-                    1000
+                    0
                 )
             )
-
 
             fee_base = float(
                 fee_base
             )
 
-
+            # --------------------------------------------------
             # Fee Rate
             #
             # fee_proportional_millionths -> fee_rate
+            # --------------------------------------------------
 
             fee_rate = e.get(
                 "fee_rate",
                 e.get(
                     "fee_proportional_millionths",
-                    10
+                    0
                 )
             )
-
 
             fee_rate = float(
                 fee_rate
             )
 
-
+            # --------------------------------------------------
             # Delay
             #
             # cltv_expiry_delta -> delay
+            # --------------------------------------------------
 
             delay = e.get(
                 "delay",
                 e.get(
                     "cltv_expiry_delta",
-                    1.0
+                    0.0
                 )
             )
-
 
             delay = float(
                 delay
             )
 
-
+            # --------------------------------------------------
             # Failure Probability
+            # --------------------------------------------------
 
             failure_probability = e.get(
                 "failure_probability",
                 0.01
             )
 
-
             failure_probability = float(
                 failure_probability
             )
 
-
+            # --------------------------------------------------
             # Availability
+            # --------------------------------------------------
 
             available = e.get(
                 "available",
                 True
             )
 
+            available = bool(
+                available
+            )
 
-            # Balances
+            # --------------------------------------------------
+            # Directional Liquidity / Balance
+            #
+            # Do NOT use capacity / 2.
+            #
+            # The real snapshot may not contain directional
+            # balances. In that case the value remains unknown.
+            # --------------------------------------------------
 
             balance_uv = e.get(
                 "balance_uv",
-                capacity / 2
+                None
             )
-
 
             balance_vu = e.get(
                 "balance_vu",
-                capacity / 2
+                None
             )
 
+            if balance_uv is not None:
 
-            balance_uv = float(
-                balance_uv
+                try:
+                    balance_uv = float(
+                        balance_uv
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    balance_uv = None
+
+            if balance_vu is not None:
+
+                try:
+                    balance_vu = float(
+                        balance_vu
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    balance_vu = None
+
+            # --------------------------------------------------
+            # Learned / Observed Liquidity
+            #
+            # This is optional and is NOT inferred from capacity.
+            # It can later be populated from routing experience.
+            # --------------------------------------------------
+
+            estimated_liquidity_uv = e.get(
+                "estimated_liquidity_uv",
+                e.get(
+                    "estimated_liquidity",
+                    None
+                )
             )
 
+            if estimated_liquidity_uv is not None:
 
-            balance_vu = float(
-                balance_vu
+                try:
+                    estimated_liquidity_uv = float(
+                        estimated_liquidity_uv
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    estimated_liquidity_uv = None
+
+            estimated_liquidity_vu = e.get(
+                "estimated_liquidity_vu",
+                None
             )
 
+            if estimated_liquidity_vu is not None:
 
+                try:
+                    estimated_liquidity_vu = float(
+                        estimated_liquidity_vu
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    estimated_liquidity_vu = None
+
+            # --------------------------------------------------
             # Create Channel
+            # --------------------------------------------------
 
             channel = Channel(
 
@@ -340,9 +499,7 @@ class LNGraphBuilder:
 
                 failure_probability=failure_probability,
 
-                available=bool(
-                    available
-                ),
+                available=available,
 
                 balance_uv=balance_uv,
 
@@ -350,8 +507,19 @@ class LNGraphBuilder:
 
             )
 
-
+            # --------------------------------------------------
             # Forward Channel: u -> v
+            # --------------------------------------------------
+
+            forward_attributes = {
+                **channel.__dict__
+            }
+
+            if estimated_liquidity_uv is not None:
+
+                forward_attributes[
+                    "estimated_liquidity"
+                ] = estimated_liquidity_uv
 
             G.add_edge(
 
@@ -361,15 +529,21 @@ class LNGraphBuilder:
 
                 key=channel.channel_id,
 
-                **channel.__dict__
+                **forward_attributes
 
             )
 
-
+            # --------------------------------------------------
             # Reverse Channel: v -> u
+            #
+            # Only create the reverse representation because
+            # the graph model uses directed routing.
+            #
+            # Directional balances are swapped only when they
+            # are actually known.
+            # --------------------------------------------------
 
             reverse_channel = {
-
                 **channel.__dict__,
 
                 "channel_id":
@@ -380,9 +554,22 @@ class LNGraphBuilder:
 
                 "balance_vu":
                     channel.balance_uv
-
             }
 
+            if estimated_liquidity_vu is not None:
+
+                reverse_channel[
+                    "estimated_liquidity"
+                ] = estimated_liquidity_vu
+
+            elif estimated_liquidity_uv is not None:
+
+                # If only the forward estimate exists, do not
+                # incorrectly reuse it for the reverse direction.
+
+                reverse_channel[
+                    "estimated_liquidity"
+                ] = None
 
             G.add_edge(
 
@@ -396,11 +583,11 @@ class LNGraphBuilder:
 
             )
 
-
         return G
 
-
+    # ==========================================================
     # Synthetic LN Generator
+    # ==========================================================
 
     def synthetic(
         self,
@@ -412,7 +599,6 @@ class LNGraphBuilder:
         rng = np.random.default_rng(
             seed
         )
-
 
         countries = [
 
@@ -429,8 +615,9 @@ class LNGraphBuilder:
 
         ]
 
-
-        # Create Scale-Free topology
+        # ------------------------------------------------------
+        # Create Scale-Free Topology
+        # ------------------------------------------------------
 
         base_graph = nx.barabasi_albert_graph(
 
@@ -448,11 +635,11 @@ class LNGraphBuilder:
 
         )
 
-
         G = nx.MultiDiGraph()
 
-
-        # Add bidirectional channels
+        # ------------------------------------------------------
+        # Add Bidirectional Channels
+        # ------------------------------------------------------
 
         for u, v in base_graph.edges():
 
@@ -466,8 +653,9 @@ class LNGraphBuilder:
                 int(u)
             )
 
-
-        # Add extra random connections
+        # ------------------------------------------------------
+        # Add Extra Random Connections
+        # ------------------------------------------------------
 
         for _ in range(
             extra_edges
@@ -483,7 +671,6 @@ class LNGraphBuilder:
 
             )
 
-
             G.add_edge(
                 int(u),
                 int(v)
@@ -494,10 +681,18 @@ class LNGraphBuilder:
                 int(u)
             )
 
-
-        # Add node attributes
+        # ------------------------------------------------------
+        # Add Node Attributes
+        # ------------------------------------------------------
 
         for node_id in G.nodes:
+
+            rgb_color = float(
+                rng.uniform(
+                    100,
+                    700
+                )
+            )
 
             node = Node(
 
@@ -525,17 +720,11 @@ class LNGraphBuilder:
                     )
                 ),
 
-                carbon_intensity=float(
-                    rng.uniform(
-                        100,
-                        700
-                    )
-                ),
+                carbon_intensity=rgb_color,
 
                 online=True
 
             )
-
 
             G.nodes[
                 node_id
@@ -543,8 +732,18 @@ class LNGraphBuilder:
                 node.__dict__
             )
 
+            # Synthetic data also follows the same semantic
+            # meaning as the real data.
 
-        # Add channel attributes
+            G.nodes[
+                node_id
+            ][
+                "rgb_color"
+            ] = rgb_color
+
+        # ------------------------------------------------------
+        # Add Channel Attributes
+        # ------------------------------------------------------
 
         for idx, (u, v, k) in enumerate(
             G.edges(
@@ -558,7 +757,6 @@ class LNGraphBuilder:
                     0.8
                 )
             )
-
 
             channel = Channel(
 
@@ -601,7 +799,6 @@ class LNGraphBuilder:
 
             )
 
-
             G.edges[
                 u,
                 v,
@@ -610,21 +807,19 @@ class LNGraphBuilder:
                 channel.__dict__
             )
 
-
         return G
 
-
+    # ==========================================================
     # Utility Functions
+    # ==========================================================
 
     def number_of_nodes(self, G):
 
         return G.number_of_nodes()
 
-
     def number_of_channels(self, G):
 
         return G.number_of_edges()
-
 
     def summary(self, G):
 
@@ -639,4 +834,3 @@ class LNGraphBuilder:
         print(
             f"Channels: {G.number_of_edges()}"
         )
-

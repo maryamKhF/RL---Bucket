@@ -38,6 +38,107 @@ def haversine_km(
 
 
 
+
+def _parse_rgb_color(value):
+    """Parse a snapshot RGB color into an (R, G, B) tuple in [0, 255]."""
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        # Common nested forms: {r,g,b}, {red,green,blue}
+        for keys in (("r", "g", "b"), ("red", "green", "blue")):
+            if all(k in value for k in keys):
+                try:
+                    rgb = tuple(float(value[k]) for k in keys)
+                    if all(math.isfinite(x) for x in rgb):
+                        if max(rgb) <= 1.0:
+                            rgb = tuple(x * 255.0 for x in rgb)
+                        return tuple(max(0.0, min(255.0, x)) for x in rgb)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    if isinstance(value, (tuple, list)) and len(value) >= 3:
+        try:
+            rgb = tuple(float(value[i]) for i in range(3))
+            if all(math.isfinite(x) for x in rgb):
+                if max(rgb) <= 1.0:
+                    rgb = tuple(x * 255.0 for x in rgb)
+                return tuple(max(0.0, min(255.0, x)) for x in rgb)
+        except (TypeError, ValueError):
+            return None
+
+    if isinstance(value, str):
+        s = value.strip().strip('"').strip("'")
+        if s.startswith("#"):
+            h = s[1:]
+            if len(h) == 6:
+                try:
+                    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+                except ValueError:
+                    return None
+            if len(h) == 8:
+                try:
+                    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+                except ValueError:
+                    return None
+        if s.lower().startswith("0x") and len(s) == 8:
+            try:
+                n = int(s, 16)
+                return ((n >> 16) & 255, (n >> 8) & 255, n & 255)
+            except ValueError:
+                return None
+        if s.lower().startswith("rgb(") and s.endswith(")"):
+            s = s[4:-1]
+        parts = [p.strip() for p in s.replace(",", " ").split()]
+        if len(parts) >= 3:
+            try:
+                rgb = tuple(float(parts[i]) for i in range(3))
+                if all(math.isfinite(x) for x in rgb):
+                    if max(rgb) <= 1.0:
+                        rgb = tuple(x * 255.0 for x in rgb)
+                    return tuple(max(0.0, min(255.0, x)) for x in rgb)
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+
+def node_rgb_color(G, node):
+    """Return the RGB color stored by the real GML snapshot."""
+    if node not in G:
+        raise KeyError(f"Node {node} does not exist in graph.")
+
+    attrs = G.nodes[node]
+    candidates = [
+        attrs.get("rgb_color"),
+        attrs.get("color"),
+        attrs.get("fill"),
+    ]
+
+    graphics = attrs.get("graphics")
+    if isinstance(graphics, dict):
+        candidates.extend([
+            graphics.get("fill"),
+            graphics.get("color"),
+            graphics.get("rgb_color"),
+        ])
+
+    for value in candidates:
+        rgb = _parse_rgb_color(value)
+        if rgb is not None:
+            return tuple(int(round(x)) for x in rgb)
+
+    raise ValueError(
+        f"Node {node} has no valid RGB color attribute in the snapshot."
+    )
+
+
+def node_rgb_scalar(G, node):
+    """Convert snapshot RGB to a scalar luminance in [0, 255]."""
+    r, g, b = node_rgb_color(G, node)
+    return float(0.299 * r + 0.587 * g + 0.114 * b)
+
 def geo_features(
         G,
         u,
@@ -75,14 +176,15 @@ def geo_features(
     )
 
 
-    # The real snapshot does not contain numeric
-    # carbon-intensity data. regcolor is the selected
-    # node-level environmental proxy.
-    carbon = (
-        float(node_u.get("regcolor", 0.0))
+    # The snapshot has no numeric carbon-intensity data.
+    # Use the node RGB Color attribute from GML instead.
+    rgb_u = node_rgb_color(G, u)
+    rgb_v = node_rgb_color(G, v)
+    rgb_luminance = (
+        node_rgb_scalar(G, u)
         +
-        float(node_v.get("regcolor", 0.0))
-    ) / 2
+        node_rgb_scalar(G, v)
+    ) / 2.0
 
 
 
@@ -96,12 +198,12 @@ def geo_features(
         "inter_continent":
             inter_continent,
 
-        "regcolor":
-            carbon,
+        "rgb_color_u": rgb_u,
+        "rgb_color_v": rgb_v,
+        "rgb_luminance": rgb_luminance,
 
         # Backward-compatible alias for older callers.
-        "carbon_intensity":
-            carbon
+        "carbon_intensity": rgb_luminance
     }
 
 

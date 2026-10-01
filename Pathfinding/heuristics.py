@@ -40,6 +40,24 @@ The RGB luminance is used as a proxy because the Lightning
 GML snapshot does not provide a physical numeric carbon-intensity
 measurement.
 
+Missing RGB
+-----------
+
+If a node does not contain any RGB/color representation,
+its RGB value is treated as:
+
+    (0, 0, 0)
+
+Therefore:
+
+    C = 0
+
+This rule also applies when an RGB/color field explicitly
+contains None.
+
+If RGB information exists but has an invalid representation,
+the corresponding validation error is preserved.
+
 
 Routing objective
 -----------------
@@ -65,15 +83,19 @@ layer:
 Scientific-evaluation policy
 ----------------------------
 
-This module does not fabricate missing values.
+This module does not fabricate missing routing or liquidity
+values.
 
-For routing-cost calculations, required fields are mandatory.
+The only explicit missing-data rule is RGB:
+
+    missing RGB -> (0, 0, 0) -> carbon proxy = 0
 
 For descriptive path evaluation, optional metrics such as
 liquidity and failure probability are used only when explicitly
 available.
 
-No artificial value is inserted when a metric is absent.
+No artificial liquidity or reliability value is inserted when
+those metrics are absent.
 """
 
 import math
@@ -92,12 +114,15 @@ def _to_float(value, name):
 
     try:
         result = float(value)
+
     except (TypeError, ValueError) as exc:
+
         raise ValueError(
             f"{name} must be numeric; got {value!r}."
         ) from exc
 
     if not math.isfinite(result):
+
         raise ValueError(
             f"{name} must be finite; got {value!r}."
         )
@@ -112,7 +137,9 @@ def _valid_number(value):
 
     try:
         result = float(value)
+
     except (TypeError, ValueError):
+
         return False
 
     return math.isfinite(result)
@@ -125,7 +152,9 @@ def _valid_nonnegative(value):
 
     try:
         result = float(value)
+
     except (TypeError, ValueError):
+
         return False
 
     return (
@@ -151,17 +180,21 @@ def validate_eta(eta):
 
     try:
         eta = float(eta)
+
     except (TypeError, ValueError) as exc:
+
         raise ValueError(
             "eta must be numeric."
         ) from exc
 
     if not math.isfinite(eta):
+
         raise ValueError(
             "eta must be finite."
         )
 
     if not 0.0 <= eta <= 1.0:
+
         raise ValueError(
             "eta must satisfy 0 <= eta <= 1."
         )
@@ -184,17 +217,21 @@ def validate_lambda_h(lambda_h):
 
     try:
         lambda_h = float(lambda_h)
+
     except (TypeError, ValueError) as exc:
+
         raise ValueError(
             "lambda_h must be numeric."
         ) from exc
 
     if not math.isfinite(lambda_h):
+
         raise ValueError(
             "lambda_h must be finite."
         )
 
     if lambda_h < 0.0:
+
         raise ValueError(
             "lambda_h must be >= 0."
         )
@@ -214,14 +251,17 @@ def _get_required_field(data, primary, alias):
     """
 
     if not isinstance(data, dict):
+
         raise TypeError(
             "Channel data must be a dictionary."
         )
 
     if primary in data:
+
         return data[primary]
 
     if alias in data:
+
         return data[alias]
 
     raise KeyError(
@@ -249,6 +289,7 @@ def channel_fee(data, amount):
     """
 
     if not isinstance(data, dict):
+
         raise TypeError(
             "Channel data must be a dictionary."
         )
@@ -259,6 +300,7 @@ def channel_fee(data, amount):
     )
 
     if amount < 0.0:
+
         raise ValueError(
             "amount must be >= 0."
         )
@@ -282,11 +324,13 @@ def channel_fee(data, amount):
     )
 
     if base_fee < 0.0:
+
         raise ValueError(
             f"base_fee must be >= 0; got {base_fee}."
         )
 
     if fee_rate < 0.0:
+
         raise ValueError(
             f"fee_rate must be >= 0; got {fee_rate}."
         )
@@ -297,6 +341,7 @@ def channel_fee(data, amount):
     )
 
     if not _valid_nonnegative(fee):
+
         raise ValueError(
             "Calculated channel fee is invalid."
         )
@@ -319,17 +364,21 @@ def channel_delay(data):
     """
 
     if not isinstance(data, dict):
+
         raise TypeError(
             "Channel data must be a dictionary."
         )
 
     if "delay" in data:
+
         value = data["delay"]
 
     elif "cltv_expiry_delta" in data:
+
         value = data["cltv_expiry_delta"]
 
     else:
+
         raise KeyError(
             "Missing required channel delay field "
             "'delay'/'cltv_expiry_delta'."
@@ -341,6 +390,7 @@ def channel_delay(data):
     )
 
     if delay < 0.0:
+
         raise ValueError(
             f"delay must be >= 0; got {delay}."
         )
@@ -390,6 +440,7 @@ def lnd_cost(
     )
 
     if not _valid_nonnegative(cost):
+
         raise ValueError(
             "Native LND cost is invalid."
         )
@@ -419,6 +470,13 @@ def _parse_rgb(rgb, node):
         "RRGGBB"
 
     All components must be in [0,255].
+
+    Missing RGB is handled by node_carbon_intensity()
+    before this function is called.
+
+    Therefore this function deliberately rejects None
+    and other unsupported representations instead of
+    silently converting malformed data to zero.
     """
 
     if isinstance(rgb, dict):
@@ -427,6 +485,7 @@ def _parse_rgb(rgb, node):
             key in rgb
             for key in ("r", "g", "b")
         ):
+
             values = [
                 rgb["r"],
                 rgb["g"],
@@ -437,6 +496,7 @@ def _parse_rgb(rgb, node):
             key in rgb
             for key in ("red", "green", "blue")
         ):
+
             values = [
                 rgb["red"],
                 rgb["green"],
@@ -444,6 +504,7 @@ def _parse_rgb(rgb, node):
             ]
 
         else:
+
             raise ValueError(
                 f"RGB dictionary for node {node!r} must contain "
                 f"either r/g/b or red/green/blue; got {rgb!r}."
@@ -460,6 +521,7 @@ def _parse_rgb(rgb, node):
     elif isinstance(rgb, (list, tuple)):
 
         if len(rgb) < 3:
+
             raise ValueError(
                 f"RGB data for node {node!r} must contain "
                 f"at least three values; got {rgb!r}."
@@ -478,28 +540,48 @@ def _parse_rgb(rgb, node):
         text = rgb.strip()
 
         if text.startswith("#"):
+
             text = text[1:]
 
         if len(text) != 6:
+
             raise ValueError(
                 f"RGB string for node {node!r} must contain "
                 f"exactly 6 hexadecimal characters; got {rgb!r}."
             )
 
         try:
+
             values = [
-                float(int(text[0:2], 16)),
-                float(int(text[2:4], 16)),
-                float(int(text[4:6], 16)),
+                float(
+                    int(
+                        text[0:2],
+                        16,
+                    )
+                ),
+                float(
+                    int(
+                        text[2:4],
+                        16,
+                    )
+                ),
+                float(
+                    int(
+                        text[4:6],
+                        16,
+                    )
+                ),
             ]
 
         except ValueError as exc:
+
             raise ValueError(
                 f"Invalid hexadecimal RGB value for "
                 f"node {node!r}: {rgb!r}."
             ) from exc
 
     else:
+
         raise TypeError(
             f"Unsupported RGB representation for node "
             f"{node!r}: {type(rgb).__name__}."
@@ -508,6 +590,7 @@ def _parse_rgb(rgb, node):
     for index, value in enumerate(values):
 
         if not 0.0 <= value <= 255.0:
+
             raise ValueError(
                 f"RGB component {index} for node {node!r} "
                 f"must be in [0,255]; got {value}."
@@ -537,32 +620,96 @@ def node_carbon_intensity(
 
     This is a proxy, not a physical carbon-emission
     measurement.
+
+    Missing RGB policy
+    ------------------
+
+    If a node has no RGB/color attribute:
+
+        RGB = (0, 0, 0)
+
+    If an RGB/color attribute exists but its value is None:
+
+        RGB = (0, 0, 0)
+
+    Therefore in both cases:
+
+        carbon_intensity = 0.0
+
+    This behavior is required for the historical Lightning
+    snapshot because some nodes contain:
+
+        "rgb_color": None
+
+    If an RGB attribute exists with a non-None but invalid
+    representation, the invalid data is NOT silently replaced
+    with zero.
     """
 
     if node not in G:
+
         raise KeyError(
             f"Node {node!r} does not exist in graph."
         )
 
     node_data = G.nodes[node]
 
+    # ------------------------------------------------------
+    # RGB lookup
+    # ------------------------------------------------------
+
     if "rgb_color" in node_data:
+
         rgb = node_data["rgb_color"]
 
     elif "rgb" in node_data:
+
         rgb = node_data["rgb"]
 
     elif "color" in node_data:
+
         rgb = node_data["color"]
 
     elif "fill" in node_data:
+
         rgb = node_data["fill"]
 
     else:
-        raise KeyError(
-            f"Missing RGB data for node {node!r}. "
-            "Cannot compute carbon-intensity proxy."
-        )
+
+        # --------------------------------------------------
+        # No RGB attribute exists.
+        #
+        # Treat the missing RGB as black:
+        #
+        #     R = 0
+        #     G = 0
+        #     B = 0
+        #
+        # Therefore:
+        #
+        #     carbon = 0
+        # --------------------------------------------------
+
+        return 0.0
+
+    # ------------------------------------------------------
+    # RGB field exists but explicitly contains None.
+    #
+    # This occurs in the historical GML snapshot for nodes
+    # that do not have RGB information.
+    #
+    # Treat None exactly like missing RGB.
+    # ------------------------------------------------------
+
+    if rgb is None:
+
+        return 0.0
+
+    # ------------------------------------------------------
+    # Parse valid non-None RGB.
+    #
+    # Invalid non-None RGB remains an error.
+    # ------------------------------------------------------
 
     r, g, b = _parse_rgb(
         rgb,
@@ -576,12 +723,14 @@ def node_carbon_intensity(
     )
 
     if not _valid_number(carbon):
+
         raise ValueError(
             f"Calculated carbon proxy for node "
             f"{node!r} is not finite."
         )
 
     if not 0.0 <= carbon <= 255.0:
+
         raise ValueError(
             f"Calculated carbon proxy for node "
             f"{node!r} is outside [0,255]: {carbon}."
@@ -649,6 +798,7 @@ def adaptive_heuristic(
     )
 
     if not _valid_number(value):
+
         raise ValueError(
             "Adaptive heuristic is not finite."
         )
@@ -709,11 +859,13 @@ def adaptive_penalty(
     )
 
     if not _valid_number(penalty):
+
         raise ValueError(
             "Adaptive penalty is not finite."
         )
 
     if not 0.0 <= penalty <= 0.5:
+
         raise ValueError(
             f"Adaptive penalty outside [0,0.5]: {penalty}."
         )
@@ -744,6 +896,7 @@ def modified_cost(
     if not _valid_nonnegative(
         native_cost,
     ):
+
         raise ValueError(
             "native_cost must be finite and >= 0."
         )
@@ -751,6 +904,7 @@ def modified_cost(
     if not _valid_nonnegative(
         geo_penalty,
     ):
+
         raise ValueError(
             "geo_penalty must be finite and >= 0."
         )
@@ -760,11 +914,13 @@ def modified_cost(
     )
 
     if geo_penalty > 0.5:
+
         raise ValueError(
             "geo_penalty must be normalized to [0,0.5]."
         )
 
     if eta is not None:
+
         validate_eta(
             eta,
         )
@@ -783,6 +939,7 @@ def modified_cost(
     )
 
     if not _valid_nonnegative(cost):
+
         raise ValueError(
             "Modified adaptive cost is invalid."
         )
@@ -840,6 +997,7 @@ def adaptive_edge_cost(
     else:
 
         if not callable(heuristic_fn):
+
             raise TypeError(
                 "heuristic_fn must be callable."
             )
@@ -855,6 +1013,7 @@ def adaptive_edge_cost(
         if not _valid_nonnegative(
             native_cost,
         ):
+
             raise ValueError(
                 "heuristic_fn returned an invalid "
                 "native routing cost."
@@ -959,6 +1118,7 @@ def enhanced_cost(
     del v
 
     if not isinstance(data, dict):
+
         raise TypeError(
             "Channel data must be a dictionary."
         )
@@ -973,6 +1133,7 @@ def enhanced_cost(
     )
 
     if "failure_probability" not in data:
+
         raise KeyError(
             "Missing 'failure_probability' for enhanced_cost()."
         )
@@ -983,6 +1144,7 @@ def enhanced_cost(
     )
 
     if not 0.0 <= failure_probability <= 1.0:
+
         raise ValueError(
             "failure_probability must be in [0,1]."
         )
@@ -995,6 +1157,7 @@ def enhanced_cost(
     )
 
     if not _valid_nonnegative(cost):
+
         raise ValueError(
             "Enhanced cost is invalid."
         )
@@ -1012,6 +1175,7 @@ def _is_multigraph(G):
     """
 
     if hasattr(G, "is_multigraph"):
+
         return bool(
             G.is_multigraph()
         )
@@ -1044,6 +1208,7 @@ def _resolve_path_edge(
     """
 
     if not G.has_edge(u, v):
+
         raise KeyError(
             f"Path contains missing edge ({u!r}, {v!r})."
         )
@@ -1056,6 +1221,7 @@ def _resolve_path_edge(
         )
 
         if channels is None:
+
             raise KeyError(
                 f"No edge data for ({u!r}, {v!r})."
             )
@@ -1063,6 +1229,7 @@ def _resolve_path_edge(
         if edge_key is not None:
 
             if edge_key not in channels:
+
                 raise KeyError(
                     f"Edge key {edge_key!r} does not exist "
                     f"for ({u!r}, {v!r})."
@@ -1076,6 +1243,7 @@ def _resolve_path_edge(
                 edge_data,
                 dict,
             ):
+
                 raise TypeError(
                     f"Channel data for "
                     f"({u!r}, {v!r}, {edge_key!r}) "
@@ -1089,6 +1257,7 @@ def _resolve_path_edge(
         )
 
         if len(keys) != 1:
+
             raise ValueError(
                 f"Multiple channels exist between "
                 f"({u!r}, {v!r}), but no edge key "
@@ -1103,6 +1272,7 @@ def _resolve_path_edge(
             edge_data,
             dict,
         ):
+
             raise TypeError(
                 f"Channel data for "
                 f"({u!r}, {v!r}) must be a dictionary."
@@ -1111,6 +1281,7 @@ def _resolve_path_edge(
         return edge_data
 
     if edge_key is not None:
+
         raise ValueError(
             f"edge_key={edge_key!r} supplied for "
             f"a non-multigraph."
@@ -1125,6 +1296,7 @@ def _resolve_path_edge(
         edge_data,
         dict,
     ):
+
         raise TypeError(
             f"Edge data for ({u!r}, {v!r}) "
             f"must be a dictionary."
@@ -1158,18 +1330,28 @@ def _is_single_edge_tuple(G, path):
     graph confirms that the third item is an actual edge key.
     """
 
-    if not isinstance(path, tuple):
+    if not isinstance(
+        path,
+        tuple,
+    ):
+
         return False
 
     if len(path) != 3:
+
         return False
 
     if not _is_multigraph(G):
+
         return False
 
     u, v, key = path
 
-    if not G.has_edge(u, v):
+    if not G.has_edge(
+        u,
+        v,
+    ):
+
         return False
 
     channels = G.get_edge_data(
@@ -1177,7 +1359,11 @@ def _is_single_edge_tuple(G, path):
         v,
     )
 
-    if not isinstance(channels, dict):
+    if not isinstance(
+        channels,
+        dict,
+    ):
+
         return False
 
     return key in channels
@@ -1227,17 +1413,20 @@ def _build_path_transitions(
     """
 
     if path is None:
+
         return []
 
     if not isinstance(
         path,
         (list, tuple),
     ):
+
         raise TypeError(
             "path must be a list or tuple."
         )
 
     if len(path) == 0:
+
         return []
 
     # ======================================================
@@ -1278,6 +1467,7 @@ def _build_path_transitions(
                 isinstance(item, tuple)
                 and len(item) == 3
             ):
+
                 raise ValueError(
                     "An edge-aware path must contain "
                     "only (u,v,key) tuples."
@@ -1294,6 +1484,7 @@ def _build_path_transitions(
                 previous_v = previous[1]
 
                 if previous_v != u:
+
                     raise ValueError(
                         "Edge-aware path is discontinuous: "
                         f"{previous_v!r} -> {u!r}."
@@ -1314,6 +1505,7 @@ def _build_path_transitions(
     # ======================================================
 
     if len(path) < 2:
+
         return []
 
     transitions = []
@@ -1380,12 +1572,14 @@ def _optional_failure_probability(
         )
 
         if success < 0.0:
+
             raise ValueError(
                 f"success_count must be >= 0 "
                 f"for {edge_description}."
             )
 
         if failure < 0.0:
+
             raise ValueError(
                 f"failure_count must be >= 0 "
                 f"for {edge_description}."
@@ -1425,6 +1619,7 @@ def _optional_failure_probability(
         return None
 
     if not 0.0 <= probability <= 1.0:
+
         raise ValueError(
             f"failure_probability for "
             f"{edge_description} must be in [0,1]; "
@@ -1485,6 +1680,7 @@ def _optional_edge_liquidity(
         return None
 
     if liquidity < 0.0:
+
         raise ValueError(
             f"Liquidity must be >= 0 for "
             f"{edge_description}."
@@ -1520,6 +1716,7 @@ def _edge_liquidity(
     )
 
     if liquidity is None:
+
         raise KeyError(
             f"Missing directional liquidity information "
             f"for {edge_description}."
@@ -1543,6 +1740,7 @@ def _node_coordinates(
     """
 
     if node not in G:
+
         raise KeyError(
             f"Node {node!r} does not exist in graph."
         )
@@ -1550,11 +1748,13 @@ def _node_coordinates(
     node_data = G.nodes[node]
 
     if "latitude" not in node_data:
+
         raise KeyError(
             f"Missing latitude for node {node!r}."
         )
 
     if "longitude" not in node_data:
+
         raise KeyError(
             f"Missing longitude for node {node!r}."
         )
@@ -1570,12 +1770,14 @@ def _node_coordinates(
     )
 
     if not -90.0 <= latitude <= 90.0:
+
         raise ValueError(
             f"latitude[{node!r}] outside [-90,90]: "
             f"{latitude}"
         )
 
     if not -180.0 <= longitude <= 180.0:
+
         raise ValueError(
             f"longitude[{node!r}] outside [-180,180]: "
             f"{longitude}"
@@ -1635,6 +1837,7 @@ def evaluate_path(
     3. Carbon is counted once per unique node.
     4. Missing optional liquidity does not become zero.
     5. Missing optional reliability does not become zero.
+    6. Missing RGB becomes carbon proxy = 0.
     """
 
     empty_result = {
@@ -1652,17 +1855,20 @@ def evaluate_path(
     # ======================================================
 
     if path is None:
+
         return empty_result
 
     if not isinstance(
         path,
         (list, tuple),
     ):
+
         raise TypeError(
             "path must be a list or tuple."
         )
 
     if len(path) == 0:
+
         return empty_result
 
     amount = _to_float(
@@ -1671,6 +1877,7 @@ def evaluate_path(
     )
 
     if amount < 0.0:
+
         raise ValueError(
             "amount must be >= 0."
         )
@@ -1685,6 +1892,7 @@ def evaluate_path(
     )
 
     if not transitions:
+
         return empty_result
 
     # ======================================================
@@ -1692,10 +1900,13 @@ def evaluate_path(
     # ======================================================
 
     total_fee = 0.0
+
     total_delay = 0.0
+
     total_distance = 0.0
 
     known_liquidity = []
+
     reliability_values = []
 
     # ======================================================
@@ -1723,6 +1934,7 @@ def evaluate_path(
             ][1]
 
             if previous_v != u:
+
                 raise ValueError(
                     "Path transitions are not continuous: "
                     f"{previous_v!r} -> {u!r}."
@@ -1831,14 +2043,20 @@ def evaluate_path(
     # ======================================================
 
     unique_nodes = []
+
     seen_nodes = set()
 
     for node in ordered_nodes:
 
         if node not in seen_nodes:
 
-            seen_nodes.add(node)
-            unique_nodes.append(node)
+            seen_nodes.add(
+                node
+            )
+
+            unique_nodes.append(
+                node
+            )
 
     total_carbon = 0.0
 
@@ -1887,7 +2105,9 @@ def evaluate_path(
             else None
         ),
         "reliability": (
-            float(path_reliability)
+            float(
+                path_reliability
+            )
             if path_reliability is not None
             else None
         ),
@@ -1939,21 +2159,25 @@ def _haversine_distance_km(
     )
 
     if not -90.0 <= lat1 <= 90.0:
+
         raise ValueError(
             f"lat1 outside [-90,90]: {lat1}"
         )
 
     if not -90.0 <= lat2 <= 90.0:
+
         raise ValueError(
             f"lat2 outside [-90,90]: {lat2}"
         )
 
     if not -180.0 <= lon1 <= 180.0:
+
         raise ValueError(
             f"lon1 outside [-180,180]: {lon1}"
         )
 
     if not -180.0 <= lon2 <= 180.0:
+
         raise ValueError(
             f"lon2 outside [-180,180]: {lon2}"
         )
@@ -1977,16 +2201,21 @@ def _haversine_distance_km(
     )
 
     a = (
-        math.sin(dphi / 2.0) ** 2
+        math.sin(
+            dphi / 2.0
+        ) ** 2
         +
         math.cos(phi1)
         *
         math.cos(phi2)
         *
-        math.sin(dlambda / 2.0) ** 2
+        math.sin(
+            dlambda / 2.0
+        ) ** 2
     )
 
     # Numerical round-off protection only.
+
     a = min(
         1.0,
         max(
@@ -2007,12 +2236,18 @@ def _haversine_distance_km(
     )
 
     distance = (
-        radius_km * c
+        radius_km
+        * c
     )
 
-    if not _valid_nonnegative(distance):
+    if not _valid_nonnegative(
+        distance
+    ):
+
         raise ValueError(
             "Calculated Haversine distance is invalid."
         )
 
-    return float(distance)
+    return float(
+        distance
+    )

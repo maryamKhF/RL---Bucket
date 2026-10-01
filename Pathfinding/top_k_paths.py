@@ -23,20 +23,33 @@ Routing invariants
 1. PPO controls eta only.
 2. k is fixed at 5 in this routing model.
 3. k is never modified internally.
-4. Liquidity is a hard feasibility constraint.
-5. No silent fallback is used for routing metrics.
-6. Exact physical channel identity is preserved.
-7. MultiDiGraph parallel channels are never collapsed.
-8. channel_key / SCID are preserved for every candidate edge.
-9. Top-K candidates are channel-aware.
-10. max_hops counts physical routing channels.
-11. adaptive_edge_cost() is the single source of truth
+4. Known learned/observed directional liquidity is a hard
+   feasibility constraint.
+5. Unknown directional liquidity is preserved as UNKNOWN
+   and is resolved through payment simulation.
+6. No silent fallback is used for routing metrics.
+7. Exact physical channel identity is preserved.
+8. MultiDiGraph parallel channels are never collapsed.
+9. channel_key / SCID are preserved for every candidate edge.
+10. Top-K candidates are channel-aware.
+11. max_hops counts physical routing channels.
+12. adaptive_edge_cost() is the single source of truth
     for adaptive routing cost.
-12. Invalid Boolean state is rejected rather than coerced.
-13. Missing required routing data is rejected.
-14. Candidate ordering is deterministic.
-15. Two paths with the same node sequence but different
+13. Invalid Boolean state is rejected rather than coerced.
+14. Missing required routing data is rejected.
+15. Candidate ordering is deterministic.
+16. Two paths with the same node sequence but different
     physical channels are distinct candidates.
+17. Snapshot channel capacity is NEVER interpreted as
+    directional liquidity.
+18. Unknown directional liquidity NEVER causes a candidate
+    to be rejected before payment simulation.
+19. Explicit malformed directional-liquidity values are
+    rejected rather than silently ignored.
+20. No synthetic directional balance is created.
+21. Historical snapshots without directional balances remain
+    routable; actual forwarding feasibility is evaluated by
+    the simulation/dynamic-state layer.
 """
 
 import math
@@ -66,78 +79,163 @@ DEFAULT_K = 5
 
 def _estimated_liquidity(data):
     """
-    Return directional liquidity.
+    Return a known empirical directional-liquidity estimate.
 
-    Priority:
+    Priority
+    --------
+        1. estimated_liquidity
+        2. liquidity_uv
+        3. balance_uv
 
-        estimated_liquidity
-        liquidity_uv
-        balance_uv
+    Semantics
+    ---------
+    A valid numeric value means that empirical directional
+    transfer knowledge is currently available.
 
-    Missing or invalid liquidity is never interpreted as
-    unlimited liquidity.
+    None means that directional liquidity is UNKNOWN.
+
+    UNKNOWN is NOT:
+
+        - zero liquidity
+        - unlimited liquidity
+        - channel capacity
+        - capacity / 2
+        - an invalid channel
+
+    Therefore, if all directional-liquidity fields are absent
+    or explicitly set to None, this function returns None.
+
+    Explicit malformed values are rejected.
+
+    Channel ``capacity`` is deliberately NOT used as a
+    replacement for directional liquidity.
+
+    Actual transferable amount is learned from payment
+    attempts and their observed outcomes.
     """
 
-    found = False
-
-    for field in (
+    liquidity_fields = (
         "estimated_liquidity",
         "liquidity_uv",
         "balance_uv",
-    ):
+    )
+
+    for field in liquidity_fields:
+
         if field not in data:
             continue
 
-        found = True
         value = data[field]
+
+        # --------------------------------------------------
+        # None means UNKNOWN.
+        #
+        # This is normal for historical Lightning snapshots
+        # that do not expose directional balances.
+        # --------------------------------------------------
 
         if value is None:
             continue
 
+        # --------------------------------------------------
+        # Explicitly supplied values must be valid.
+        # --------------------------------------------------
+
         try:
-            value = float(value)
+            liquidity = float(value)
+
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"Invalid liquidity value in field "
                 f"{field!r}: {value!r}"
             ) from exc
 
-        if not math.isfinite(value):
+        if not math.isfinite(liquidity):
             raise ValueError(
                 f"Non-finite liquidity value in field "
                 f"{field!r}: {value!r}"
             )
 
-        if value < 0.0:
+        if liquidity < 0.0:
             raise ValueError(
                 f"Negative liquidity value in field "
                 f"{field!r}: {value!r}"
             )
 
-        return value
+        return liquidity
 
-    if found:
-        raise ValueError(
-            "Liquidity field exists but contains no valid value"
-        )
+    # ------------------------------------------------------
+    # No directional liquidity is known.
+    #
+    # This is NOT an error.
+    #
+    # Do NOT:
+    #
+    #     return 0.0
+    #     return capacity
+    #     return capacity / 2
+    #     raise ValueError
+    #
+    # The channel remains a candidate and its actual
+    # forwarding capability is determined later.
+    # ------------------------------------------------------
 
-    raise ValueError(
-        "Missing directional liquidity"
-    )
+    return None
 
 
 def _channel_can_carry(data, amount):
     """
-    Liquidity is a hard feasibility constraint.
+    Determine whether a channel can remain a Top-K candidate.
 
-    A channel is feasible only when:
+    Known directional liquidity
+    ----------------------------
+    If empirical directional liquidity is known:
 
         liquidity >= amount
+            -> candidate allowed
+
+        liquidity < amount
+            -> candidate rejected
+
+    Unknown directional liquidity
+    -----------------------------
+    If directional liquidity is unknown:
+
+        -> keep the channel as a candidate
+
+    Unknown does NOT mean zero.
+
+    The actual forwarding capability is determined later by
+    Payment Simulation / Network Dynamics / FailureModel.
+
+    Channel capacity is never used as a proxy for
+    directional liquidity.
     """
+
+    amount = _strict_positive_float(
+        amount,
+        "amount",
+    )
 
     liquidity = _estimated_liquidity(data)
 
-    return liquidity >= float(amount)
+    # ------------------------------------------------------
+    # Unknown liquidity:
+    #
+    # Do not eliminate the channel.
+    # ------------------------------------------------------
+
+    if liquidity is None:
+        return True
+
+    # ------------------------------------------------------
+    # Known liquidity:
+    #
+    # Apply the observed/learned value as a hard
+    # feasibility constraint.
+    # ------------------------------------------------------
+
+    return liquidity >= amount
 
 
 # ==========================================================
@@ -293,35 +391,56 @@ def _normalize_edge_data(data):
 
     No synthetic routing values are created.
 
-    available is optional because an absent availability
+    ``available`` is optional because an absent availability
     flag means that the snapshot does not explicitly provide
-    an availability state. It is not a numerical fallback.
+    an availability state.
+
+    Directional liquidity is intentionally NOT synthesized
+    from capacity.
     """
 
     data = dict(data)
 
+    # ------------------------------------------------------
+    # Fee base
+    # ------------------------------------------------------
+
     if "fee_base" not in data:
+
         if "fee_base_msat" in data:
             data["fee_base"] = data["fee_base_msat"]
+
         else:
             raise KeyError(
                 "Missing fee_base / fee_base_msat"
             )
 
+    # ------------------------------------------------------
+    # Fee rate
+    # ------------------------------------------------------
+
     if "fee_rate" not in data:
+
         if "fee_proportional_millionths" in data:
             data["fee_rate"] = (
                 data["fee_proportional_millionths"]
             )
+
         else:
             raise KeyError(
                 "Missing fee_rate / "
                 "fee_proportional_millionths"
             )
 
+    # ------------------------------------------------------
+    # Delay
+    # ------------------------------------------------------
+
     if "delay" not in data:
+
         if "cltv_expiry_delta" in data:
             data["delay"] = data["cltv_expiry_delta"]
+
         else:
             raise KeyError(
                 "Missing delay / cltv_expiry_delta"
@@ -334,7 +453,10 @@ def _normalize_edge_data(data):
 # Boolean Validation
 # ==========================================================
 
-def _strict_bool(value, field_name):
+def _strict_bool(
+    value,
+    field_name,
+):
     """
     Accept actual Boolean values only.
 
@@ -376,7 +498,7 @@ def _build_routing_graph(
         A
         |
         v
-    [CHANNEL-1]
+    [CHANNEL]
         |
         v
         B
@@ -422,6 +544,7 @@ def _build_routing_graph(
     # ------------------------------------------------------
 
     for node, node_data in G.nodes(data=True):
+
         H.add_node(
             node,
             **dict(node_data),
@@ -482,7 +605,9 @@ def _build_routing_graph(
                 raw_data
             )
 
-            key = data.get("channel_key")
+            key = data.get(
+                "channel_key"
+            )
 
             _process_edge(
                 H=H,
@@ -518,6 +643,9 @@ def _process_edge(
 ):
     """
     Validate one physical channel and insert it into H.
+
+    Unknown directional liquidity does not prevent the
+    channel from becoming a routing candidate.
     """
 
     # ------------------------------------------------------
@@ -538,14 +666,29 @@ def _process_edge(
     # Node availability
     # ------------------------------------------------------
 
-    if not _node_available(G, u):
+    if not _node_available(
+        G,
+        u,
+    ):
         return
 
-    if not _node_available(G, v):
+    if not _node_available(
+        G,
+        v,
+    ):
         return
 
     # ------------------------------------------------------
-    # Liquidity
+    # Directional liquidity
+    # ------------------------------------------------------
+    #
+    # Known liquidity:
+    #     hard feasibility constraint.
+    #
+    # Unknown liquidity:
+    #     preserve channel as candidate.
+    #
+    # Capacity is NOT used here.
     # ------------------------------------------------------
 
     if not _channel_can_carry(
@@ -592,7 +735,9 @@ def _process_edge(
     # Delay
     # ------------------------------------------------------
 
-    delay = channel_delay(data)
+    delay = channel_delay(
+        data
+    )
 
     if not _valid_metric(delay):
         raise ValueError(
@@ -604,7 +749,9 @@ def _process_edge(
     # Reliability
     # ------------------------------------------------------
 
-    reliability = _channel_reliability(data)
+    reliability = _channel_reliability(
+        data
+    )
 
     # ------------------------------------------------------
     # Channel identity
@@ -612,8 +759,14 @@ def _process_edge(
 
     scid = data.get(
         "scid",
-        data.get("short_channel_id"),
+        data.get(
+            "short_channel_id"
+        ),
     )
+
+    # ------------------------------------------------------
+    # Store physical channel attributes.
+    # ------------------------------------------------------
 
     channel_attributes = {
         "channel_key": key,
@@ -624,12 +777,18 @@ def _process_edge(
         "reliability": float(reliability),
         "eta": float(eta),
         "raw_heuristic": float(raw_h),
-        "adaptive_penalty": float(adaptive_penalty),
+        "adaptive_penalty": float(
+            adaptive_penalty
+        ),
         "weight": float(weight),
     }
 
     # ------------------------------------------------------
     # Unique virtual channel node
+    # ------------------------------------------------------
+    #
+    # Every physical channel receives its own virtual node.
+    # Therefore parallel channels remain distinguishable.
     # ------------------------------------------------------
 
     virtual_node = (
@@ -643,6 +802,7 @@ def _process_edge(
     )
 
     while virtual_node in H:
+
         virtual_node = (
             "__channel__",
             id(H),
@@ -681,7 +841,9 @@ def _process_edge(
         reliability=float(reliability),
         eta=float(eta),
         raw_heuristic=float(raw_h),
-        adaptive_penalty=float(adaptive_penalty),
+        adaptive_penalty=float(
+            adaptive_penalty
+        ),
         hop_increment=1,
     )
 
@@ -747,7 +909,9 @@ def _extract_physical_path(
 
     while index < len(expanded_path) - 1:
 
-        virtual_node = expanded_path[index + 1]
+        virtual_node = expanded_path[
+            index + 1
+        ]
 
         if not _is_virtual_channel_node(
             H,
@@ -787,7 +951,9 @@ def _extract_physical_path(
             )
         )
 
-        if index + 2 >= len(expanded_path):
+        if index + 2 >= len(
+            expanded_path
+        ):
             raise RuntimeError(
                 "Virtual channel node has no destination"
             )
@@ -813,9 +979,19 @@ def _extract_physical_path(
         if destination_edge.get(
             "channel_key"
         ) != channel_key:
+
             raise RuntimeError(
                 "Channel identity mismatch between "
                 "expanded edges"
+            )
+
+        if destination_edge.get(
+            "scid"
+        ) != scid:
+
+            raise RuntimeError(
+                "SCID mismatch between "
+                "expanded channel edges"
             )
 
         physical_edges.append(
@@ -833,6 +1009,7 @@ def _extract_physical_path(
         )
 
         current_source = destination
+
         index += 2
 
     if physical_nodes[-1] != target:
@@ -840,9 +1017,12 @@ def _extract_physical_path(
             "Physical path does not terminate at target"
         )
 
-    if len(physical_nodes) != len(physical_edges) + 1:
+    if len(physical_nodes) != (
+        len(physical_edges) + 1
+    ):
         raise RuntimeError(
-            "Physical path and channel-edge counts are inconsistent"
+            "Physical path and channel-edge counts "
+            "are inconsistent"
         )
 
     return (
@@ -882,7 +1062,10 @@ def _path_metrics(
         expanded_path[1:],
     ):
 
-        if not H.has_edge(u, v):
+        if not H.has_edge(
+            u,
+            v,
+        ):
             raise KeyError(
                 f"Missing expanded edge "
                 f"{u!r}->{v!r}"
@@ -924,9 +1107,11 @@ def _path_metrics(
                 "raw heuristic",
             )
 
-            total_adaptive_penalty += _strict_nonnegative_float(
-                edge["adaptive_penalty"],
-                "adaptive penalty",
+            total_adaptive_penalty += (
+                _strict_nonnegative_float(
+                    edge["adaptive_penalty"],
+                    "adaptive penalty",
+                )
             )
 
             hop_count += 1
@@ -986,10 +1171,17 @@ def _valid_candidate_path(
     if hops > max_hops:
         return False
 
+    # ------------------------------------------------------
     # Physical node path must be simple.
+    # ------------------------------------------------------
+
     try:
-        if len(set(physical_path)) != len(physical_path):
+
+        if len(set(physical_path)) != len(
+            physical_path
+        ):
             return False
+
     except TypeError:
         return False
 
@@ -1005,6 +1197,13 @@ def _candidate_channel_identity(
 ):
     """
     Return deterministic physical-channel identity.
+
+    Channel identity contains:
+
+        source
+        target
+        channel_key
+        SCID
     """
 
     return tuple(
@@ -1060,6 +1259,16 @@ def top_k_paths(
             "candidate": True,
             "success": None,
         }
+
+    Liquidity behavior
+    ------------------
+    Known empirical liquidity may exclude a channel when the
+    requested amount is above the known transferable amount.
+
+    Unknown liquidity does NOT exclude a channel.
+
+    Actual forwarding capability is determined by the
+    simulation/dynamic-state layer.
     """
 
     # ------------------------------------------------------
@@ -1126,8 +1335,13 @@ def top_k_paths(
         "max_hops",
     )
 
-    eta = validate_eta(eta)
-    lambda_h = validate_lambda_h(lambda_h)
+    eta = validate_eta(
+        eta
+    )
+
+    lambda_h = validate_lambda_h(
+        lambda_h
+    )
 
     if heuristic_fn is None:
         heuristic_fn = lnd_cost
@@ -1207,9 +1421,8 @@ def top_k_paths(
                 expanded_path,
             )
 
-            if (
-                metrics["hop_count"]
-                != len(physical_edges)
+            if metrics["hop_count"] != len(
+                physical_edges
             ):
                 raise RuntimeError(
                     "Physical hop count does not match "
@@ -1217,7 +1430,9 @@ def top_k_paths(
                 )
 
             candidate = {
-                "path": list(physical_path),
+                "path": list(
+                    physical_path
+                ),
                 "edges": physical_edges,
                 "cost": metrics["cost"],
                 "hop_count": metrics["hop_count"],
@@ -1239,19 +1454,26 @@ def top_k_paths(
                 "success": None,
             }
 
-            results.append(candidate)
+            results.append(
+                candidate
+            )
 
-            # We can stop once five distinct physical
-            # channel-aware candidates have been collected.
+            # --------------------------------------------------
+            # Fixed Top-K = 5
+            # --------------------------------------------------
+
             if len(results) >= k:
                 break
 
     except nx.NetworkXNoPath:
-        # No path can remain after the generator is exhausted.
-        # This is a legitimate routing outcome, not a fallback.
+        # --------------------------------------------------
+        # No path is a legitimate routing result.
+        # --------------------------------------------------
+
         pass
 
     except nx.NodeNotFound as exc:
+
         raise RuntimeError(
             "Expanded routing graph lost a required node "
             "during candidate generation"
@@ -1327,6 +1549,7 @@ def _node_available(
         online
 
     Missing flags are not interpreted as failure.
+
     Invalid Boolean values are rejected.
     """
 
@@ -1363,18 +1586,26 @@ def _strict_number(
     value,
     field_name,
 ):
+    """
+    Convert a numeric value to float and validate finiteness.
+    """
+
     try:
+
         value = float(value)
+
     except (
         TypeError,
         ValueError,
     ) as exc:
+
         raise ValueError(
             f"{field_name} must be numeric: "
             f"{value!r}"
         ) from exc
 
     if not math.isfinite(value):
+
         raise ValueError(
             f"{field_name} must be finite: "
             f"{value!r}"
@@ -1387,12 +1618,17 @@ def _strict_nonnegative_float(
     value,
     field_name,
 ):
+    """
+    Validate a finite non-negative floating-point value.
+    """
+
     value = _strict_number(
         value,
         field_name,
     )
 
     if value < 0.0:
+
         raise ValueError(
             f"{field_name} must be non-negative: "
             f"{value!r}"
@@ -1405,12 +1641,17 @@ def _strict_positive_float(
     value,
     field_name,
 ):
+    """
+    Validate a finite positive floating-point value.
+    """
+
     value = _strict_number(
         value,
         field_name,
     )
 
     if value <= 0.0:
+
         raise ValueError(
             f"{field_name} must be greater than zero: "
             f"{value!r}"
@@ -1442,6 +1683,7 @@ def _strict_positive_int(
     """
 
     if isinstance(value, bool):
+
         raise ValueError(
             f"{field_name} must be an integer: "
             f"{value!r}"
@@ -1450,36 +1692,43 @@ def _strict_positive_int(
     if isinstance(value, float):
 
         if not math.isfinite(value):
+
             raise ValueError(
                 f"{field_name} must be a finite integer: "
                 f"{value!r}"
             )
 
         if not value.is_integer():
+
             raise ValueError(
                 f"{field_name} must be an integer: "
                 f"{value!r}"
             )
 
     if isinstance(value, str):
+
         raise ValueError(
             f"{field_name} must be an integer: "
             f"{value!r}"
         )
 
     try:
+
         integer = int(value)
+
     except (
         TypeError,
         ValueError,
         OverflowError,
     ) as exc:
+
         raise ValueError(
             f"{field_name} must be an integer: "
             f"{value!r}"
         ) from exc
 
     if integer <= 0:
+
         raise ValueError(
             f"{field_name} must be greater than zero: "
             f"{value!r}"
@@ -1492,12 +1741,17 @@ def _strict_probability(
     value,
     field_name,
 ):
+    """
+    Validate a probability in [0, 1].
+    """
+
     value = _strict_number(
         value,
         field_name,
     )
 
     if value < 0.0 or value > 1.0:
+
         raise ValueError(
             f"{field_name} must be in [0, 1]: "
             f"{value!r}"
@@ -1506,25 +1760,43 @@ def _strict_probability(
     return value
 
 
-def _valid_number(value):
+def _valid_number(
+    value,
+):
+    """
+    Return True only for finite numeric values.
+    """
+
     try:
+
         value = float(value)
+
     except (
         TypeError,
         ValueError,
     ):
+
         return False
 
     return math.isfinite(value)
 
 
-def _valid_metric(value):
+def _valid_metric(
+    value,
+):
+    """
+    Return True only for finite non-negative metrics.
+    """
+
     try:
+
         value = float(value)
+
     except (
         TypeError,
         ValueError,
     ):
+
         return False
 
     return (
@@ -1533,13 +1805,22 @@ def _valid_metric(value):
     )
 
 
-def _valid_cost(value):
+def _valid_cost(
+    value,
+):
+    """
+    Return True only for finite non-negative costs.
+    """
+
     try:
+
         value = float(value)
+
     except (
         TypeError,
         ValueError,
     ):
+
         return False
 
     return (
@@ -1552,13 +1833,16 @@ def _valid_cost(value):
 # Deterministic Channel-Key Ordering
 # ==========================================================
 
-def _channel_key_sort_value(key):
+def _channel_key_sort_value(
+    key,
+):
     """
     Convert arbitrary NetworkX channel keys into a
     deterministic comparable representation.
     """
 
     if key is None:
+
         return (
             0,
             "",

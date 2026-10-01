@@ -17,9 +17,16 @@ class LNGraphBuilder:
         3. Synthetic Lightning topology
 
     Important modeling rules
-    ------------------------
-    - rgb_color is used as the numeric carbon-intensity value.
-    - Larger rgb_color means higher carbon intensity.
+    -------------------------
+    - rgb_color is preserved in its original representation.
+    - RGB values are converted to a numeric carbon-intensity proxy
+      using:
+
+          0.299R + 0.587G + 0.114B
+
+    - If rgb_color is missing or invalid, carbon_intensity is set
+      to 0.0.
+
     - Channel capacity is NOT treated as directional liquidity.
     - If directional balance/liquidity is not provided by the input,
       it remains unknown (None).
@@ -28,10 +35,208 @@ class LNGraphBuilder:
     """
 
     # ==========================================================
+    # RGB / Carbon Utility
+    # ==========================================================
+
+    @staticmethod
+    def _rgb_to_carbon_intensity(rgb_color):
+        """
+        Convert a supported RGB representation into the numeric
+        carbon-intensity proxy used by the routing heuristics.
+
+        Supported representations:
+
+            "3399ff"
+            "#3399ff"
+
+            [51, 153, 255]
+            (51, 153, 255)
+
+            {"r": 51, "g": 153, "b": 255}
+            {"red": 51, "green": 153, "blue": 255}
+
+        Returns
+        -------
+        float or None
+            Numeric RGB luminance/carbon proxy.
+
+            None is returned when the RGB representation is
+            absent or invalid.
+
+        Important
+        ---------
+        The original rgb_color value is NOT modified.
+
+        The graph keeps the original value separately as
+        "rgb_color".
+        """
+
+        # ------------------------------------------------------
+        # Missing RGB
+        # ------------------------------------------------------
+
+        if rgb_color is None:
+            return None
+
+        r = None
+        g = None
+        b = None
+
+        # ------------------------------------------------------
+        # Dictionary representation
+        # ------------------------------------------------------
+
+        if isinstance(rgb_color, dict):
+
+            if all(
+                key in rgb_color
+                for key in ("r", "g", "b")
+            ):
+                r = rgb_color["r"]
+                g = rgb_color["g"]
+                b = rgb_color["b"]
+
+            elif all(
+                key in rgb_color
+                for key in ("red", "green", "blue")
+            ):
+                r = rgb_color["red"]
+                g = rgb_color["green"]
+                b = rgb_color["blue"]
+
+            else:
+                return None
+
+        # ------------------------------------------------------
+        # List / Tuple representation
+        # ------------------------------------------------------
+
+        elif isinstance(
+            rgb_color,
+            (list, tuple)
+        ):
+
+            if len(rgb_color) != 3:
+                return None
+
+            r, g, b = rgb_color
+
+        # ------------------------------------------------------
+        # Hexadecimal string representation
+        # ------------------------------------------------------
+
+        elif isinstance(
+            rgb_color,
+            str
+        ):
+
+            value = rgb_color.strip()
+
+            if value.startswith("#"):
+                value = value[1:]
+
+            if len(value) != 6:
+                return None
+
+            try:
+                r = int(
+                    value[0:2],
+                    16
+                )
+
+                g = int(
+                    value[2:4],
+                    16
+                )
+
+                b = int(
+                    value[4:6],
+                    16
+                )
+
+            except ValueError:
+                return None
+
+        # ------------------------------------------------------
+        # Unsupported representation
+        # ------------------------------------------------------
+
+        else:
+            return None
+
+        # ------------------------------------------------------
+        # Validate RGB components
+        # ------------------------------------------------------
+
+        try:
+            r = float(r)
+            g = float(g)
+            b = float(b)
+
+        except (
+            TypeError,
+            ValueError
+        ):
+            return None
+
+        # ------------------------------------------------------
+        # Validate finite values
+        # ------------------------------------------------------
+
+        if not all(
+            np.isfinite(value)
+            for value in (r, g, b)
+        ):
+            return None
+
+        # ------------------------------------------------------
+        # Validate RGB range
+        # ------------------------------------------------------
+
+        if not all(
+            0.0 <= value <= 255.0
+            for value in (r, g, b)
+        ):
+            return None
+
+        # ------------------------------------------------------
+        # RGB luminance / carbon-intensity proxy
+        #
+        # Formula:
+        #
+        #     0.299R + 0.587G + 0.114B
+        #
+        # ------------------------------------------------------
+
+        carbon_intensity = (
+            0.299 * r
+            +
+            0.587 * g
+            +
+            0.114 * b
+        )
+
+        return float(
+            carbon_intensity
+        )
+
+    # ==========================================================
     # Load Real LN Snapshot from JSON File
     # ==========================================================
 
     def from_json(self, path):
+        """
+        Load a Lightning Network snapshot from a JSON file.
+
+        Parameters
+        ----------
+        path:
+            Path to the JSON snapshot.
+
+        Returns
+        -------
+        networkx.MultiDiGraph
+        """
 
         data = json.loads(
             Path(path).read_text(
@@ -39,13 +244,24 @@ class LNGraphBuilder:
             )
         )
 
-        return self.from_data(data)
+        return self.from_data(
+            data
+        )
 
     # ==========================================================
     # Load Real LN Snapshot from In-Memory Data
     # ==========================================================
 
     def from_data(self, data):
+        """
+        Build a MultiDiGraph from JSON-like data.
+
+        Important:
+        - RGB is preserved.
+        - Missing RGB produces carbon_intensity=0.0.
+        - Capacity is never interpreted as directional liquidity.
+        - Unknown directional liquidity remains None.
+        """
 
         G = nx.MultiDiGraph()
 
@@ -81,7 +297,9 @@ class LNGraphBuilder:
             if nid is None:
                 continue
 
-            nid = str(nid)
+            nid = str(
+                nid
+            )
 
             # --------------------------------------------------
             # Geographic information
@@ -109,13 +327,33 @@ class LNGraphBuilder:
             )
 
             # --------------------------------------------------
-            # Carbon intensity
+            # RGB / Carbon information
             #
-            # rgb_color is treated as a numeric carbon value.
+            # The original RGB representation is preserved.
             #
-            # Larger rgb_color
-            #       ->
-            # higher carbon intensity
+            # Example:
+            #
+            #     "3399ff"
+            #
+            # is NOT converted to float and is NOT discarded.
+            #
+            # Instead:
+            #
+            #     R = 51
+            #     G = 153
+            #     B = 255
+            #
+            # and:
+            #
+            #     carbon =
+            #         0.299R
+            #       + 0.587G
+            #       + 0.114B
+            #
+            # If RGB is missing or invalid:
+            #
+            #     carbon_intensity = 0.0
+            #
             # --------------------------------------------------
 
             rgb_color = n.get(
@@ -123,30 +361,32 @@ class LNGraphBuilder:
                 None
             )
 
-            if rgb_color is not None:
+            rgb_carbon_intensity = (
+                self._rgb_to_carbon_intensity(
+                    rgb_color
+                )
+            )
 
-                try:
-                    rgb_color = float(
-                        rgb_color
-                    )
-
-                except (
-                    TypeError,
-                    ValueError
-                ):
-
-                    rgb_color = None
-
-            # Backward compatibility:
-            # if rgb_color is unavailable, use explicitly
-            # provided carbon_intensity.
+            # --------------------------------------------------
+            # Determine carbon intensity
+            # --------------------------------------------------
             #
-            # No artificial default such as 300 is introduced
-            # for real snapshot data.
+            # Priority:
+            #
+            # 1. Valid RGB
+            # 2. Explicit carbon_intensity
+            # 3. Zero
+            #
+            # The third case is important for real snapshot
+            # nodes that contain no RGB information.
+            #
+            # --------------------------------------------------
 
-            if rgb_color is not None:
+            if rgb_carbon_intensity is not None:
 
-                carbon_intensity = rgb_color
+                carbon_intensity = (
+                    rgb_carbon_intensity
+                )
 
             else:
 
@@ -158,9 +398,15 @@ class LNGraphBuilder:
                 if carbon_value is not None:
 
                     try:
+
                         carbon_intensity = float(
                             carbon_value
                         )
+
+                        if not np.isfinite(
+                            carbon_intensity
+                        ):
+                            carbon_intensity = 0.0
 
                     except (
                         TypeError,
@@ -209,12 +455,22 @@ class LNGraphBuilder:
                 online=bool(
                     online
                 )
+
             )
 
-            # Keep rgb_color explicitly as a node attribute.
+            # --------------------------------------------------
+            # Preserve original RGB representation.
             #
-            # This allows the graph to retain the original
-            # carbon-related field from the dataset.
+            # Examples:
+            #
+            #     "3399ff"
+            #
+            # or:
+            #
+            #     None
+            #
+            # for nodes where RGB is unavailable.
+            # --------------------------------------------------
 
             node_attributes = {
                 **node.__dict__,
@@ -230,7 +486,9 @@ class LNGraphBuilder:
         # Add Channels
         # ======================================================
 
-        for i, e in enumerate(channels):
+        for i, e in enumerate(
+            channels
+        ):
 
             source = e.get(
                 "source"
@@ -265,7 +523,10 @@ class LNGraphBuilder:
             # channel attribute.
             #
             # IMPORTANT:
+            #
             # capacity is NOT directional liquidity.
+            #
+            # No capacity / 2 is used here.
             # --------------------------------------------------
 
             capacity = e.get(
@@ -279,6 +540,7 @@ class LNGraphBuilder:
             if capacity is not None:
 
                 try:
+
                     capacity = float(
                         capacity
                     )
@@ -389,10 +651,19 @@ class LNGraphBuilder:
             # --------------------------------------------------
             # Directional Liquidity / Balance
             #
+            # IMPORTANT:
+            #
             # Do NOT use capacity / 2.
             #
             # The real snapshot may not contain directional
-            # balances. In that case the value remains unknown.
+            # balances.
+            #
+            # In that case:
+            #
+            #     balance_uv = None
+            #     balance_vu = None
+            #
+            # Unknown liquidity is kept unknown.
             # --------------------------------------------------
 
             balance_uv = e.get(
@@ -408,6 +679,7 @@ class LNGraphBuilder:
             if balance_uv is not None:
 
                 try:
+
                     balance_uv = float(
                         balance_uv
                     )
@@ -422,6 +694,7 @@ class LNGraphBuilder:
             if balance_vu is not None:
 
                 try:
+
                     balance_vu = float(
                         balance_vu
                     )
@@ -436,8 +709,11 @@ class LNGraphBuilder:
             # --------------------------------------------------
             # Learned / Observed Liquidity
             #
-            # This is optional and is NOT inferred from capacity.
-            # It can later be populated from routing experience.
+            # This is optional.
+            #
+            # It is NOT inferred from capacity.
+            #
+            # It can later be populated by routing experience.
             # --------------------------------------------------
 
             estimated_liquidity_uv = e.get(
@@ -451,6 +727,7 @@ class LNGraphBuilder:
             if estimated_liquidity_uv is not None:
 
                 try:
+
                     estimated_liquidity_uv = float(
                         estimated_liquidity_uv
                     )
@@ -470,6 +747,7 @@ class LNGraphBuilder:
             if estimated_liquidity_vu is not None:
 
                 try:
+
                     estimated_liquidity_vu = float(
                         estimated_liquidity_vu
                     )
@@ -554,6 +832,7 @@ class LNGraphBuilder:
 
                 "balance_vu":
                     channel.balance_uv
+
             }
 
             if estimated_liquidity_vu is not None:
@@ -595,6 +874,15 @@ class LNGraphBuilder:
         extra_edges=500,
         seed=42
     ):
+        """
+        Generate a synthetic Lightning Network topology.
+
+        Synthetic topology behavior is kept separate from the
+        real snapshot behavior.
+
+        In particular, synthetic channels have known directional
+        balances initialized to capacity / 2.
+        """
 
         rng = np.random.default_rng(
             seed
@@ -732,8 +1020,9 @@ class LNGraphBuilder:
                 node.__dict__
             )
 
-            # Synthetic data also follows the same semantic
-            # meaning as the real data.
+            # --------------------------------------------------
+            # Preserve synthetic RGB representation.
+            # --------------------------------------------------
 
             G.nodes[
                 node_id
@@ -813,15 +1102,33 @@ class LNGraphBuilder:
     # Utility Functions
     # ==========================================================
 
-    def number_of_nodes(self, G):
+    def number_of_nodes(
+        self,
+        G
+    ):
+        """
+        Return the number of nodes in the graph.
+        """
 
         return G.number_of_nodes()
 
-    def number_of_channels(self, G):
+    def number_of_channels(
+        self,
+        G
+    ):
+        """
+        Return the number of directed channels in the graph.
+        """
 
         return G.number_of_edges()
 
-    def summary(self, G):
+    def summary(
+        self,
+        G
+    ):
+        """
+        Print a concise graph summary.
+        """
 
         print(
             "Lightning Network Graph"

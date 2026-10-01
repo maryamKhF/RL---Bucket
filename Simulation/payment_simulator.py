@@ -61,7 +61,23 @@ For MultiGraph / MultiDiGraph:
 
 is mandatory.
 
-The simulator NEVER silently selects a parallel channel.
+Top-K / Bucket may represent a physical edge as:
+
+    {
+        "source": u,
+        "target": v,
+        "channel_key": key,
+        "scid": ...,
+        "data": ...
+    }
+
+PaymentSimulator accepts both representations and internally
+normalizes them to:
+
+    (u, v, key)
+
+The original edge representation is preserved when passing
+route_edges to FailureModel and when storing it in PaymentResult.
 
 Capacity
 --------
@@ -98,7 +114,6 @@ The geographic rule is a fallback proxy only. It is not a
 complete geographic database.
 """
 
-
 import math
 import time
 
@@ -131,20 +146,6 @@ def estimate_inter_continent(G, u, v):
         abs(longitude_u - longitude_v) > 45
 
     Missing or invalid coordinates return 0.
-
-    Parameters
-    ----------
-    G : networkx graph
-        Network graph.
-
-    u, v :
-        Source and destination node identifiers.
-
-    Returns
-    -------
-    int
-        1 if the hop is estimated to cross continents,
-        otherwise 0.
     """
 
     if G is None:
@@ -428,6 +429,30 @@ class PaymentSimulator:
         Top-K candidate selection
 
     It executes exactly one route supplied by its caller.
+
+    Edge compatibility
+    ------------------
+    The simulator accepts both:
+
+        (u, v)
+        (u, v, key)
+
+    and Top-K / Bucket dictionaries:
+
+        {
+            "source": u,
+            "target": v,
+            "channel_key": key,
+            ...
+        }
+
+    Dictionary edges are preserved when passed to external
+    components and stored in PaymentResult.
+
+    Internally, all edge comparisons and graph lookups use
+    the canonical identity:
+
+        (u, v, key)
     """
 
     def __init__(
@@ -597,6 +622,19 @@ class PaymentSimulator:
 
         # ----------------------------------------------------
         # FailureModel
+        #
+        # IMPORTANT:
+        # Preserve the ORIGINAL edge representation here.
+        #
+        # Top-K/Bucket dictionary edges must reach the
+        # FailureModel unchanged so that a failure model can
+        # inspect:
+        #
+        #     source
+        #     target
+        #     channel_key
+        #     scid
+        #     data
         # ----------------------------------------------------
 
         failure = (
@@ -667,7 +705,12 @@ class PaymentSimulator:
 
         # ----------------------------------------------------
         # Forwarding succeeded.
+        #
         # Settlement is attempted exactly once.
+        #
+        # The original edge representation is preserved.
+        # NetworkDynamics therefore receives the same physical
+        # channel identity supplied by Top-K/Bucket.
         # ----------------------------------------------------
 
         settlement_success = (
@@ -781,6 +824,22 @@ class PaymentSimulator:
     ):
         """
         Validate node sequence and exact edge identity.
+
+        Edge representation may be either:
+
+            tuple/list:
+                (u, v)
+                (u, v, key)
+
+        or:
+
+            dictionary:
+                {
+                    "source": u,
+                    "target": v,
+                    "channel_key": key,
+                    ...
+                }
         """
 
         if not isinstance(
@@ -1060,9 +1119,15 @@ class PaymentSimulator:
                 )
             )
 
-        average_carbon = (
-            carbon / len(edges)
-        )
+        if len(edges) == 0:
+
+            average_carbon = 0.0
+
+        else:
+
+            average_carbon = (
+                carbon / len(edges)
+            )
 
         return {
             "fee": fee,
@@ -1083,14 +1148,7 @@ class PaymentSimulator:
         """
         Return the continent associated with a country code.
 
-        The mapping contains commonly encountered country codes
-        relevant to deterministic simulation data.
-
         Unknown countries return None.
-
-        Returning None is intentional: the caller then uses
-        the geographic fallback rather than inventing a
-        continent classification.
         """
 
         country_to_continent = {
@@ -1256,7 +1314,6 @@ class PaymentSimulator:
             "PG": "Oceania",
             "WS": "Oceania",
             "TO": "Oceania",
-
         }
 
         return country_to_continent.get(
@@ -1271,22 +1328,6 @@ class PaymentSimulator:
     def _get_fee_components(data):
         """
         Extract Lightning fee components.
-
-        Supported attributes:
-
-            fee_base
-            fee_rate
-
-        or:
-
-            fee_base_msat
-            fee_proportional_millionths
-
-        If an explicitly supplied value is malformed,
-        ValueError is raised.
-
-        If neither representation exists, the fee component
-        is explicitly treated as zero.
         """
 
         if not isinstance(data, dict):
@@ -1294,10 +1335,6 @@ class PaymentSimulator:
             raise TypeError(
                 "Channel data must be a dictionary."
             )
-
-        # ----------------------------------------------------
-        # Base fee
-        # ----------------------------------------------------
 
         if "fee_base" in data:
 
@@ -1322,10 +1359,6 @@ class PaymentSimulator:
         else:
 
             base = 0.0
-
-        # ----------------------------------------------------
-        # Proportional fee
-        # ----------------------------------------------------
 
         if "fee_rate" in data:
 
@@ -1369,10 +1402,6 @@ class PaymentSimulator:
     ):
         """
         Read one of two optional numeric attributes.
-
-        Missing attributes use the explicitly supplied default.
-
-        Present but invalid attributes raise ValueError.
         """
 
         if primary in data:
@@ -1409,12 +1438,6 @@ class PaymentSimulator:
     ):
         """
         Read a node metric.
-
-        Missing metric:
-            explicit default
-
-        Present but invalid:
-            ValueError
         """
 
         if field_name not in node_data:
@@ -1439,18 +1462,12 @@ class PaymentSimulator:
         """
         Validate the FailureModel contract.
 
-        Required:
+        failed_edge may be either:
 
-            dict
-            success -> bool
-            reason  -> string
+            (u, v)
+            (u, v, key)
 
-        Optional:
-
-            failed_node
-            failed_edge
-            failure_index
-            visited_edges
+        or a Top-K/Bucket dictionary.
         """
 
         if not isinstance(
@@ -1557,14 +1574,13 @@ class PaymentSimulator:
         route_edges
     ):
         """
-        Validate and normalize FailureModel visited edges.
+        Validate FailureModel visited edges.
 
-        Every visited edge must:
+        Both tuple/list and dictionary edge representations
+        are accepted.
 
-            1. have valid edge representation
-            2. correspond to an edge in the supplied route
-            3. preserve exact channel identity
-            4. preserve route order
+        The original representation is preserved in the
+        returned list.
         """
 
         if visited_edges is None:
@@ -1688,44 +1704,189 @@ class PaymentSimulator:
     @staticmethod
     def _parse_edge(edge):
         """
-        Normalize edge representation.
+        Normalize a physical channel edge.
 
-        Accepted:
+        Accepted representations
+        -------------------------
+
+        Top-K / Bucket dictionary:
+
+            {
+                "source": u,
+                "target": v,
+                "channel_key": key,
+                ...
+            }
+
+        Compatible dictionary aliases:
+
+            {
+                "u": u,
+                "v": v,
+                "key": key,
+                ...
+            }
+
+        Tuple:
 
             (u, v)
 
-        or:
+        Keyed tuple:
 
             (u, v, key)
 
-        Dictionary edge representations are intentionally not
-        accepted here. Top-K/Bucket must normalize candidates
-        before they reach PaymentSimulator.
+        Returns
+        -------
+
+        tuple or None
+
+            Canonical form:
+
+                (u, v, key)
+
+        Important
+        ---------
+
+        This method does NOT replace the original edge.
+
+        It is used only for:
+
+            - route validation
+            - exact graph lookup
+            - edge identity comparison
+            - metric calculation
+            - failure information validation
+
+        The original object is preserved by callers.
         """
 
-        if not isinstance(
+        if edge is None:
+            return None
+
+        # ----------------------------------------------------
+        # Dictionary representation
+        # ----------------------------------------------------
+
+        if isinstance(edge, dict):
+
+            # ------------------------------------------------
+            # Source
+            # ------------------------------------------------
+
+            if "source" in edge:
+
+                u = edge.get(
+                    "source"
+                )
+
+            elif "u" in edge:
+
+                u = edge.get(
+                    "u"
+                )
+
+            else:
+
+                return None
+
+            # ------------------------------------------------
+            # Target
+            # ------------------------------------------------
+
+            if "target" in edge:
+
+                v = edge.get(
+                    "target"
+                )
+
+            elif "v" in edge:
+
+                v = edge.get(
+                    "v"
+                )
+
+            else:
+
+                return None
+
+            # ------------------------------------------------
+            # Exact channel key
+            # ------------------------------------------------
+
+            if "channel_key" in edge:
+
+                key = edge.get(
+                    "channel_key"
+                )
+
+            elif "key" in edge:
+
+                key = edge.get(
+                    "key"
+                )
+
+            else:
+
+                key = None
+
+            if u is None or v is None:
+
+                return None
+
+            return (
+                u,
+                v,
+                key
+            )
+
+        # ----------------------------------------------------
+        # Tuple / list representation
+        # ----------------------------------------------------
+
+        if isinstance(
             edge,
             (tuple, list)
         ):
+
+            if len(edge) == 2:
+
+                return (
+                    edge[0],
+                    edge[1],
+                    None
+                )
+
+            if len(edge) == 3:
+
+                return (
+                    edge[0],
+                    edge[1],
+                    edge[2]
+                )
+
             return None
 
-        if len(edge) == 2:
-
-            return (
-                edge[0],
-                edge[1],
-                None
-            )
-
-        if len(edge) == 3:
-
-            return (
-                edge[0],
-                edge[1],
-                edge[2]
-            )
-
         return None
+
+    # ========================================================
+    # Canonical Edge Identity
+    # ========================================================
+
+    @staticmethod
+    def _edge_identity(edge):
+        """
+        Return canonical physical-channel identity.
+
+        The identity is:
+
+            (source, target, channel_key)
+
+        or None when the edge representation is invalid.
+        """
+
+        return PaymentSimulator._parse_edge(
+            edge
+        )
 
     # ========================================================
     # Graph Edge Access
@@ -2140,6 +2301,10 @@ if __name__ == "__main__":
         "C"
     ]
 
+    # --------------------------------------------------------
+    # Tuple representation
+    # --------------------------------------------------------
+
     edges = [
         ("A", "B", 10),
         ("B", "C", 20)
@@ -2153,6 +2318,8 @@ if __name__ == "__main__":
     )
 
     print()
+    print("Tuple edge test")
+    print("----------------")
     print("Success          :", result.success)
     print("Reason           :", result.reason)
     print("Path             :", result.path)
@@ -2192,6 +2359,10 @@ if __name__ == "__main__":
     assert network_dynamics.settlement_calls == 1
     assert len(network_dynamics.records) == 1
 
+    # --------------------------------------------------------
+    # Exact channel identity
+    # --------------------------------------------------------
+
     exact_data = simulator._get_edge(
         "A",
         "B",
@@ -2220,6 +2391,143 @@ if __name__ == "__main__":
         "A",
         "B"
     ) is None
+
+    # --------------------------------------------------------
+    # Dictionary edge compatibility diagnostic
+    # --------------------------------------------------------
+
+    dictionary_edges = [
+        {
+            "source": "A",
+            "target": "B",
+            "channel_key": 10,
+            "scid": "A-B-10"
+        },
+        {
+            "source": "B",
+            "target": "C",
+            "channel_key": 20,
+            "scid": "B-C-20"
+        }
+    ]
+
+    parsed_first = simulator._parse_edge(
+        dictionary_edges[0]
+    )
+
+    parsed_second = simulator._parse_edge(
+        dictionary_edges[1]
+    )
+
+    assert parsed_first == (
+        "A",
+        "B",
+        10
+    )
+
+    assert parsed_second == (
+        "B",
+        "C",
+        20
+    )
+
+    dictionary_validation = simulator._validate_route(
+        path,
+        dictionary_edges
+    )
+
+    assert dictionary_validation["valid"] is True
+
+    dictionary_metrics = simulator._calculate_metrics(
+        dictionary_edges,
+        1000
+    )
+
+    assert dictionary_metrics["fee"] >= 0.0
+
+    dictionary_result = simulator.simulate_payment(
+        path=path,
+        edges=dictionary_edges,
+        amount=1000,
+        tx_id="TX-DICT-001"
+    )
+
+    assert dictionary_result.success is True
+    assert dictionary_result.edges == dictionary_edges
+    assert dictionary_result.visited_edges == dictionary_edges
+
+    # --------------------------------------------------------
+    # FailureModel receives original dictionary edges
+    # --------------------------------------------------------
+
+    class DictionaryAwareFailureModel:
+
+        def __init__(self):
+
+            self.received_edges = None
+
+        def evaluate_payment_failure(
+            self,
+            route,
+            amount,
+            network,
+            route_edges=None
+        ):
+
+            self.received_edges = list(
+                route_edges
+            )
+
+            assert isinstance(
+                self.received_edges[0],
+                dict
+            )
+
+            assert (
+                self.received_edges[0][
+                    "channel_key"
+                ] == 10
+            )
+
+            return {
+                "success": True,
+                "reason": "success",
+                "visited_edges": list(
+                    route_edges
+                )
+            }
+
+    dictionary_failure_model = (
+        DictionaryAwareFailureModel()
+    )
+
+    dictionary_dynamics = TestNetworkDynamics()
+
+    dictionary_simulator = PaymentSimulator(
+        G=G,
+        failure_model=dictionary_failure_model,
+        network_dynamics=dictionary_dynamics
+    )
+
+    dictionary_e2e_result = (
+        dictionary_simulator.simulate_payment(
+            path=path,
+            edges=dictionary_edges,
+            amount=1000,
+            tx_id="TX-DICT-002"
+        )
+    )
+
+    assert dictionary_e2e_result.success is True
+
+    assert (
+        dictionary_failure_model.received_edges
+        == dictionary_edges
+    )
+
+    # --------------------------------------------------------
+    # Failure propagation
+    # --------------------------------------------------------
 
     class FailedPaymentModel:
 
@@ -2283,9 +2591,109 @@ if __name__ == "__main__":
     # FailureModel failure must NOT settle the route.
     assert failed_dynamics.settlement_calls == 0
 
+    # --------------------------------------------------------
+    # Dictionary failed_edge compatibility
+    # --------------------------------------------------------
+
+    class DictionaryFailureModel:
+
+        def evaluate_payment_failure(
+            self,
+            route,
+            amount,
+            network,
+            route_edges=None
+        ):
+
+            return {
+                "success": False,
+                "reason": "channel_failure",
+                "failed_node": "B",
+                "failed_edge": {
+                    "source": "B",
+                    "target": "C",
+                    "channel_key": 20,
+                    "scid": "B-C-20"
+                },
+                "failure_index": 1,
+                "visited_edges": [
+                    {
+                        "source": "A",
+                        "target": "B",
+                        "channel_key": 10,
+                        "scid": "A-B-10"
+                    }
+                ]
+            }
+
+    dictionary_failed_dynamics = TestNetworkDynamics()
+
+    dictionary_failed_simulator = PaymentSimulator(
+        G=G,
+        failure_model=DictionaryFailureModel(),
+        network_dynamics=dictionary_failed_dynamics
+    )
+
+    dictionary_failed_result = (
+        dictionary_failed_simulator.simulate_payment(
+            path=path,
+            edges=dictionary_edges,
+            amount=1000,
+            tx_id="TX-DICT-FAIL"
+        )
+    )
+
+    assert dictionary_failed_result.success is False
+    assert (
+        dictionary_failed_result.reason
+        == "channel_failure"
+    )
+
+    assert (
+        dictionary_failed_result.failed_edge[
+            "source"
+        ]
+        == "B"
+    )
+
+    assert (
+        dictionary_failed_result.failed_edge[
+            "target"
+        ]
+        == "C"
+    )
+
+    assert (
+        dictionary_failed_result.failed_edge[
+            "channel_key"
+        ]
+        == 20
+    )
+
+    assert dictionary_failed_result.failure_index == 1
+
+    assert (
+        dictionary_failed_result.visited_edges
+        == [
+            dictionary_edges[0]
+        ]
+    )
+
+    assert (
+        dictionary_failed_dynamics.settlement_calls
+        == 0
+    )
+
+    # --------------------------------------------------------
+    # Final diagnostics
+    # --------------------------------------------------------
+
     print()
     print("Exact channel identity : PASS")
     print("Successful settlement  : PASS")
+    print("Tuple edge format      : PASS")
+    print("Dictionary edge format : PASS")
     print("Failure propagation    : PASS")
+    print("Dictionary failure     : PASS")
     print("No retry               : PASS")
     print("PAYMENT SIMULATOR      : SUCCESS")

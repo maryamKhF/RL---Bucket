@@ -22,7 +22,7 @@ Validated flow
                         Bucket
                            |
                            v
-                  Payment Simulator
+                  Payment Simulation
                            |
                            v
                      Failure Model
@@ -34,7 +34,7 @@ Validated flow
                     Bucket Alternative
                            |
                            v
-                   Payment Simulator
+                   Payment Simulation
                            |
                            v
                        SUCCESS
@@ -49,12 +49,15 @@ Repository invariants
 4. Top-K is channel-aware.
 5. Top-K physical edges are dictionaries.
 6. Bucket stores candidate routes.
-7. PaymentSimulator executes one route per attempt.
+7. Payment simulation executes one route per attempt.
 8. FailureModel evaluates the actual physical edges.
 9. PartialBacktracking reuses an existing Bucket candidate.
 10. No full reroute is required when a valid alternative exists.
+11. Channel capacity is never used as directional liquidity.
+12. No synthetic reliability values are introduced.
+13. The controlled failure is deterministic.
+14. The final successful route must come from the Bucket alternative.
 """
-
 
 import unittest
 from types import SimpleNamespace
@@ -89,19 +92,18 @@ def build_e2e_graph():
 
     Both routes share A -> B.
 
-    The primary route is deliberately cheaper so that it is
-    selected first. The controlled FailureModel then forces
-    B -> C to fail, allowing Partial Backtracking to select
-    the already stored alternative route.
+    The primary route is cheaper than the alternative route.
+    The controlled FailureModel then forces B -> C to fail.
+
+    The alternative route is already present in Top-K/Bucket;
+    therefore Partial Backtracking must reuse it instead of
+    performing a complete reroute.
     """
 
     G = nx.MultiDiGraph()
 
     # --------------------------------------------------------
     # Node metadata
-    #
-    # These fields satisfy the current Network.topology and
-    # Dijkstra requirements.
     # --------------------------------------------------------
 
     node_data = {
@@ -150,7 +152,6 @@ def build_e2e_graph():
     }
 
     for node, attrs in node_data.items():
-
         G.add_node(
             node,
             available=True,
@@ -185,12 +186,9 @@ def build_e2e_graph():
 
     # ========================================================
     # Primary route
-    #
-    # Lower fee -> lower native routing cost.
     # ========================================================
 
     for u, v, key in primary_edges:
-
         G.add_edge(
             u,
             v,
@@ -198,6 +196,7 @@ def build_e2e_graph():
 
             capacity=10000.0,
 
+            # Explicit directional liquidity.
             estimated_liquidity=10000.0,
             balance_uv=10000.0,
 
@@ -208,6 +207,7 @@ def build_e2e_graph():
 
             delay=1.0,
 
+            # Explicit reliability information.
             failure_probability=0.0,
 
             scid=f"{u}-{v}-0",
@@ -215,12 +215,9 @@ def build_e2e_graph():
 
     # ========================================================
     # Alternative route
-    #
-    # Higher fee -> lower priority than primary route.
     # ========================================================
 
     for u, v, key in alternative_edges:
-
         G.add_edge(
             u,
             v,
@@ -228,16 +225,19 @@ def build_e2e_graph():
 
             capacity=10000.0,
 
+            # Explicit directional liquidity.
             estimated_liquidity=10000.0,
             balance_uv=10000.0,
 
             available=True,
 
+            # Higher fee makes this route less preferable.
             fee_base=20.0,
             fee_rate=0.0,
 
             delay=1.0,
 
+            # Explicit reliability information.
             failure_probability=0.0,
 
             scid=f"{u}-{v}-0",
@@ -279,7 +279,7 @@ class ControlledFailureModel(FailureModel):
 
     Any other route succeeds.
 
-    Top-K represents physical edges as dictionaries:
+    Top-K physical edges are dictionaries:
 
         {
             "source": ...,
@@ -288,9 +288,6 @@ class ControlledFailureModel(FailureModel):
             "scid": ...,
             "data": ...
         }
-
-    Therefore this class explicitly normalizes those dictionaries
-    before checking the failed physical channel.
     """
 
     FAILED_EDGE = (
@@ -300,7 +297,6 @@ class ControlledFailureModel(FailureModel):
     )
 
     def __init__(self):
-
         super().__init__(
             node_failure_probability=0.0,
             liquidity_failure_probability=0.0,
@@ -317,13 +313,16 @@ class ControlledFailureModel(FailureModel):
         """
         Evaluate the actual physical route edges.
 
-        The FailureModel returns canonical tuples for failure
-        identification while preserving the original edge
-        dictionaries in visited_edges.
+        The original edge dictionaries are preserved in
+        visited_edges.
+
+        Failed physical channels are represented by the
+        canonical tuple:
+
+            (source, target, channel_key)
         """
 
         if route_edges is None:
-
             return {
                 "success": False,
                 "reason": "invalid_route_edges",
@@ -334,7 +333,6 @@ class ControlledFailureModel(FailureModel):
             route_edges,
             (list, tuple),
         ):
-
             return {
                 "success": False,
                 "reason": "invalid_route_edges",
@@ -345,35 +343,33 @@ class ControlledFailureModel(FailureModel):
 
         for edge in route_edges:
 
-            if not isinstance(
-                edge,
-                dict,
-            ):
-
+            if not isinstance(edge, dict):
                 return {
                     "success": False,
                     "reason": "invalid_edge_format",
                     "visited_edges": [],
                 }
 
+            source = edge.get("source")
+            target = edge.get("target")
+            channel_key = edge.get("channel_key")
+
             normalized_edges.append(
                 (
-                    edge.get("source"),
-                    edge.get("target"),
-                    edge.get("channel_key"),
+                    source,
+                    target,
+                    channel_key,
                 )
             )
 
         # ----------------------------------------------------
-        # Controlled failure
+        # Controlled physical-channel failure
         # ----------------------------------------------------
 
         if self.FAILED_EDGE in normalized_edges:
 
-            failure_index = (
-                normalized_edges.index(
-                    self.FAILED_EDGE
-                )
+            failure_index = normalized_edges.index(
+                self.FAILED_EDGE
             )
 
             return {
@@ -393,9 +389,7 @@ class ControlledFailureModel(FailureModel):
 
                 "visited_edges":
                     list(
-                        route_edges[
-                            :failure_index
-                        ]
+                        route_edges[:failure_index]
                     ),
             }
 
@@ -443,9 +437,8 @@ class DeterministicNetworkDynamics:
         self,
         reset_balances=False,
     ):
-
         self.reset_calls.append(
-            bool(reset_balances)
+            reset_balances
         )
 
     # --------------------------------------------------------
@@ -453,7 +446,6 @@ class DeterministicNetworkDynamics:
     # --------------------------------------------------------
 
     def update(self):
-
         self.update_calls += 1
 
     # --------------------------------------------------------
@@ -465,9 +457,7 @@ class DeterministicNetworkDynamics:
         route_edges,
         amount,
     ):
-
         self.settlement_calls += 1
-
         return True
 
     # --------------------------------------------------------
@@ -479,7 +469,6 @@ class DeterministicNetworkDynamics:
         tx_id,
         result,
     ):
-
         self.payment_records.append(
             {
                 "tx_id": tx_id,
@@ -496,20 +485,14 @@ def make_ppo_config():
     """
     Minimal PPO configuration.
 
-    No training is performed in this E2E test.
+    No PPO training is performed.
 
-    PPO is instantiated and produces the eta action that is
-    passed into RoutingEnv.step().
+    The model is instantiated and produces the eta action
+    consumed by RoutingEnv.step().
     """
 
     return {
-
-        # ----------------------------------------------------
-        # RL
-        # ----------------------------------------------------
-
         "rl": {
-
             "hidden_layers": [
                 16,
                 16,
@@ -540,12 +523,7 @@ def make_ppo_config():
             "eta_max": 1.0,
         },
 
-        # ----------------------------------------------------
-        # Graph / routing
-        # ----------------------------------------------------
-
         "graph": {
-
             "max_hops": 6,
 
             "lambda_h": 1.0,
@@ -555,12 +533,7 @@ def make_ppo_config():
             "neighborhood_m": 3,
         },
 
-        # ----------------------------------------------------
-        # Simulation
-        # ----------------------------------------------------
-
         "simulation": {
-
             "seed": 123,
 
             "node_failure_probability": 0.0,
@@ -579,23 +552,64 @@ def make_ppo_config():
 
 
 # ============================================================
+# Candidate Validation Helpers
+# ============================================================
+
+def physical_channel_identity(edge):
+    """
+    Return the canonical physical-channel identity.
+
+    Top-K edges are dictionaries.
+    """
+
+    if not isinstance(edge, dict):
+        raise AssertionError(
+            "Top-K physical edge must be a dictionary."
+        )
+
+    return (
+        edge.get("source"),
+        edge.get("target"),
+        edge.get("channel_key"),
+        str(edge.get("scid")),
+    )
+
+
+def route_channel_identity(route):
+    """
+    Return the physical-channel identity of a complete route.
+    """
+
+    edges = route.get("edges")
+
+    if not isinstance(edges, (list, tuple)):
+        raise AssertionError(
+            "Route edges must be a list or tuple."
+        )
+
+    return tuple(
+        physical_channel_identity(edge)
+        for edge in edges
+    )
+
+
+# ============================================================
 # E2E Test
 # ============================================================
 
-class EndToEndRoutingTest(
-    unittest.TestCase
-):
+class EndToEndRoutingTest(unittest.TestCase):
 
-    def test_complete_ppo_to_backtracking_pipeline(
-        self,
-    ):
+    def test_complete_ppo_to_backtracking_pipeline(self):
         """
-        Validate the complete pipeline:
+        Validate:
 
             PPO
              |
              v
             eta
+             |
+             v
+        Adaptive Routing
              |
              v
            Top-K
@@ -607,10 +621,10 @@ class EndToEndRoutingTest(
         Payment #1
              |
              v
-          Failure
+           Failure
              |
              v
-        Backtracking
+        Partial Backtracking
              |
              v
         Bucket Alternative
@@ -632,32 +646,42 @@ class EndToEndRoutingTest(
 
         cfg = make_ppo_config()
 
-        failure_model = (
-            ControlledFailureModel()
-        )
+        failure_model = ControlledFailureModel()
 
         network_dynamics = (
             DeterministicNetworkDynamics()
         )
 
+        expected_primary_path = [
+            "A",
+            "B",
+            "C",
+            "D",
+            "E",
+        ]
+
+        expected_alternative_path = [
+            "A",
+            "B",
+            "F",
+            "G",
+            "E",
+        ]
+
         # ====================================================
         # 1. Dijkstra
         # ====================================================
 
-        dijkstra = Dijkstra(
-            G
-        )
+        dijkstra = Dijkstra(G)
 
-        dijkstra_result = (
-            dijkstra.shortest_path(
-                source=tx.source,
-                target=tx.destination,
-                amount=tx.amount,
-                heuristic_fn=lnd_cost,
-                eta=0.5,
-                max_hops=6,
-                lambda_h=1.0,
-            )
+        dijkstra_result = dijkstra.shortest_path(
+            source=tx.source,
+            target=tx.destination,
+            amount=tx.amount,
+            heuristic_fn=lnd_cost,
+            eta=0.5,
+            max_hops=6,
+            lambda_h=1.0,
         )
 
         self.assertIsInstance(
@@ -676,14 +700,6 @@ class EndToEndRoutingTest(
         dijkstra_path = list(
             dijkstra_result["path"]
         )
-
-        expected_primary_path = [
-            "A",
-            "B",
-            "C",
-            "D",
-            "E",
-        ]
 
         self.assertEqual(
             dijkstra_path,
@@ -722,6 +738,15 @@ class EndToEndRoutingTest(
             ),
         )
 
+        # ----------------------------------------------------
+        # Fixed k invariant
+        # ----------------------------------------------------
+
+        self.assertLessEqual(
+            len(candidates),
+            5,
+        )
+
         # ====================================================
         # 3. Dijkstra / Top-K consistency
         # ====================================================
@@ -731,9 +756,10 @@ class EndToEndRoutingTest(
             dijkstra_path,
         )
 
-        # Top-K edges are dictionaries, not tuples.
+        first_candidate = candidates[0]
+
         first_candidate_edge = (
-            candidates[0]["edges"][0]
+            first_candidate["edges"][0]
         )
 
         self.assertIsInstance(
@@ -762,16 +788,64 @@ class EndToEndRoutingTest(
         )
 
         # ====================================================
-        # 4. Verify alternative candidate
+        # 4. Validate all candidate physical edges
         # ====================================================
 
-        expected_alternative_path = [
-            "A",
-            "B",
-            "F",
-            "G",
-            "E",
-        ]
+        channel_identities = []
+
+        for candidate in candidates:
+
+            self.assertIsInstance(
+                candidate,
+                dict,
+            )
+
+            self.assertTrue(
+                candidate.get("candidate"),
+            )
+
+            self.assertEqual(
+                candidate.get("eta"),
+                eta_for_consistency,
+            )
+
+            self.assertEqual(
+                candidate.get("lambda_h"),
+                1.0,
+            )
+
+            edges = candidate.get("edges")
+
+            self.assertIsInstance(
+                edges,
+                list,
+            )
+
+            self.assertGreater(
+                len(edges),
+                0,
+            )
+
+            identity = route_channel_identity(
+                candidate
+            )
+
+            channel_identities.append(
+                identity
+            )
+
+        self.assertEqual(
+            len(channel_identities),
+            len(set(channel_identities)),
+            msg=(
+                "Top-K returned duplicate physical "
+                "channel routes."
+            ),
+        )
+
+        # ====================================================
+        # 5. Verify alternative candidate
+        # ====================================================
 
         candidate_paths = [
             list(candidate["path"])
@@ -788,7 +862,7 @@ class EndToEndRoutingTest(
         )
 
         # ====================================================
-        # 5. ETA effect
+        # 6. ETA effect
         # ====================================================
 
         candidates_eta_0 = top_k_paths(
@@ -856,8 +930,7 @@ class EndToEndRoutingTest(
                 costs_eta_0[path]
                 -
                 costs_eta_1[path]
-            )
-            > 1e-9
+            ) > 1e-9
             for path in common_routes
         )
 
@@ -870,7 +943,7 @@ class EndToEndRoutingTest(
         )
 
         # ====================================================
-        # 6. Routing Environment
+        # 7. Routing Environment
         # ====================================================
 
         env = RoutingEnv(
@@ -885,13 +958,11 @@ class EndToEndRoutingTest(
         try:
 
             # =================================================
-            # 7. Reset
+            # 8. Reset
             # =================================================
 
-            observation, reset_info = (
-                env.reset(
-                    seed=123
-                )
+            observation, reset_info = env.reset(
+                seed=123
             )
 
             self.assertIsInstance(
@@ -910,7 +981,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 8. PPO
+            # 9. PPO
             # =================================================
 
             ppo_model = build_ppo(
@@ -919,11 +990,9 @@ class EndToEndRoutingTest(
                 seed=123,
             )
 
-            ppo_action, _ = (
-                ppo_model.predict(
-                    observation,
-                    deterministic=True,
-                )
+            ppo_action, _ = ppo_model.predict(
+                observation,
+                deterministic=True,
             )
 
             ppo_action = np.asarray(
@@ -951,7 +1020,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 9. Actual Environment Pipeline
+            # 10. Actual Environment Pipeline
             # =================================================
 
             (
@@ -964,8 +1033,13 @@ class EndToEndRoutingTest(
                 ppo_action
             )
 
+            self.assertIsInstance(
+                info,
+                dict,
+            )
+
             # =================================================
-            # 10. PPO -> eta
+            # 11. PPO -> eta
             # =================================================
 
             self.assertAlmostEqual(
@@ -975,7 +1049,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 11. Fixed Top-K
+            # 12. Fixed Top-K
             # =================================================
 
             self.assertEqual(
@@ -994,31 +1068,26 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 12. Bucket
+            # 13. Bucket
             # =================================================
-
-            self.assertGreaterEqual(
-                info["bucket_size"],
-                2,
-            )
 
             self.assertIsInstance(
                 env.current_bucket,
                 Bucket,
             )
 
-            # At least two attempts are required:
-            #
-            #   1. primary route
-            #   2. alternative route
-            #
+            self.assertGreaterEqual(
+                info["bucket_size"],
+                2,
+            )
+
             self.assertGreaterEqual(
                 env.current_bucket.attempts,
                 2,
             )
 
             # =================================================
-            # 13. Failure + Partial Backtracking
+            # 14. Failure + Partial Backtracking
             # =================================================
 
             self.assertGreaterEqual(
@@ -1037,7 +1106,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 14. No full reroute
+            # 15. No full reroute
             # =================================================
 
             self.assertEqual(
@@ -1050,7 +1119,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 15. Final payment
+            # 16. Final payment
             # =================================================
 
             self.assertTrue(
@@ -1071,7 +1140,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 16. Final path
+            # 17. Final path
             # =================================================
 
             final_path = list(
@@ -1094,7 +1163,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 17. PaymentSimulator execution
+            # 18. Payment Simulator execution
             # =================================================
 
             self.assertGreaterEqual(
@@ -1109,22 +1178,20 @@ class EndToEndRoutingTest(
                 2,
             )
 
-            # Only the successful second payment reaches
-            # settlement.
-
+            # Only the successful attempt settles.
             self.assertEqual(
                 network_dynamics.settlement_calls,
                 1,
             )
 
             # =================================================
-            # 18. Recorded payment results
+            # 19. Recorded payment results
             # =================================================
 
             recorded_results = [
                 record["result"]
-                for record in
-                network_dynamics.payment_records
+                for record
+                in network_dynamics.payment_records
             ]
 
             self.assertGreaterEqual(
@@ -1171,7 +1238,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 19. Final environment outputs
+            # 20. Final environment outputs
             # =================================================
 
             self.assertIsInstance(
@@ -1194,7 +1261,7 @@ class EndToEndRoutingTest(
             )
 
             # =================================================
-            # 20. PASS summary
+            # 21. PASS summary
             # =================================================
 
             print()
@@ -1285,7 +1352,6 @@ class EndToEndRoutingTest(
 # ============================================================
 
 if __name__ == "__main__":
-
     unittest.main(
         verbosity=2
     )

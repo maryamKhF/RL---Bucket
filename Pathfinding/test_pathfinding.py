@@ -1,3 +1,4 @@
+
 # Pathfinding/test_pathfinding.py
 
 import math
@@ -97,6 +98,110 @@ def safe_float(
 
 
 # ==========================================================
+# Strict Boolean Validation
+# ==========================================================
+
+def strict_bool(
+    value,
+    field_name,
+):
+    """
+    Accept actual Boolean values only.
+
+    Invalid examples:
+
+        "true"
+        "false"
+        0
+        1
+        None
+    """
+
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{field_name} must be a Boolean value, "
+            f"got {value!r}"
+        )
+
+    return value
+
+
+# ==========================================================
+# Edge Record Helper
+# ==========================================================
+
+def get_edge_identity(
+    edge,
+):
+    """
+    Extract the canonical edge identity from a Top-K edge
+    dictionary.
+
+    Current Top-K edge contract:
+
+        {
+            "source": ...,
+            "target": ...,
+            "channel_key": ...,
+            "scid": ...
+        }
+
+    Returns:
+
+        source,
+        target,
+        channel_key
+
+    or:
+
+        None, None, None
+
+    if the edge record is invalid.
+    """
+
+    if not isinstance(
+        edge,
+        dict,
+    ):
+        return (
+            None,
+            None,
+            None,
+        )
+
+    source = edge.get(
+        "source"
+    )
+
+    target = edge.get(
+        "target"
+    )
+
+    channel_key = edge.get(
+        "channel_key"
+    )
+
+    if (
+        source is None
+        or
+        target is None
+        or
+        channel_key is None
+    ):
+        return (
+            None,
+            None,
+            None,
+        )
+
+    return (
+        source,
+        target,
+        channel_key,
+    )
+
+
+# ==========================================================
 # Directional Liquidity Helper
 # ==========================================================
 
@@ -106,22 +211,27 @@ def get_directional_liquidity(
     """
     Return explicitly available directional liquidity.
 
+    This schema is aligned with top_k_paths.py.
+
+    Supported explicit attributes:
+
+        estimated_liquidity
+        liquidity_uv
+        balance_uv
+
     IMPORTANT:
 
         Channel capacity is NOT interpreted as directional
         liquidity.
 
-    The function only accepts attributes that explicitly
-    represent directional/local liquidity.
-
-    If no such attribute exists, liquidity is UNKNOWN.
+    If no explicit directional liquidity exists,
+    the result is UNKNOWN.
     """
 
     explicit_keys = (
-        "liquidity",
-        "liquidity_msat",
-        "local_balance",
-        "local_balance_msat",
+        "estimated_liquidity",
+        "liquidity_uv",
+        "balance_uv",
     )
 
     for key in explicit_keys:
@@ -146,7 +256,7 @@ def get_directional_liquidity(
         if not math.isfinite(value):
             continue
 
-        if value < 0:
+        if value < 0.0:
             continue
 
         return value
@@ -164,37 +274,139 @@ def get_channel_reliability(
     """
     Return an explicitly available channel reliability.
 
-    The current test does NOT assume a specific reliability
-    model inside heuristics.py.
+    The current Top-K implementation supports:
 
-    Supported explicit attributes:
+        success_count + failure_count
+
+    or:
+
+        failure_probability
+
+    This helper mirrors that contract.
+
+    Additional explicit reliability aliases are accepted only
+    for diagnostic reporting:
 
         reliability
         reliability_score
         success_rate
 
-    If the dataset does not contain one of these attributes,
-    reliability is reported as UNKNOWN.
-
-    This is intentionally conservative: missing reliability
-    information is not converted into an artificial value.
+    Missing reliability remains UNKNOWN.
     """
 
-    explicit_keys = (
+    # ------------------------------------------------------
+    # Empirical success/failure history
+    # ------------------------------------------------------
+
+    has_success = (
+        "success_count"
+        in data
+    )
+
+    has_failure = (
+        "failure_count"
+        in data
+    )
+
+    if (
+        has_success
+        or
+        has_failure
+    ):
+
+        try:
+            success = float(
+                data.get(
+                    "success_count",
+                    0.0,
+                )
+            )
+
+            failure = float(
+                data.get(
+                    "failure_count",
+                    0.0,
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            success = None
+            failure = None
+
+        if (
+            success is not None
+            and
+            failure is not None
+            and
+            math.isfinite(success)
+            and
+            math.isfinite(failure)
+            and
+            success >= 0.0
+            and
+            failure >= 0.0
+        ):
+
+            total = (
+                success
+                +
+                failure
+            )
+
+            if total > 0.0:
+
+                return (
+                    success
+                    /
+                    total
+                )
+
+    # ------------------------------------------------------
+    # Explicit failure probability
+    # ------------------------------------------------------
+
+    if "failure_probability" in data:
+
+        value = data.get(
+            "failure_probability"
+        )
+
+        try:
+            value = float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            value = None
+
+        if (
+            value is not None
+            and
+            math.isfinite(value)
+            and
+            0.0 <= value <= 1.0
+        ):
+
+            return 1.0 - value
+
+    # ------------------------------------------------------
+    # Diagnostic aliases
+    # ------------------------------------------------------
+
+    for key in (
         "reliability",
         "reliability_score",
         "success_rate",
-    )
-
-    for key in explicit_keys:
+    ):
 
         if key not in data:
             continue
 
         value = data.get(key)
-
-        if value is None:
-            continue
 
         try:
             value = float(value)
@@ -205,21 +417,292 @@ def get_channel_reliability(
         ):
             continue
 
-        if not math.isfinite(value):
-            continue
-
-        if not (
-            0.0
-            <=
-            value
-            <=
-            1.0
+        if (
+            math.isfinite(value)
+            and
+            0.0 <= value <= 1.0
         ):
-            continue
 
-        return value
+            return value
 
     return None
+
+
+# ==========================================================
+# Routing Data Readiness
+# ==========================================================
+
+def validate_routing_data_readiness(
+    G,
+):
+    """
+    Verify whether the graph contains the routing data
+    required by top_k_paths.py.
+
+    Required per usable channel:
+
+        directional liquidity
+        OR
+        explicit reliability information
+
+    IMPORTANT:
+
+        capacity is NOT accepted as directional liquidity.
+
+    This function does not modify the graph and does not
+    synthesize missing values.
+
+    Returns:
+
+        {
+            "ready": bool,
+            "total_edges": int,
+            "available_edges": int,
+            "liquidity_known": int,
+            "liquidity_unknown": int,
+            "reliability_known": int,
+            "reliability_unknown": int,
+            "both_known": int,
+            "capacity_only": int,
+        }
+    """
+
+    total_edges = 0
+    available_edges = 0
+
+    liquidity_known = 0
+    liquidity_unknown = 0
+
+    reliability_known = 0
+    reliability_unknown = 0
+
+    both_known = 0
+    capacity_only = 0
+
+    for (
+        _,
+        _,
+        _,
+        data,
+    ) in G.edges(
+        keys=True,
+        data=True,
+    ):
+
+        total_edges += 1
+
+        # --------------------------------------------------
+        # Availability
+        # --------------------------------------------------
+
+        if "available" in data:
+
+            available = strict_bool(
+                data["available"],
+                "edge.available",
+            )
+
+        else:
+
+            available = True
+
+        if not available:
+            continue
+
+        available_edges += 1
+
+        # --------------------------------------------------
+        # Directional liquidity
+        # --------------------------------------------------
+
+        liquidity = get_directional_liquidity(
+            data
+        )
+
+        if liquidity is not None:
+
+            liquidity_known += 1
+
+        else:
+
+            liquidity_unknown += 1
+
+            if "capacity" in data:
+
+                capacity_only += 1
+
+        # --------------------------------------------------
+        # Reliability
+        # --------------------------------------------------
+
+        reliability = get_channel_reliability(
+            data
+        )
+
+        if reliability is not None:
+
+            reliability_known += 1
+
+        else:
+
+            reliability_unknown += 1
+
+        # --------------------------------------------------
+        # Complete routing information
+        # --------------------------------------------------
+
+        if (
+            liquidity is not None
+            and
+            reliability is not None
+        ):
+
+            both_known += 1
+
+    # ------------------------------------------------------
+    # Current Top-K contract
+    # ------------------------------------------------------
+
+    ready = (
+        available_edges > 0
+        and
+        liquidity_known > 0
+        and
+        reliability_known > 0
+    )
+
+    return {
+        "ready": ready,
+        "total_edges": total_edges,
+        "available_edges": available_edges,
+        "liquidity_known": liquidity_known,
+        "liquidity_unknown": liquidity_unknown,
+        "reliability_known": reliability_known,
+        "reliability_unknown": reliability_unknown,
+        "both_known": both_known,
+        "capacity_only": capacity_only,
+    }
+
+
+# ==========================================================
+# Print Routing Data Readiness
+# ==========================================================
+
+def print_routing_data_readiness(
+    G,
+):
+    """
+    Print routing-data readiness before Top-K execution.
+
+    This prevents a raw GML data problem from being reported
+    as an algorithmic Top-K failure.
+    """
+
+    print_header(
+        "4. ROUTING DATA READINESS"
+    )
+
+    readiness = validate_routing_data_readiness(
+        G
+    )
+
+    print(
+        f"Total channels           : "
+        f"{readiness['total_edges']:,}"
+    )
+
+    print(
+        f"Available channels       : "
+        f"{readiness['available_edges']:,}"
+    )
+
+    print()
+
+    print(
+        "Directional liquidity:"
+    )
+
+    print(
+        f"  Known                  : "
+        f"{readiness['liquidity_known']:,}"
+    )
+
+    print(
+        f"  Unknown                : "
+        f"{readiness['liquidity_unknown']:,}"
+    )
+
+    print(
+        f"  Capacity only          : "
+        f"{readiness['capacity_only']:,}"
+    )
+
+    print()
+
+    print(
+        "Channel reliability:"
+    )
+
+    print(
+        f"  Known                  : "
+        f"{readiness['reliability_known']:,}"
+    )
+
+    print(
+        f"  Unknown                : "
+        f"{readiness['reliability_unknown']:,}"
+    )
+
+    print()
+
+    print(
+        f"Channels with both      : "
+        f"{readiness['both_known']:,}"
+    )
+
+    print()
+
+    print(
+        "Data-readiness status   : "
+        f"{'READY' if readiness['ready'] else 'NOT READY'}"
+    )
+
+    if not readiness["ready"]:
+
+        print()
+        print(
+            "Top-K execution is skipped."
+        )
+
+        print(
+            "Reason:"
+        )
+
+        if readiness["liquidity_known"] == 0:
+
+            print(
+                "  - No explicit directional liquidity "
+                "is available."
+            )
+
+        if readiness["reliability_known"] == 0:
+
+            print(
+                "  - No explicit channel reliability "
+                "information is available."
+            )
+
+        print()
+        print(
+            "Channel capacity is NOT used as a "
+            "directional-liquidity fallback."
+        )
+
+        print(
+            "No synthetic routing values are created."
+        )
+
+    return readiness
 
 
 # ==========================================================
@@ -423,19 +906,27 @@ def print_graph_statistics(
             node
         ]
 
-        online = bool(
-            data.get(
-                "online",
-                True,
-            )
-        )
+        if "online" in data:
 
-        available = bool(
-            data.get(
-                "available",
-                True,
+            online = strict_bool(
+                data["online"],
+                "node.online",
             )
-        )
+
+        else:
+
+            online = True
+
+        if "available" in data:
+
+            available = strict_bool(
+                data["available"],
+                "node.available",
+            )
+
+        else:
+
+            available = True
 
         if online:
             online_nodes += 1
@@ -464,12 +955,16 @@ def print_graph_statistics(
         data=True,
     ):
 
-        available = bool(
-            data.get(
-                "available",
-                True,
+        if "available" in data:
+
+            available = strict_bool(
+                data["available"],
+                "edge.available",
             )
-        )
+
+        else:
+
+            available = True
 
         if available:
             available_edges += 1
@@ -626,6 +1121,50 @@ def print_graph_statistics(
         "as directional liquidity."
     )
 
+    # ======================================================
+    # Reliability
+    # ======================================================
+
+    known_reliability = 0
+    unknown_reliability = 0
+
+    for (
+        _,
+        _,
+        _,
+        data,
+    ) in G.edges(
+        keys=True,
+        data=True,
+    ):
+
+        reliability = get_channel_reliability(
+            data
+        )
+
+        if reliability is not None:
+
+            known_reliability += 1
+
+        else:
+
+            unknown_reliability += 1
+
+    print()
+    print(
+        "Channel reliability:"
+    )
+
+    print(
+        f"  Known                    : "
+        f"{known_reliability:,}"
+    )
+
+    print(
+        f"  Unknown                  : "
+        f"{unknown_reliability:,}"
+    )
+
 
 # ==========================================================
 # Select Source / Destination
@@ -747,6 +1286,15 @@ def validate_route(
     """
     Validate structural consistency of one candidate route.
 
+    Current Top-K edge representation:
+
+        {
+            "source": ...,
+            "target": ...,
+            "channel_key": ...,
+            "scid": ...
+        }
+
     This test does NOT execute the payment.
     """
 
@@ -798,9 +1346,18 @@ def validate_route(
 
         return False, "missing_hop_count"
 
-    hop_count = int(
-        hop_count
-    )
+    try:
+
+        hop_count = int(
+            hop_count
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return False, "invalid_hop_count"
 
     if (
         len(path) - 1
@@ -834,14 +1391,32 @@ def validate_route(
         edges
     ):
 
-        if len(edge) != 3:
+        if not isinstance(
+            edge,
+            dict,
+        ):
 
             return (
                 False,
                 f"invalid_edge_format:{edge}",
             )
 
-        u, v, key = edge
+        u, v, key = get_edge_identity(
+            edge
+        )
+
+        if (
+            u is None
+            or
+            v is None
+            or
+            key is None
+        ):
+
+            return (
+                False,
+                f"missing_edge_identity:{edge}",
+            )
 
         expected_u = path[
             index
@@ -886,15 +1461,62 @@ def validate_route(
         data = G[u][v][key]
 
         # --------------------------------------------------
+        # SCID consistency
+        # --------------------------------------------------
+
+        edge_scid = edge.get(
+            "scid"
+        )
+
+        graph_scid = data.get(
+            "scid"
+        )
+
+        if (
+            edge_scid is not None
+            and
+            graph_scid is not None
+            and
+            str(edge_scid)
+            !=
+            str(graph_scid)
+        ):
+
+            return (
+                False,
+                f"scid_mismatch:"
+                f"{u}->{v}:{key}:"
+                f"edge={edge_scid},"
+                f"graph={graph_scid}",
+            )
+
+        # --------------------------------------------------
         # Channel availability
         # --------------------------------------------------
 
-        if not bool(
-            data.get(
-                "available",
-                True,
-            )
-        ):
+        if "available" in data:
+
+            try:
+
+                available = strict_bool(
+                    data["available"],
+                    "edge.available",
+                )
+
+            except ValueError as exc:
+
+                return (
+                    False,
+                    f"invalid_channel_availability:"
+                    f"{u}->{v}:{key}:"
+                    f"{exc}",
+                )
+
+        else:
+
+            available = True
+
+        if not available:
 
             return (
                 False,
@@ -906,24 +1528,56 @@ def validate_route(
         # Node availability
         # --------------------------------------------------
 
-        if not bool(
-            G.nodes[u].get(
-                "online",
-                True,
-            )
-        ):
+        if "online" in G.nodes[u]:
+
+            try:
+
+                source_online = strict_bool(
+                    G.nodes[u]["online"],
+                    "node.online",
+                )
+
+            except ValueError as exc:
+
+                return (
+                    False,
+                    f"invalid_source_node_state:"
+                    f"{u}:{exc}",
+                )
+
+        else:
+
+            source_online = True
+
+        if not source_online:
 
             return (
                 False,
                 f"source_node_offline:{u}",
             )
 
-        if not bool(
-            G.nodes[v].get(
-                "online",
-                True,
-            )
-        ):
+        if "online" in G.nodes[v]:
+
+            try:
+
+                target_online = strict_bool(
+                    G.nodes[v]["online"],
+                    "node.online",
+                )
+
+            except ValueError as exc:
+
+                return (
+                    False,
+                    f"invalid_target_node_state:"
+                    f"{v}:{exc}",
+                )
+
+        else:
+
+            target_online = True
+
+        if not target_online:
 
             return (
                 False,
@@ -1127,55 +1781,105 @@ def print_route(
         edges
     ):
 
-        if len(edge) == 3:
+        if not isinstance(
+            edge,
+            dict,
+        ):
 
-            u, v, key = edge
-
-            data = G[u][v][key]
-
-            fee = channel_fee(
-                data,
-                AMOUNT,
+            print(
+                f"  {index + 1:02d}. "
+                f"INVALID EDGE RECORD: "
+                f"{edge}"
             )
 
-            reliability = get_channel_reliability(
-                data
+            continue
+
+        u, v, key = get_edge_identity(
+            edge
+        )
+
+        if (
+            u is None
+            or
+            v is None
+            or
+            key is None
+        ):
+
+            print(
+                f"  {index + 1:02d}. "
+                f"INVALID EDGE RECORD: "
+                f"{edge}"
             )
 
-            liquidity = get_directional_liquidity(
-                data
-            )
+            continue
 
-            reliability_text = (
-                "unknown"
-                if reliability is None
-                else f"{reliability:.6f}"
-            )
-
-            liquidity_text = (
-                "unknown"
-                if liquidity is None
-                else f"{liquidity:.4f}"
-            )
+        if not G.has_edge(
+            u,
+            v,
+        ):
 
             print(
                 f"  {index + 1:02d}. "
                 f"{u} -> {v} "
-                f"(channel={key})"
+                f"(missing graph edge)"
             )
 
-            print(
-                f"       fee={fee:.4f}, "
-                f"reliability={reliability_text}, "
-                f"liquidity={liquidity_text}"
-            )
+            continue
 
-        else:
+        if key not in G[u][v]:
 
             print(
                 f"  {index + 1:02d}. "
-                f"{edge}"
+                f"{u} -> {v} "
+                f"(missing channel={key})"
             )
+
+            continue
+
+        data = G[u][v][key]
+
+        fee = channel_fee(
+            data,
+            AMOUNT,
+        )
+
+        reliability = get_channel_reliability(
+            data
+        )
+
+        liquidity = get_directional_liquidity(
+            data
+        )
+
+        reliability_text = (
+            "unknown"
+            if reliability is None
+            else f"{reliability:.6f}"
+        )
+
+        liquidity_text = (
+            "unknown"
+            if liquidity is None
+            else f"{liquidity:.4f}"
+        )
+
+        scid = edge.get(
+            "scid",
+            data.get("scid"),
+        )
+
+        print(
+            f"  {index + 1:02d}. "
+            f"{u} -> {v} "
+            f"(channel={key}, scid={scid})"
+        )
+
+        print(
+            f"       fee={fee:.4f}, "
+            f"reliability={reliability_text}, "
+            f"liquidity={liquidity_text}"
+        )
 
     # ======================================================
     # Route Metrics
@@ -1448,34 +2152,87 @@ def validate_k(
 ):
     """
     Verify that the number of returned routes does not exceed
-    K and that every returned route is unique by node path.
+    K and that every returned route is unique by physical
+    channel identity.
+
+    Two candidates with the same node sequence but different
+    physical channels are considered distinct.
     """
 
     if len(routes) > requested_k:
 
         return False, "more_routes_than_requested"
 
-    paths = []
+    channel_paths = []
 
     for route in routes:
 
-        path = tuple(
-            route.get(
-                "path",
-                [],
-            )
+        edges = route.get(
+            "edges",
+            [],
         )
 
-        if not path:
+        if not edges:
 
-            return False, "empty_candidate_path"
+            return False, "empty_candidate_edges"
 
-        if path in paths:
+        identity = []
 
-            return False, "duplicate_candidate_path"
+        for edge in edges:
 
-        paths.append(
-            path
+            if not isinstance(
+                edge,
+                dict,
+            ):
+
+                return (
+                    False,
+                    f"invalid_edge_format:{edge}",
+                )
+
+            u, v, key = get_edge_identity(
+                edge
+            )
+
+            if (
+                u is None
+                or
+                v is None
+                or
+                key is None
+            ):
+
+                return (
+                    False,
+                    f"missing_edge_identity:{edge}",
+                )
+
+            identity.append(
+                (
+                    u,
+                    v,
+                    str(key),
+                    str(
+                        edge.get(
+                            "scid"
+                        )
+                    ),
+                )
+            )
+
+        identity = tuple(
+            identity
+        )
+
+        if identity in channel_paths:
+
+            return (
+                False,
+                "duplicate_physical_channel_candidate",
+            )
+
+        channel_paths.append(
+            identity
         )
 
     return True, "OK"
@@ -1570,7 +2327,34 @@ def validate_adaptive_cost(
 
     recomputed_cost = 0.0
 
-    for u, v, key in edges:
+    for edge in edges:
+
+        if not isinstance(
+            edge,
+            dict,
+        ):
+
+            return (
+                False,
+                f"invalid_edge_format:{edge}",
+            )
+
+        u, v, key = get_edge_identity(
+            edge
+        )
+
+        if (
+            u is None
+            or
+            v is None
+            or
+            key is None
+        ):
+
+            return (
+                False,
+                f"missing_edge_identity:{edge}",
+            )
 
         if not G.has_edge(
             u,
@@ -1590,10 +2374,6 @@ def validate_adaptive_cost(
             )
 
         data = G[u][v][key]
-
-        # --------------------------------------------------
-        # Shared adaptive cost helper
-        # --------------------------------------------------
 
         result = adaptive_edge_cost(
             G=G,
@@ -1659,10 +2439,6 @@ def validate_adaptive_cost(
                 f"non_finite_edge_cost:"
                 f"{u}->{v}:{key}",
             )
-
-        # --------------------------------------------------
-        # Edge-level penalty invariant
-        # --------------------------------------------------
 
         if not (
             0.0
@@ -1786,7 +2562,51 @@ def validate_edge_level_adaptive_formula(
             f"invalid_parameters:{exc}",
         )
 
-    for u, v, key in edges:
+    for edge in edges:
+
+        if not isinstance(
+            edge,
+            dict,
+        ):
+
+            return (
+                False,
+                f"invalid_edge_format:{edge}",
+            )
+
+        u, v, key = get_edge_identity(
+            edge
+        )
+
+        if (
+            u is None
+            or
+            v is None
+            or
+            key is None
+        ):
+
+            return (
+                False,
+                f"missing_edge_identity:{edge}",
+            )
+
+        if not G.has_edge(
+            u,
+            v,
+        ):
+
+            return (
+                False,
+                f"missing_edge:{u}->{v}",
+            )
+
+        if key not in G[u][v]:
+
+            return (
+                False,
+                f"missing_channel:{u}->{v}:{key}",
+            )
 
         data = G[u][v][key]
 
@@ -1800,6 +2620,16 @@ def validate_edge_level_adaptive_formula(
             heuristic_fn=lnd_cost,
             lambda_h=lambda_h,
         )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+
+            return (
+                False,
+                "adaptive_edge_cost_invalid_return_type",
+            )
 
         native_cost = safe_float(
             result.get(
@@ -1828,6 +2658,22 @@ def validate_edge_level_adaptive_formula(
             ),
             default=float("nan"),
         )
+
+        if not all(
+            math.isfinite(value)
+            for value in (
+                native_cost,
+                raw_h,
+                reported_penalty,
+                reported_cost,
+            )
+        ):
+
+            return (
+                False,
+                f"non_finite_formula_values:"
+                f"edge={u}->{v}:{key}",
+            )
 
         expected_penalty = (
             abs(raw_h)
@@ -1944,11 +2790,78 @@ def main():
     )
 
     # ======================================================
-    # 4. Run Top-K Pathfinding
+    # 4. Routing Data Readiness
+    # ======================================================
+
+    readiness = print_routing_data_readiness(
+        G
+    )
+
+    if not readiness["ready"]:
+
+        print()
+        print_separator(
+            "!",
+            78,
+        )
+
+        print(
+            "PATHFINDING STATUS : DATA NOT READY"
+        )
+
+        print_separator(
+            "!",
+            78,
+        )
+
+        print()
+        print(
+            "The raw GML snapshot does not contain the "
+            "routing data required by top_k_paths.py."
+        )
+
+        print()
+        print(
+            "No directional-liquidity fallback was applied."
+        )
+
+        print(
+            "Channel capacity was NOT interpreted as "
+            "directional liquidity."
+        )
+
+        print(
+            "No synthetic reliability value was introduced."
+        )
+
+        print()
+        print(
+            "The Top-K algorithm was therefore not executed."
+        )
+
+        print()
+        print(
+            "This is a data-readiness condition, not an "
+            "algorithmic Top-K exception."
+        )
+
+        print()
+        print_separator()
+
+        print(
+            " END OF TOP-K PATHFINDING TEST "
+        )
+
+        print_separator()
+
+        return
+
+    # ======================================================
+    # 5. Run Top-K Pathfinding
     # ======================================================
 
     print_header(
-        "4. RUN TOP-K PATHFINDING"
+        "5. RUN TOP-K PATHFINDING"
     )
 
     print(
@@ -2050,7 +2963,7 @@ def main():
         raise
 
     # ======================================================
-    # 5. Number of routes
+    # 6. Number of routes
     # ======================================================
 
     print()
@@ -2060,11 +2973,11 @@ def main():
     )
 
     # ======================================================
-    # 6. Route validation
+    # 7. Route validation
     # ======================================================
 
     print_header(
-        "6. VALIDATE CANDIDATE ROUTES"
+        "7. VALIDATE CANDIDATE ROUTES"
     )
 
     structural_pass = 0
@@ -2131,11 +3044,11 @@ def main():
     )
 
     # ======================================================
-    # 7. Print routes
+    # 8. Print routes
     # ======================================================
 
     print_header(
-        "7. CANDIDATE ROUTES"
+        "8. CANDIDATE ROUTES"
     )
 
     for rank, route in enumerate(
@@ -2152,7 +3065,7 @@ def main():
         )
 
     # ======================================================
-    # 8. Summary
+    # 9. Summary
     # ======================================================
 
     print_summary(
@@ -2160,11 +3073,11 @@ def main():
     )
 
     # ======================================================
-    # 9. Cost Ordering
+    # 10. Cost Ordering
     # ======================================================
 
     print_header(
-        "8. ROUTE ORDER VALIDATION"
+        "9. ROUTE ORDER VALIDATION"
     )
 
     ordered = validate_cost_order(
@@ -2194,11 +3107,11 @@ def main():
             )
 
     # ======================================================
-    # 10. K Validation
+    # 11. K Validation
     # ======================================================
 
     print_header(
-        "9. TOP-K VALIDATION"
+        "10. TOP-K VALIDATION"
     )
 
     k_valid, k_reason = validate_k(
@@ -2219,11 +3132,11 @@ def main():
         )
 
     # ======================================================
-    # 11. Adaptive Cost Validation
+    # 12. Adaptive Cost Validation
     # ======================================================
 
     print_header(
-        "10. ADAPTIVE COST VALIDATION"
+        "11. ADAPTIVE COST VALIDATION"
     )
 
     adaptive_pass = 0
@@ -2288,11 +3201,11 @@ def main():
     )
 
     # ======================================================
-    # 12. Final Result
+    # 13. Final Result
     # ======================================================
 
     print_header(
-        "11. TEST RESULT"
+        "12. TEST RESULT"
     )
 
     if not routes:

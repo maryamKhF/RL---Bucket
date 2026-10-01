@@ -65,7 +65,7 @@ class RoutingEnv(gym.Env):
     """
     PPO environment for adaptive Lightning routing.
 
-    PPO controls ONLY eta.
+    PPO controls only eta.
 
     Fixed routing configuration:
 
@@ -73,96 +73,63 @@ class RoutingEnv(gym.Env):
 
     Complete routing pipeline:
 
-        Network State
-             |
-             v
-           PPO
-             |
-             v
-            eta
-             |
-             v
-        Top-K Paths
-          k = 5
-             |
-             v
-       CandidateManager
-             |
-             v
-           Bucket
-             |
-             v
-      Payment Simulator
-             |
-          Failure?
-          /      \
-        No        Yes
-        |          |
-        v          v
-     Success   Partial Backtrack
-                   |
-                   v
-             Bucket Alternative
-                   |
-                Failed?
-                /     \
-              No       Yes
-              |         |
-              v         v
-           Success   Full Reroute
-                        |
-                        v
-                    Top-K again
-                        |
-                        v
+        PPO
+          |
+          v
+        eta
+          |
+          v
+        Top-K
+          |
+          v
+        CandidateManager
+          |
+          v
+        Bucket
+          |
+          v
+        PaymentSimulator
+          |
+       Failure?
+        /    \
+      No      Yes
+      |        |
+      v        v
+    Success  PartialBacktrack
+               |
+               v
+         Bucket Alternative
+               |
+               v
+          PaymentSimulator
+             /       \
+          Success   Failure
+             |         |
+             v         v
+          Finish    Full Reroute
+                       |
+                       v
+                     Top-K
+                       |
+                       v
+                    Bucket
+                       |
+                       v
                     Payment
-             |
-             v
-          Reward
 
-    Bucket lifecycle
-    ----------------
-    current_bucket:
-        Active Bucket belonging to the transaction currently
-        being executed.
+    Important lifecycle rule
+    ------------------------
+    self.current_bucket and self.bucket reference the actual
+    Bucket that participated in the completed step.
 
-    bucket:
-        Last real Bucket created by the routing pipeline.
-
-        It is deliberately preserved after step() so that
-        End-to-End tests and diagnostics can inspect the actual
-        Bucket that participated in the pipeline.
-
-        It is cleared:
-            - during reset()
-            - at the beginning of the next step()
-
-    PPO:
-        controls eta only.
-
-    Top-K:
-        always fixed at 5.
-
-    Payment execution:
-        handled only by PaymentSimulator.
-
-    Failure evaluation:
-        handled only by FailureModel / PaymentSimulator.
-
-    Partial recovery:
-        handled only by PartialBacktracker.
-
-    Full rerouting:
-        regenerates Top-K using the same eta selected by PPO.
+    At terminal state these references are intentionally kept
+    alive so that E2E tests and diagnostics can inspect the
+    completed routing pipeline.
     """
 
     metadata = {
         "render_modes": [],
     }
-
-    # ======================================================
-    # FIXED ROUTING PARAMETER
-    # ======================================================
 
     FIXED_TOP_K = 5
 
@@ -182,10 +149,6 @@ class RoutingEnv(gym.Env):
         network_dynamics=None,
     ):
         super().__init__()
-
-        # --------------------------------------------------
-        # Basic validation
-        # --------------------------------------------------
 
         if G is None:
             raise ValueError(
@@ -236,10 +199,6 @@ class RoutingEnv(gym.Env):
                 "mode must be a string."
             )
 
-        # --------------------------------------------------
-        # Store inputs
-        # --------------------------------------------------
-
         self.G = G
         self.transactions = list(transactions)
         self.heuristic_fn = heuristic_fn
@@ -265,7 +224,6 @@ class RoutingEnv(gym.Env):
                 "config['graph'] must be a dictionary."
             )
 
-        # k is ALWAYS fixed to 5.
         self.top_k = self.FIXED_TOP_K
 
         self.max_hops = self._validate_positive_int(
@@ -440,6 +398,7 @@ class RoutingEnv(gym.Env):
         # --------------------------------------------------
 
         if failure_model is None:
+
             self.failure_model = FailureModel(
                 node_failure_probability=(
                     self.node_failure_probability
@@ -449,7 +408,9 @@ class RoutingEnv(gym.Env):
                 ),
                 seed=self.seed,
             )
+
         else:
+
             self.failure_model = failure_model
 
         if self.failure_model is None:
@@ -462,6 +423,7 @@ class RoutingEnv(gym.Env):
         # --------------------------------------------------
 
         if network_dynamics is None:
+
             self.network_dynamics = NetworkDynamics(
                 self.G,
                 channel_failure_rate=(
@@ -475,7 +437,9 @@ class RoutingEnv(gym.Env):
                 ),
                 seed=self.seed,
             )
+
         else:
+
             self.network_dynamics = network_dynamics
 
         if self.network_dynamics is None:
@@ -493,11 +457,6 @@ class RoutingEnv(gym.Env):
             network_dynamics=self.network_dynamics,
         )
 
-        if self.payment_simulator is None:
-            raise RuntimeError(
-                "PaymentSimulator initialization failed."
-            )
-
         # --------------------------------------------------
         # Partial backtracker
         # --------------------------------------------------
@@ -505,11 +464,6 @@ class RoutingEnv(gym.Env):
         self.backtracker = PartialBacktracker(
             network=self.G,
         )
-
-        if self.backtracker is None:
-            raise RuntimeError(
-                "PartialBacktracker initialization failed."
-            )
 
         # --------------------------------------------------
         # Bucket references
@@ -527,7 +481,7 @@ class RoutingEnv(gym.Env):
         self.current_bucket = None
 
         # --------------------------------------------------
-        # Previous routing information
+        # Routing history
         # --------------------------------------------------
 
         self.last_failure_probability = 0.0
@@ -554,10 +508,6 @@ class RoutingEnv(gym.Env):
             radius=self.state_radius,
         )
 
-        # --------------------------------------------------
-        # Observation space
-        # --------------------------------------------------
-
         observation_dimension = int(
             self.state_builder.dimension
         )
@@ -573,10 +523,6 @@ class RoutingEnv(gym.Env):
             shape=(observation_dimension,),
             dtype=np.float32,
         )
-
-        # --------------------------------------------------
-        # Action space
-        # --------------------------------------------------
 
         self.action_space = spaces.Box(
             low=np.array(
@@ -615,11 +561,6 @@ class RoutingEnv(gym.Env):
         if seed is not None:
             self.seed = self._validate_seed(seed)
 
-        if self.network_dynamics is None:
-            raise RuntimeError(
-                "NetworkDynamics is not initialized."
-            )
-
         reset_method = getattr(
             self.network_dynamics,
             "reset",
@@ -636,11 +577,6 @@ class RoutingEnv(gym.Env):
                 self.reset_balances_on_episode_reset
             )
         )
-
-        if self.failure_model is None:
-            raise RuntimeError(
-                "FailureModel is not initialized."
-            )
 
         reset_failure_state = getattr(
             self.failure_model,
@@ -660,10 +596,6 @@ class RoutingEnv(gym.Env):
             reset_rng=(seed is not None),
         )
 
-        # --------------------------------------------------
-        # Transaction state
-        # --------------------------------------------------
-
         self.tx_index = 0
         self.current_tx = None
         self.current_paths = []
@@ -672,27 +604,15 @@ class RoutingEnv(gym.Env):
         self.bucket = None
         self.backtracker.bucket = None
 
-        # --------------------------------------------------
-        # Routing history
-        # --------------------------------------------------
-
         self.last_failure_probability = 0.0
         self.last_average_delay = 0.0
         self.last_backtrack_count = 0
-
-        # --------------------------------------------------
-        # Statistics
-        # --------------------------------------------------
 
         self.episode_reward = 0.0
         self.episode_steps = 0
 
         self.total_successes = 0
         self.total_failures = 0
-
-        # --------------------------------------------------
-        # First transaction
-        # --------------------------------------------------
 
         self.current_tx = self._get_current_transaction()
 
@@ -716,16 +636,6 @@ class RoutingEnv(gym.Env):
     # ======================================================
 
     def step(self, action):
-        """
-        Execute exactly one PPO routing decision.
-
-        PPO:
-            eta
-
-        Routing:
-            eta -> Top-K -> CandidateManager -> Bucket
-            -> Payment -> Failure -> Backtracking/Reroute
-        """
 
         if self.current_tx is None:
             raise RuntimeError(
@@ -733,20 +643,17 @@ class RoutingEnv(gym.Env):
                 "Call reset() before step()."
             )
 
+        # A new transaction step starts here.
         self.bucket = None
         self.current_bucket = None
         self.backtracker.bucket = None
-
-        # --------------------------------------------------
-        # 1. Decode PPO action
-        # --------------------------------------------------
 
         eta = self._decode_eta(action)
 
         tx = self.current_tx
 
         # --------------------------------------------------
-        # 2. Generate Top-K
+        # Top-K
         # --------------------------------------------------
 
         candidates = self._generate_candidates(
@@ -754,73 +661,15 @@ class RoutingEnv(gym.Env):
             eta=eta,
         )
 
-        # --------------------------------------------------
-        # 3. No candidates
-        # --------------------------------------------------
-
         if not candidates:
-            reward = self._calculate_environment_reward(
-                success=False,
-                path_length=0,
-                carbon_intensity=0.0,
-                fee=0.0,
-                delay=0.0,
-                partial_backtrack_count=0,
-                full_reroute_count=0,
-                attempt_count=0,
-            )
-
-            self.last_failure_probability = 1.0
-            self.last_average_delay = 0.0
-            self.last_backtrack_count = 0
-
-            self.total_failures += 1
-            self.episode_reward += reward
-            self.episode_steps += 1
-
-            self._update_network_dynamics()
-
-            info = {
-                "transaction_id": self._transaction_id(),
-                "success": False,
-                "eta": eta,
-                "top_k": self.top_k,
-                "candidate_path_count": 0,
-                "usable_candidate_count": 0,
-                "bucket_size": 0,
-                "payment_success": False,
-                "failure_probability": 1.0,
-                "average_delay": 0.0,
-                "backtrack_count": 0,
-                "partial_backtrack_count": 0,
-                "partial_backtrack_success": 0,
-                "full_reroute": False,
-                "full_reroute_count": 0,
-                "attempt_count": 0,
-                "reason": "no_initial_candidate",
-            }
-
-            terminated = self._advance_transaction()
-
-            observation = (
-                self._build_state()
-                if not terminated
-                else np.zeros(
-                    self.observation_space.shape,
-                    dtype=np.float32,
-                )
-            )
-
-            return (
-                observation,
-                float(reward),
-                terminated,
-                False,
-                info,
+            return self._finish_failed_step(
+                tx=tx,
+                eta=eta,
+                reason="no_initial_candidate",
             )
 
         # --------------------------------------------------
-        # 4. CandidateManager -> Bucket
+        # CandidateManager -> Bucket
         # --------------------------------------------------
 
         bucket, filtered_candidates = self._create_bucket(
@@ -828,75 +677,17 @@ class RoutingEnv(gym.Env):
             candidates=candidates,
         )
 
-        # --------------------------------------------------
-        # 5. No usable Bucket
-        # --------------------------------------------------
-
         if bucket is None:
-            reward = self._calculate_environment_reward(
-                success=False,
-                path_length=0,
-                carbon_intensity=0.0,
-                fee=0.0,
-                delay=0.0,
-                partial_backtrack_count=0,
-                full_reroute_count=0,
-                attempt_count=0,
-            )
-
-            self.last_failure_probability = 1.0
-            self.last_average_delay = 0.0
-            self.last_backtrack_count = 0
-
-            self.total_failures += 1
-            self.episode_reward += reward
-            self.episode_steps += 1
-
-            self._update_network_dynamics()
-
-            info = {
-                "transaction_id": self._transaction_id(),
-                "success": False,
-                "eta": eta,
-                "top_k": self.top_k,
-                "candidate_path_count": len(
-                    filtered_candidates
-                ),
-                "usable_candidate_count": 0,
-                "bucket_size": 0,
-                "payment_success": False,
-                "failure_probability": 1.0,
-                "average_delay": 0.0,
-                "backtrack_count": 0,
-                "partial_backtrack_count": 0,
-                "partial_backtrack_success": 0,
-                "full_reroute": False,
-                "full_reroute_count": 0,
-                "attempt_count": 0,
-                "reason": "no_usable_bucket",
-            }
-
-            terminated = self._advance_transaction()
-
-            observation = (
-                self._build_state()
-                if not terminated
-                else np.zeros(
-                    self.observation_space.shape,
-                    dtype=np.float32,
-                )
-            )
-
-            return (
-                observation,
-                float(reward),
-                terminated,
-                False,
-                info,
+            return self._finish_failed_step(
+                tx=tx,
+                eta=eta,
+                reason="no_usable_bucket",
+                candidate_path_count=len(candidates),
+                usable_candidate_count=0,
             )
 
         # --------------------------------------------------
-        # 6. Register the REAL Bucket
+        # Register actual Bucket
         # --------------------------------------------------
 
         self.current_paths = list(
@@ -904,23 +695,17 @@ class RoutingEnv(gym.Env):
         )
 
         self.current_bucket = bucket
-
         self.bucket = bucket
-
         self.backtracker.bucket = bucket
 
         # --------------------------------------------------
-        # 7. Execute complete pipeline
+        # Execute routing/payment pipeline
         # --------------------------------------------------
 
         result = self._execute_bucket_pipeline(
             tx=tx,
             eta=eta,
         )
-
-        # --------------------------------------------------
-        # 8. Final result
-        # --------------------------------------------------
 
         payment_success = bool(
             result["success"]
@@ -962,10 +747,6 @@ class RoutingEnv(gym.Env):
             result["attempt_count"]
         )
 
-        # --------------------------------------------------
-        # 9. Environment state
-        # --------------------------------------------------
-
         self.last_failure_probability = float(
             result["failure_probability"]
         )
@@ -974,7 +755,7 @@ class RoutingEnv(gym.Env):
         self.last_backtrack_count = backtrack_count
 
         # --------------------------------------------------
-        # 10. Reward
+        # Reward
         # --------------------------------------------------
 
         reward = self._calculate_environment_reward(
@@ -993,7 +774,7 @@ class RoutingEnv(gym.Env):
         )
 
         # --------------------------------------------------
-        # 11. Statistics
+        # Statistics
         # --------------------------------------------------
 
         if payment_success:
@@ -1004,65 +785,153 @@ class RoutingEnv(gym.Env):
         self.episode_reward += reward
         self.episode_steps += 1
 
-        # --------------------------------------------------
-        # 12. Network dynamics
-        # --------------------------------------------------
-
         self._update_network_dynamics()
 
         # --------------------------------------------------
-        # 13. Info
+        # Info
         # --------------------------------------------------
 
         info = {
             "transaction_id": self._transaction_id(),
             "eta": eta,
             "top_k": self.top_k,
-            "candidate_path_count": len(candidates),
+
+            "candidate_path_count": len(
+                candidates
+            ),
+
             "usable_candidate_count": len(
                 filtered_candidates
             ),
+
             "bucket_size": self._bucket_size(
                 self.current_bucket
             ),
+
             "success": payment_success,
             "payment_success": payment_success,
+
             "path": result["path"],
             "path_length": final_path_length,
+
             "fee": final_fee,
             "delay": final_delay,
             "carbon": final_carbon,
+
             "failure_probability": (
                 self.last_failure_probability
             ),
+
             "average_delay": (
                 self.last_average_delay
             ),
+
             "backtrack_count": backtrack_count,
+
             "partial_backtrack_count": (
                 partial_backtrack_count
             ),
+
             "partial_backtrack_success": (
                 partial_backtrack_success
             ),
+
             "full_reroute": (
                 full_reroute_count > 0
             ),
+
             "full_reroute_count": (
                 full_reroute_count
             ),
+
             "attempt_count": attempt_count,
+
             "reason": result["reason"],
-            "episode_reward": self.episode_reward,
+
+            "episode_reward": (
+                self.episode_reward
+            ),
         }
 
         # --------------------------------------------------
-        # 14. Advance transaction
+        # Advance transaction
         #
-        # IMPORTANT:
-        # _advance_transaction() preserves the actual Bucket
-        # references when the episode terminates.
+        # Terminal state deliberately preserves Bucket.
         # --------------------------------------------------
+
+        terminated = self._advance_transaction()
+
+        if terminated:
+
+            observation = np.zeros(
+                self.observation_space.shape,
+                dtype=np.float32,
+            )
+
+        else:
+
+            observation = self._build_state()
+
+        return (
+            observation,
+            float(reward),
+            terminated,
+            False,
+            info,
+        )
+
+    # ======================================================
+    # FAILED STEP HELPER
+    # ======================================================
+
+    def _finish_failed_step(
+        self,
+        tx,
+        eta,
+        reason,
+        candidate_path_count=0,
+        usable_candidate_count=0,
+    ):
+        reward = self._calculate_environment_reward(
+            success=False,
+            path_length=0,
+            carbon_intensity=0.0,
+            fee=0.0,
+            delay=0.0,
+            partial_backtrack_count=0,
+            full_reroute_count=0,
+            attempt_count=0,
+        )
+
+        self.last_failure_probability = 1.0
+        self.last_average_delay = 0.0
+        self.last_backtrack_count = 0
+
+        self.total_failures += 1
+        self.episode_reward += reward
+        self.episode_steps += 1
+
+        self._update_network_dynamics()
+
+        info = {
+            "transaction_id": self._transaction_id(),
+            "success": False,
+            "eta": eta,
+            "top_k": self.top_k,
+            "candidate_path_count": candidate_path_count,
+            "usable_candidate_count": usable_candidate_count,
+            "bucket_size": 0,
+            "payment_success": False,
+            "failure_probability": 1.0,
+            "average_delay": 0.0,
+            "backtrack_count": 0,
+            "partial_backtrack_count": 0,
+            "partial_backtrack_success": 0,
+            "full_reroute": False,
+            "full_reroute_count": 0,
+            "attempt_count": 0,
+            "reason": reason,
+        }
 
         terminated = self._advance_transaction()
 
@@ -1134,18 +1003,6 @@ class RoutingEnv(gym.Env):
         tx,
         candidates,
     ):
-        """
-        Convert Top-K candidates into the actual Bucket.
-
-        CandidateManager owns:
-
-            filtering
-            ranking
-            Bucket creation
-
-        The original candidate representation is preserved.
-        """
-
         if not candidates:
             return None, []
 
@@ -1199,8 +1056,7 @@ class RoutingEnv(gym.Env):
 
         if len(bucket.candidates) == 0:
             raise RuntimeError(
-                "CandidateManager returned an empty Bucket "
-                "after filtering."
+                "CandidateManager returned an empty Bucket."
             )
 
         return (
@@ -1218,52 +1074,28 @@ class RoutingEnv(gym.Env):
         eta,
     ):
         """
-        Execute the complete Bucket-based payment pipeline.
-
-        Flow:
+        Execute:
 
             Bucket
-                |
-                v
-            Candidate
-                |
-                v
+              |
+              v
         PaymentSimulator
-                |
-             Failure?
-             /      \
-           No        Yes
-           |          |
-           v          v
-        Success   PartialBacktrack
-                         |
-                         v
-                   Alternative
-                         |
-                         v
-                      Payment
-                         |
-                   +-----+-----+
-                   |           |
-                 Success      Fail
-                   |           |
-                   v           v
-                Finish     Bucket / Reroute
-
-        Important invariants
-        --------------------
-        1. Bucket.attempts counts actual payment attempts only.
-        2. PartialBacktracker itself does not increment Bucket.attempts.
-        3. PartialBacktracker receives the exact physical route_edges
-           sequence for MultiDiGraph.
-        4. A failure identified only by failure_index is converted to
-           the exact physical edge from the validated route.
-        5. A failure identified only by failed_edge is resolved back
-           to its exact route index whenever possible.
-        6. Partial backtracking is attempted before full reroute.
-        7. Full reroute preserves the PPO-selected eta.
-        8. partial_backtrack_success is incremented only after the
-           alternative route is actually retried successfully.
+              |
+           Failure
+              |
+              v
+        PartialBacktracker
+              |
+              v
+        Bucket alternative
+              |
+              v
+        PaymentSimulator
+              |
+        success/failure
+              |
+              v
+        optional full reroute
         """
 
         current_bucket = self.current_bucket
@@ -1294,20 +1126,16 @@ class RoutingEnv(gym.Env):
         final_reason = None
 
         max_attempts = (
-            (self.top_k * 3) + 5
-        )
+            self.top_k * 3
+        ) + 5
 
         while attempt_count < max_attempts:
 
-            # =================================================
-            # CURRENT BUCKET CANDIDATE
-            # =================================================
-
             candidate = current_bucket.current()
 
-            # =================================================
-            # BUCKET EXHAUSTED
-            # =================================================
+            # ------------------------------------------------
+            # Bucket exhausted
+            # ------------------------------------------------
 
             if candidate is None:
 
@@ -1319,9 +1147,11 @@ class RoutingEnv(gym.Env):
                 )
 
                 if reroute_bucket is None:
+
                     final_reason = (
                         "bucket_exhausted_no_reroute"
                     )
+
                     break
 
                 full_reroute_count += 1
@@ -1334,24 +1164,28 @@ class RoutingEnv(gym.Env):
 
                 continue
 
-            # =================================================
-            # CANDIDATE ROUTE
-            # =================================================
+            # ------------------------------------------------
+            # Resolve route
+            # ------------------------------------------------
 
-            path, candidate_edges = (
-                self._candidate_route(candidate)
+            path, edges = self._candidate_route(
+                candidate
             )
 
             if not path:
+
                 current_bucket.backtrack(
-                    failed_candidate=candidate
+                    failed_candidate=candidate,
+                    reason="invalid_candidate_path",
                 )
+
                 continue
 
-            edges = candidate_edges
-
             if not edges:
-                edges = self._path_to_edges(path)
+
+                edges = self._path_to_edges(
+                    path
+                )
 
             if edges is None:
 
@@ -1361,25 +1195,19 @@ class RoutingEnv(gym.Env):
 
                 current_bucket.backtrack(
                     failed_candidate=candidate,
-                    reason=(
-                        "cannot_resolve_exact_route_edges"
-                    ),
+                    reason="cannot_resolve_exact_route_edges",
                 )
 
                 continue
-
-            # =================================================
-            # EXACT ROUTE VALIDATION
-            # =================================================
 
             self._validate_route_edges(
                 path,
                 edges,
             )
 
-            # =================================================
-            # SELECT CANDIDATE
-            # =================================================
+            # ------------------------------------------------
+            # Select
+            # ------------------------------------------------
 
             selected = current_bucket.select_candidate(
                 candidate
@@ -1390,17 +1218,12 @@ class RoutingEnv(gym.Env):
                     "Bucket could not select its current candidate."
                 )
 
-            # =================================================
-            # RECORD ACTUAL PAYMENT ATTEMPT
-            # =================================================
+            # ------------------------------------------------
+            # Actual payment attempt
+            # ------------------------------------------------
 
             current_bucket.record_attempt()
-
             attempt_count += 1
-
-            # =================================================
-            # PAYMENT SIMULATION
-            # =================================================
 
             payment_result = (
                 self.payment_simulator.simulate_payment(
@@ -1421,9 +1244,9 @@ class RoutingEnv(gym.Env):
                 "PaymentSimulator result",
             )
 
-            # =================================================
+            # ------------------------------------------------
             # SUCCESS
-            # =================================================
+            # ------------------------------------------------
 
             if success:
 
@@ -1434,8 +1257,7 @@ class RoutingEnv(gym.Env):
                     candidate
                 ):
                     raise RuntimeError(
-                        "Bucket.mark_success() failed after "
-                        "a successful payment."
+                        "Bucket.mark_success() failed."
                     )
 
                 final_success = True
@@ -1486,9 +1308,9 @@ class RoutingEnv(gym.Env):
 
                 break
 
-            # =================================================
+            # ------------------------------------------------
             # FAILURE
-            # =================================================
+            # ------------------------------------------------
 
             if isinstance(candidate, dict):
                 candidate["success"] = False
@@ -1497,213 +1319,24 @@ class RoutingEnv(gym.Env):
                 tuple(path)
             )
 
-            # =================================================
-            # RESOLVE FAILURE INFORMATION
-            # =================================================
-
-            failed_edge = result.get(
-                "failed_edge"
+            failed_edge = self._resolve_failed_edge(
+                result=result,
+                edges=edges,
             )
 
-            if failed_edge is None:
-                failed_edge = result.get(
-                    "failed_channel"
-                )
-
-            if failed_edge is None:
-                failed_edge = result.get(
-                    "failed_physical_edge"
-                )
-
-            if failed_edge is None:
-                failed_edge = result.get(
-                    "edge"
-                )
-
-            if failed_edge is None:
-                failed_edge = result.get(
-                    "channel"
-                )
-
-            failure_index = result.get(
-                "failure_index"
+            failure_index = self._resolve_failure_index(
+                result=result,
+                edges=edges,
+                failed_edge=failed_edge,
             )
-
-            if failure_index is None:
-                failure_index = result.get(
-                    "failed_edge_index"
-                )
-
-            if failure_index is None:
-                failure_index = result.get(
-                    "failure_position"
-                )
-
-            # =================================================
-            # NORMALIZE FAILURE INDEX
-            # =================================================
-
-            if failure_index is not None:
-
-                if isinstance(
-                    failure_index,
-                    bool,
-                ):
-                    failure_index = None
-
-                elif not isinstance(
-                    failure_index,
-                    int,
-                ):
-
-                    try:
-                        converted_index = int(
-                            failure_index
-                        )
-
-                        if (
-                            float(failure_index)
-                            == float(converted_index)
-                        ):
-                            failure_index = (
-                                converted_index
-                            )
-                        else:
-                            failure_index = None
-
-                    except (
-                        TypeError,
-                        ValueError,
-                    ):
-                        failure_index = None
-
-            # =================================================
-            # FAILURE INDEX -> EXACT PHYSICAL EDGE
-            # =================================================
-
-            if (
-                failed_edge is None
-                and
-                failure_index is not None
-            ):
-
-                if (
-                    0 <= failure_index < len(edges)
-                ):
-                    failed_edge = edges[
-                        failure_index
-                    ]
-
-            # =================================================
-            # FAILED EDGE -> EXACT FAILURE INDEX
-            # =================================================
-
-            if (
-                failure_index is None
-                and
-                failed_edge is not None
-            ):
-
-                normalized_reported_edge = (
-                    self._normalize_edge(
-                        failed_edge
-                    )
-                )
-
-                if normalized_reported_edge is not None:
-
-                    fu, fv, fk = (
-                        normalized_reported_edge
-                    )
-
-                    for edge_index, route_edge in enumerate(
-                        edges
-                    ):
-
-                        normalized_route_edge = (
-                            self._normalize_edge(
-                                route_edge
-                            )
-                        )
-
-                        if normalized_route_edge is None:
-                            continue
-
-                        ru, rv, rk = (
-                            normalized_route_edge
-                        )
-
-                        if (
-                            ru != fu
-                            or
-                            rv != fv
-                        ):
-                            continue
-
-                        if self.G.is_multigraph():
-
-                            # -----------------------------------------
-                            # No channel key supplied:
-                            # endpoint match is sufficient.
-                            # -----------------------------------------
-
-                            if fk is None:
-
-                                failure_index = (
-                                    edge_index
-                                )
-
-                                failed_edge = (
-                                    route_edge
-                                )
-
-                                break
-
-                            # -----------------------------------------
-                            # Exact physical channel match.
-                            # -----------------------------------------
-
-                            if rk == fk:
-
-                                failure_index = (
-                                    edge_index
-                                )
-
-                                failed_edge = (
-                                    route_edge
-                                )
-
-                                break
-
-                        else:
-
-                            failure_index = (
-                                edge_index
-                            )
-
-                            failed_edge = (
-                                route_edge
-                            )
-
-                            break
-
-            # =================================================
-            # FINAL AUTHORITATIVE EDGE RESOLUTION
-            # =================================================
 
             if (
                 failure_index is not None
-                and
-                0 <= failure_index < len(edges)
+                and 0 <= failure_index < len(edges)
             ):
-
                 failed_edge = edges[
                     failure_index
                 ]
-
-            # =================================================
-            # NORMALIZE FAILED PHYSICAL EDGE
-            # =================================================
 
             normalized_failed_edge = (
                 self._normalize_edge(
@@ -1712,55 +1345,20 @@ class RoutingEnv(gym.Env):
             )
 
             if normalized_failed_edge is not None:
-
                 failed_edges.add(
                     normalized_failed_edge
                 )
 
-            # =================================================
-            # NO FAILURE INFORMATION
-            # =================================================
-
-            if (
-                failed_edge is None
-                and
-                failure_index is None
-            ):
-
-                current_bucket.backtrack(
-                    failed_candidate=candidate,
-                    reason=result.get(
-                        "reason",
-                        "payment_failed",
-                    ),
-                )
-
-                final_reason = result.get(
-                    "reason",
-                    "payment_failed",
-                )
-
-                final_failure_probability = 1.0
-
-                continue
-
-            # =================================================
-            # PARTIAL BACKTRACK
-            # =================================================
+            # ------------------------------------------------
+            # One real failure => one partial-backtracking
+            # event.
+            # ------------------------------------------------
 
             partial_backtrack_count += 1
 
-            # -------------------------------------------------
-            # IMPORTANT:
-            #
-            # Pass both:
-            #
-            #   route
-            #   route_edges
-            #
-            # because a node-only route is insufficient to
-            # identify the physical channel in MultiDiGraph.
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Partial backtracking
+            # ------------------------------------------------
 
             backtrack_result = (
                 self.backtracker.backtrack(
@@ -1787,401 +1385,143 @@ class RoutingEnv(gym.Env):
                 "status"
             )
 
-            # =================================================
-            # PARTIAL BACKTRACK FOUND ALTERNATIVE
-            # =================================================
+            # ------------------------------------------------
+            # Alternative found
+            # ------------------------------------------------
 
-            if (
-                status == "alternative_found"
-                and
-                backtrack_result.get(
-                    "success",
-                    False,
-                )
-            ):
+            if status == "alternative_found":
 
                 new_path = backtrack_result.get(
                     "new_route"
                 )
 
-                if new_path:
+                new_edges = backtrack_result.get(
+                    "new_edges"
+                )
 
-                    new_edges = (
-                        backtrack_result.get(
-                            "new_edges"
-                        )
-                    )
-
-                    if not new_edges:
-                        new_edges = (
-                            self._path_to_edges(
-                                new_path
-                            )
-                        )
-
-                    if new_edges is None:
-                        raise RuntimeError(
-                            "PartialBacktracker returned a route "
-                            "without resolvable exact edges."
-                        )
-
-                    # =================================================
-                    # VALIDATE ALTERNATIVE ROUTE
-                    # =================================================
+                if new_path and new_edges:
 
                     self._validate_route_edges(
                         new_path,
                         new_edges,
                     )
 
-                    # =================================================
-                    # RETRY ALTERNATIVE ROUTE
-                    # =================================================
+                    # The returned route is an actual retry
+                    # candidate. Execute it exactly once.
+                    current_bucket = self.current_bucket
 
-                    if attempt_count < max_attempts:
+                    self._record_external_bucket_attempt(
+                        current_bucket
+                    )
 
-                        # ---------------------------------------------
-                        # This retry is an actual payment attempt.
-                        # ---------------------------------------------
+                    attempt_count += 1
 
-                        attempt_count += 1
+                    retry_result = (
+                        self.payment_simulator.simulate_payment(
+                            path=list(new_path),
+                            edges=list(new_edges),
+                            amount=tx.amount,
+                            tx_id=tx.tx_id,
+                        )
+                    )
 
-                        # ---------------------------------------------
-                        # Synchronize Bucket diagnostic state.
-                        #
-                        # PartialBacktracker itself must not modify
-                        # Bucket.attempts, therefore this explicit
-                        # accounting is performed here.
-                        # ---------------------------------------------
+                    retry_dict = self._result_to_dict(
+                        retry_result
+                    )
 
-                        self._record_external_bucket_attempt(
-                            current_bucket
+                    retry_success = (
+                        self._require_bool(
+                            retry_dict,
+                            "success",
+                            "PaymentSimulator retry result",
+                        )
+                    )
+
+                    if retry_success:
+
+                        partial_backtrack_success += 1
+
+                        final_success = True
+                        final_path = list(new_path)
+
+                        final_fee = self._result_float(
+                            retry_dict,
+                            "fee",
+                            default=0.0,
                         )
 
-                        retry_result = (
-                            self.payment_simulator.simulate_payment(
-                                path=new_path,
-                                edges=new_edges,
-                                amount=tx.amount,
-                                tx_id=tx.tx_id,
-                            )
+                        final_delay = self._result_float(
+                            retry_dict,
+                            "delay",
+                            default=0.0,
                         )
 
-                        retry_dict = (
-                            self._result_to_dict(
-                                retry_result
-                            )
+                        final_carbon = self._result_float(
+                            retry_dict,
+                            "carbon",
+                            default=0.0,
                         )
 
-                        retry_success = (
-                            self._require_bool(
-                                retry_dict,
-                                "success",
-                                "PaymentSimulator retry result",
-                            )
+                        final_failure_probability = 0.0
+
+                        final_reason = (
+                            "partial_backtrack_success"
                         )
 
-                        # =================================================
-                        # RETRY SUCCESS
-                        # =================================================
+                        # The retry succeeded. Do NOT call
+                        # Bucket.backtrack() for the successful
+                        # alternative and do NOT full-reroute.
+                        break
 
-                        if retry_success:
+                    # ------------------------------------------------
+                    # Alternative itself failed.
+                    # ------------------------------------------------
 
-                            # ---------------------------------------------
-                            # IMPORTANT:
-                            #
-                            # Count partial-backtracking success only
-                            # after the alternative route actually succeeds.
-                            # ---------------------------------------------
+                    retry_failed_edge = self._resolve_failed_edge(
+                        result=retry_dict,
+                        edges=new_edges,
+                    )
 
-                            partial_backtrack_success += 1
+                    retry_failure_index = (
+                        self._resolve_failure_index(
+                            result=retry_dict,
+                            edges=new_edges,
+                            failed_edge=retry_failed_edge,
+                        )
+                    )
 
-                            final_success = True
+                    if (
+                        retry_failure_index is not None
+                        and
+                        0 <= retry_failure_index < len(new_edges)
+                    ):
+                        retry_failed_edge = new_edges[
+                            retry_failure_index
+                        ]
 
-                            final_path = list(
-                                new_path
-                            )
+                    normalized_retry_failed_edge = (
+                        self._normalize_edge(
+                            retry_failed_edge
+                        )
+                    )
 
-                            final_fee = (
-                                self._result_float(
-                                    retry_dict,
-                                    "fee",
-                                    default=0.0,
-                                )
-                            )
-
-                            final_delay = (
-                                self._result_float(
-                                    retry_dict,
-                                    "delay",
-                                    default=0.0,
-                                )
-                            )
-
-                            final_carbon = (
-                                self._result_float(
-                                    retry_dict,
-                                    "carbon",
-                                    default=0.0,
-                                )
-                            )
-
-                            final_failure_probability = 0.0
-
-                            final_reason = (
-                                "partial_backtrack_success"
-                            )
-
-                            # ---------------------------------------------
-                            # The pipeline is complete.
-                            # ---------------------------------------------
-
-                            break
-
-                        # =================================================
-                        # RETRY FAILURE
-                        # =================================================
-
-                        retry_failed_route = tuple(
-                            new_path
+                    if normalized_retry_failed_edge is not None:
+                        failed_edges.add(
+                            normalized_retry_failed_edge
                         )
 
-                        failed_routes.add(
-                            retry_failed_route
-                        )
+                    failed_routes.add(
+                        tuple(new_path)
+                    )
 
-                        retry_failed_edge = (
-                            retry_dict.get(
-                                "failed_edge"
-                            )
-                        )
+                # ------------------------------------------------
+                # If retry did not succeed, continue normal
+                # Bucket failure handling.
+                # ------------------------------------------------
 
-                        if retry_failed_edge is None:
-                            retry_failed_edge = (
-                                retry_dict.get(
-                                    "failed_channel"
-                                )
-                            )
-
-                        if retry_failed_edge is None:
-                            retry_failed_edge = (
-                                retry_dict.get(
-                                    "failed_physical_edge"
-                                )
-                            )
-
-                        if retry_failed_edge is None:
-                            retry_failed_edge = (
-                                retry_dict.get(
-                                    "edge"
-                                )
-                            )
-
-                        retry_failure_index = (
-                            retry_dict.get(
-                                "failure_index"
-                            )
-                        )
-
-                        if retry_failure_index is None:
-                            retry_failure_index = (
-                                retry_dict.get(
-                                    "failed_edge_index"
-                                )
-                            )
-
-                        if retry_failure_index is None:
-                            retry_failure_index = (
-                                retry_dict.get(
-                                    "failure_position"
-                                )
-                            )
-
-                        # =================================================
-                        # NORMALIZE RETRY FAILURE INDEX
-                        # =================================================
-
-                        if retry_failure_index is not None:
-
-                            if isinstance(
-                                retry_failure_index,
-                                bool,
-                            ):
-                                retry_failure_index = None
-
-                            elif not isinstance(
-                                retry_failure_index,
-                                int,
-                            ):
-
-                                try:
-                                    converted_retry_index = int(
-                                        retry_failure_index
-                                    )
-
-                                    if (
-                                        float(
-                                            retry_failure_index
-                                        )
-                                        ==
-                                        float(
-                                            converted_retry_index
-                                        )
-                                    ):
-                                        retry_failure_index = (
-                                            converted_retry_index
-                                        )
-                                    else:
-                                        retry_failure_index = None
-
-                                except (
-                                    TypeError,
-                                    ValueError,
-                                ):
-                                    retry_failure_index = None
-
-                        # =================================================
-                        # RECOVER EXACT RETRY FAILURE EDGE
-                        # =================================================
-
-                        if (
-                            retry_failed_edge is None
-                            and
-                            retry_failure_index is not None
-                        ):
-
-                            if (
-                                0 <= retry_failure_index
-                                < len(new_edges)
-                            ):
-                                retry_failed_edge = (
-                                    new_edges[
-                                        retry_failure_index
-                                    ]
-                                )
-
-                        # =================================================
-                        # RESOLVE RETRY EDGE BY MATCHING ROUTE
-                        # =================================================
-
-                        if (
-                            retry_failure_index is None
-                            and
-                            retry_failed_edge is not None
-                        ):
-
-                            normalized_retry_edge = (
-                                self._normalize_edge(
-                                    retry_failed_edge
-                                )
-                            )
-
-                            if normalized_retry_edge is not None:
-
-                                rfu, rfv, rfk = (
-                                    normalized_retry_edge
-                                )
-
-                                for retry_edge_index, route_edge in enumerate(
-                                    new_edges
-                                ):
-
-                                    normalized_route_edge = (
-                                        self._normalize_edge(
-                                            route_edge
-                                        )
-                                    )
-
-                                    if normalized_route_edge is None:
-                                        continue
-
-                                    rru, rrv, rrk = (
-                                        normalized_route_edge
-                                    )
-
-                                    if (
-                                        rru != rfu
-                                        or
-                                        rrv != rfv
-                                    ):
-                                        continue
-
-                                    if self.G.is_multigraph():
-
-                                        if rfk is None:
-
-                                            retry_failure_index = (
-                                                retry_edge_index
-                                            )
-
-                                            retry_failed_edge = (
-                                                route_edge
-                                            )
-
-                                            break
-
-                                        if rrk == rfk:
-
-                                            retry_failure_index = (
-                                                retry_edge_index
-                                            )
-
-                                            retry_failed_edge = (
-                                                route_edge
-                                            )
-
-                                            break
-
-                                    else:
-
-                                        retry_failure_index = (
-                                            retry_edge_index
-                                        )
-
-                                        retry_failed_edge = (
-                                            route_edge
-                                        )
-
-                                        break
-
-                        # =================================================
-                        # FINAL RETRY EDGE RESOLUTION
-                        # =================================================
-
-                        if (
-                            retry_failure_index is not None
-                            and
-                            0 <= retry_failure_index
-                            < len(new_edges)
-                        ):
-
-                            retry_failed_edge = (
-                                new_edges[
-                                    retry_failure_index
-                                ]
-                            )
-
-                        # =================================================
-                        # STORE RETRY FAILED EDGE
-                        # =================================================
-
-                        retry_failed_edge = (
-                            self._normalize_edge(
-                                retry_failed_edge
-                            )
-                        )
-
-                        if retry_failed_edge is not None:
-
-                            failed_edges.add(
-                                retry_failed_edge
-                            )
-
-                        final_failure_probability = 1.0
-
-            # =================================================
-            # PARTIAL BACKTRACK FAILED
-            # =================================================
+            # ------------------------------------------------
+            # Record failed current candidate and move Bucket
+            # ------------------------------------------------
 
             current_bucket.backtrack(
                 failed_candidate=candidate,
@@ -2192,16 +1532,16 @@ class RoutingEnv(gym.Env):
                 ),
             )
 
-            # =================================================
-            # BUCKET STILL HAS CANDIDATE
-            # =================================================
+            # ------------------------------------------------
+            # Continue within Bucket if another candidate exists
+            # ------------------------------------------------
 
             if current_bucket.current() is not None:
                 continue
 
-            # =================================================
-            # FULL REROUTE
-            # =================================================
+            # ------------------------------------------------
+            # Full reroute
+            # ------------------------------------------------
 
             if attempt_count >= max_attempts:
 
@@ -2234,9 +1574,9 @@ class RoutingEnv(gym.Env):
             self.bucket = current_bucket
             self.backtracker.bucket = current_bucket
 
-        # ==================================================
-        # FINAL FAILURE
-        # ==================================================
+        # --------------------------------------------------
+        # Final failure
+        # --------------------------------------------------
 
         if not final_success:
 
@@ -2246,10 +1586,6 @@ class RoutingEnv(gym.Env):
             )
 
             final_failure_probability = 1.0
-
-        # ==================================================
-        # FINAL METRICS
-        # ==================================================
 
         path_length = max(
             len(final_path) - 1,
@@ -2286,6 +1622,146 @@ class RoutingEnv(gym.Env):
         }
 
     # ======================================================
+    # FAILURE INFORMATION
+    # ======================================================
+
+    def _resolve_failed_edge(
+        self,
+        result,
+        edges,
+    ):
+        """
+        Resolve the exact physical failed edge.
+
+        Priority:
+
+            failed_edge
+            failed_channel
+            failed_physical_edge
+            edge
+            channel
+            failure_index
+        """
+
+        failed_edge = None
+
+        for key in (
+            "failed_edge",
+            "failed_channel",
+            "failed_physical_edge",
+            "edge",
+            "channel",
+        ):
+            value = result.get(key)
+
+            if value is not None:
+                failed_edge = value
+                break
+
+        if failed_edge is not None:
+            return failed_edge
+
+        failure_index = result.get(
+            "failure_index"
+        )
+
+        if failure_index is None:
+            failure_index = result.get(
+                "failed_edge_index"
+            )
+
+        if failure_index is None:
+            failure_index = result.get(
+                "failure_position"
+            )
+
+        failure_index = self._normalize_failure_index(
+            failure_index
+        )
+
+        if (
+            failure_index is not None
+            and
+            0 <= failure_index < len(edges)
+        ):
+            return edges[
+                failure_index
+            ]
+
+        return None
+
+    # ======================================================
+    # FAILURE INDEX
+    # ======================================================
+
+    def _resolve_failure_index(
+        self,
+        result,
+        edges,
+        failed_edge,
+    ):
+        failure_index = result.get(
+            "failure_index"
+        )
+
+        if failure_index is None:
+            failure_index = result.get(
+                "failed_edge_index"
+            )
+
+        if failure_index is None:
+            failure_index = result.get(
+                "failure_position"
+            )
+
+        failure_index = self._normalize_failure_index(
+            failure_index
+        )
+
+        if failure_index is not None:
+            if (
+                0 <= failure_index < len(edges)
+            ):
+                return failure_index
+
+        if failed_edge is None:
+            return None
+
+        normalized_failed = self._normalize_edge(
+            failed_edge
+        )
+
+        if normalized_failed is None:
+            return None
+
+        fu, fv, fk = normalized_failed
+
+        for index, edge in enumerate(edges):
+
+            normalized_edge = self._normalize_edge(
+                edge
+            )
+
+            if normalized_edge is None:
+                continue
+
+            eu, ev, ek = normalized_edge
+
+            if eu != fu or ev != fv:
+                continue
+
+            if self.G.is_multigraph():
+
+                if fk is None or ek == fk:
+                    return index
+
+            else:
+
+                return index
+
+        return None
+
+    # ======================================================
     # FULL REROUTE
     # ======================================================
 
@@ -2296,14 +1772,6 @@ class RoutingEnv(gym.Env):
         failed_routes=None,
         failed_edges=None,
     ):
-        """
-        Generate a fresh Top-K candidate set.
-
-        PPO-selected eta is preserved.
-
-        k remains fixed at 5.
-        """
-
         candidates = self._generate_candidates(
             tx=tx,
             eta=eta,
@@ -2343,26 +1811,19 @@ class RoutingEnv(gym.Env):
                     "Top-K candidate has invalid path."
                 )
 
-            path_tuple = tuple(path)
-
-            if path_tuple in failed_routes:
+            if tuple(path) in failed_routes:
                 continue
 
             candidate_edges = candidate.get(
                 "edges"
             )
 
-            if candidate_edges is None:
-                raise ValueError(
-                    "Top-K candidate is missing exact edges."
-                )
-
             if not isinstance(
                 candidate_edges,
                 (list, tuple),
             ):
-                raise TypeError(
-                    "Candidate edges must be a list or tuple."
+                raise ValueError(
+                    "Top-K candidate is missing exact edges."
                 )
 
             if len(candidate_edges) != len(path) - 1:
@@ -2433,12 +1894,13 @@ class RoutingEnv(gym.Env):
                     "Candidate dictionary is missing 'edges'."
                 )
 
-            return path, edges
+            return list(path), list(edges)
 
         if isinstance(
             candidate,
             (tuple, list),
         ):
+
             if len(candidate) >= 2:
                 return (
                     candidate[0],
@@ -2455,23 +1917,6 @@ class RoutingEnv(gym.Env):
 
     @staticmethod
     def _normalize_edge(edge):
-        """
-        Normalize an edge into:
-
-            (source, target, channel_key)
-
-        Supported:
-
-            {
-                "source": u,
-                "target": v,
-                "channel_key": key
-            }
-
-            (u, v, key)
-
-            (u, v)
-        """
 
         if edge is None:
             return None
@@ -2479,15 +1924,34 @@ class RoutingEnv(gym.Env):
         if isinstance(edge, dict):
 
             source = edge.get("source")
+
+            if source is None:
+                source = edge.get("u")
+
             target = edge.get("target")
+
+            if target is None:
+                target = edge.get("v")
 
             if source is None or target is None:
                 return None
 
+            key = edge.get("channel_key")
+
+            if key is None:
+                key = edge.get("key")
+
+            if key is None:
+                return (
+                    source,
+                    target,
+                    None,
+                )
+
             return (
                 source,
                 target,
-                edge.get("channel_key"),
+                key,
             )
 
         if not isinstance(
@@ -2513,7 +1977,7 @@ class RoutingEnv(gym.Env):
         return None
 
     # ======================================================
-    # FAILED EDGE MATCHING
+    # EDGE MATCHING
     # ======================================================
 
     def _edge_matches_failure(
@@ -2550,8 +2014,10 @@ class RoutingEnv(gym.Env):
     # PATH TO EXACT EDGES
     # ======================================================
 
-    def _path_to_edges(self, path):
-
+    def _path_to_edges(
+        self,
+        path,
+    ):
         if not isinstance(
             path,
             (list, tuple),
@@ -2661,7 +2127,7 @@ class RoutingEnv(gym.Env):
         return edges
 
     # ======================================================
-    # ROUTE EDGE VALIDATION
+    # ROUTE VALIDATION
     # ======================================================
 
     def _validate_route_edges(
@@ -2722,7 +2188,7 @@ class RoutingEnv(gym.Env):
 
                 if key is None:
                     raise ValueError(
-                        "MultiGraph route requires an exact channel key."
+                        "MultiGraph route requires exact channel key."
                     )
 
                 if not self.G.has_edge(
@@ -2751,7 +2217,7 @@ class RoutingEnv(gym.Env):
                     )
 
     # ======================================================
-    # PAYMENT RESULT
+    # RESULT
     # ======================================================
 
     @staticmethod
@@ -2769,7 +2235,7 @@ class RoutingEnv(gym.Env):
         ):
             raise TypeError(
                 "Payment simulator must return "
-                "a dictionary or an object with to_dict()."
+                "a dictionary or object with to_dict()."
             )
 
         if "success" not in result:
@@ -2791,8 +2257,10 @@ class RoutingEnv(gym.Env):
     # ETA
     # ======================================================
 
-    def _decode_eta(self, action):
-
+    def _decode_eta(
+        self,
+        action,
+    ):
         array = np.asarray(
             action,
             dtype=np.float32,
@@ -2811,7 +2279,11 @@ class RoutingEnv(gym.Env):
                 "PPO produced a non-finite eta."
             )
 
-        if eta < self.eta_min or eta > self.eta_max:
+        if (
+            eta < self.eta_min
+            or
+            eta > self.eta_max
+        ):
             raise ValueError(
                 "PPO eta is outside the declared action space: "
                 f"{eta} not in "
@@ -2907,11 +2379,6 @@ class RoutingEnv(gym.Env):
 
     def _update_network_dynamics(self):
 
-        if self.network_dynamics is None:
-            raise RuntimeError(
-                "NetworkDynamics is not initialized."
-            )
-
         update_method = getattr(
             self.network_dynamics,
             "update",
@@ -2940,6 +2407,7 @@ class RoutingEnv(gym.Env):
         bucket_info = {}
 
         if self.current_bucket is not None:
+
             bucket_info = self._bucket_info(
                 self.current_bucket
             )
@@ -2973,14 +2441,10 @@ class RoutingEnv(gym.Env):
             dtype=np.float32,
         ).reshape(-1)
 
-        expected_shape = (
-            self.observation_space.shape
-        )
-
-        if vector.shape != expected_shape:
+        if vector.shape != self.observation_space.shape:
             raise RuntimeError(
                 "Invalid observation shape.\n"
-                f"Expected: {expected_shape}\n"
+                f"Expected: {self.observation_space.shape}\n"
                 f"Received: {vector.shape}"
             )
 
@@ -3003,15 +2467,11 @@ class RoutingEnv(gym.Env):
         if bucket is None:
             return 0
 
-        if not hasattr(
+        candidates = getattr(
             bucket,
             "candidates",
-        ):
-            raise TypeError(
-                "Bucket must expose candidates."
-            )
-
-        candidates = bucket.candidates
+            None,
+        )
 
         if not isinstance(
             candidates,
@@ -3031,15 +2491,18 @@ class RoutingEnv(gym.Env):
         if bucket is None:
             return {}
 
-        if not hasattr(
+        info_method = getattr(
             bucket,
             "info",
-        ):
+            None,
+        )
+
+        if not callable(info_method):
             raise TypeError(
                 "Bucket must provide info()."
             )
 
-        info = bucket.info()
+        info = info_method()
 
         if not isinstance(
             info,
@@ -3060,32 +2523,7 @@ class RoutingEnv(gym.Env):
         return result
 
     # ======================================================
-    # REWARD CONFIG
-    # ======================================================
-
-    def _reward_scale(self):
-
-        reward_cfg = self.cfg.get(
-            "reward",
-            {},
-        )
-
-        if not isinstance(
-            reward_cfg,
-            dict,
-        ):
-            raise TypeError(
-                "config['reward'] must be a dictionary."
-            )
-
-        return self._reward_float(
-            reward_cfg,
-            "scale",
-            100.0,
-        )
-
-    # ======================================================
-    # TRANSACTION ACCESS
+    # TRANSACTION
     # ======================================================
 
     def _get_current_transaction(self):
@@ -3118,17 +2556,9 @@ class RoutingEnv(gym.Env):
                     f"Transaction is missing required field '{field}'."
                 )
 
-        try:
-            amount = float(
-                transaction.amount
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            raise ValueError(
-                "Transaction amount must be numeric."
-            )
+        amount = float(
+            transaction.amount
+        )
 
         if (
             not math.isfinite(amount)
@@ -3175,35 +2605,13 @@ class RoutingEnv(gym.Env):
     # ======================================================
 
     def _advance_transaction(self):
-        """
-        Move to the next transaction.
-
-        Bucket lifecycle
-        ----------------
-        self.bucket:
-            Always preserves the last real Bucket used by
-            the completed routing pipeline.
-
-        self.current_bucket:
-            Preserves the completed transaction's active Bucket
-            when the episode terminates so that End-to-End tests
-            and diagnostics can inspect the actual Bucket.
-
-        self.backtracker.bucket:
-            Also preserves the same Bucket at episode termination.
-
-        For a non-terminal transition to another transaction,
-        current_bucket and backtracker.bucket are cleared because
-        they belong to the previous active transaction.
-
-        The next step() clears self.bucket before starting the
-        next transaction lifecycle.
-        """
 
         self.tx_index += 1
 
         # --------------------------------------------------
-        # Episode finished
+        # Terminal
+        #
+        # Preserve the actual Bucket.
         # --------------------------------------------------
 
         if self.tx_index >= len(
@@ -3213,22 +2621,16 @@ class RoutingEnv(gym.Env):
             self.current_tx = None
             self.current_paths = []
 
-            # IMPORTANT:
+            # DO NOT CLEAR:
             #
-            # DO NOT clear:
-            #
-            #   self.bucket
-            #   self.current_bucket
-            #   self.backtracker.bucket
-            #
-            # The final real Bucket must remain accessible after
-            # step() returns so the complete End-to-End pipeline
-            # can be inspected and validated.
+            # self.bucket
+            # self.current_bucket
+            # self.backtracker.bucket
 
             return True
 
         # --------------------------------------------------
-        # Next transaction
+        # Non-terminal
         # --------------------------------------------------
 
         self.current_tx = (
@@ -3237,9 +2639,6 @@ class RoutingEnv(gym.Env):
 
         self.current_paths = []
         self.current_bucket = None
-
-        # self.bucket intentionally remains unchanged until
-        # the next step() starts.
 
         self.backtracker.bucket = None
 
@@ -3250,15 +2649,11 @@ class RoutingEnv(gym.Env):
         return False
 
     # ======================================================
-    # RENDER
+    # RENDER / CLOSE
     # ======================================================
 
     def render(self):
         return None
-
-    # ======================================================
-    # CLOSE
-    # ======================================================
 
     def close(self):
         return None
@@ -3582,27 +2977,23 @@ class RoutingEnv(gym.Env):
         bucket,
     ):
         """
-        Count a real PaymentSimulator retry generated by
+        Count a PaymentSimulator retry created by
         PartialBacktracker.
 
-        The retry may not correspond to Bucket.current(),
-        therefore it is recorded explicitly.
+        PartialBacktracker itself deliberately does not
+        modify Bucket.attempts.
         """
 
         if bucket is None:
             raise RuntimeError(
-                "Cannot record external attempt without a Bucket."
+                "Cannot record external attempt without Bucket."
             )
 
-        if not hasattr(
+        attempts = getattr(
             bucket,
             "attempts",
-        ):
-            raise TypeError(
-                "Bucket must expose attempts."
-            )
-
-        attempts = bucket.attempts
+            None,
+        )
 
         if isinstance(
             attempts,
@@ -3626,3 +3017,68 @@ class RoutingEnv(gym.Env):
             )
 
         bucket.attempts = attempts + 1
+
+    @staticmethod
+    def _normalize_failure_index(value):
+        """
+        Normalize a failure index into a valid non-negative integer.
+
+        Accepted inputs
+        ---------------
+        - int
+        - integer-like float
+        - numeric string
+        - None
+
+        Returns
+        -------
+        int | None
+            Normalized failure index, or None when the value cannot be
+            interpreted as a valid non-negative index.
+        """
+
+        if value is None:
+            return None
+
+        # Boolean is technically an int subclass, but it must not be
+        # interpreted as a route position.
+        if isinstance(value, bool):
+            return None
+
+        try:
+            # Direct integer values.
+            if isinstance(value, int):
+                return value if value >= 0 else None
+
+            # Integer-valued floats, e.g. 2.0.
+            if isinstance(value, float):
+                if not value.is_integer():
+                    return None
+                value = int(value)
+                return value if value >= 0 else None
+
+            # Numeric strings, e.g. "2".
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return None
+
+                # Accept "2" but reject "2.5".
+                if value.isdigit():
+                    return int(value)
+
+                parsed = float(value)
+                if not parsed.is_integer():
+                    return None
+
+                parsed = int(parsed)
+                return parsed if parsed >= 0 else None
+
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        return None
+
+# ============================================================
+# End of RoutingEnv
+# ============================================================

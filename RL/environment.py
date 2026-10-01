@@ -1096,6 +1096,20 @@ class RoutingEnv(gym.Env):
               |
               v
         optional full reroute
+
+        Important integration rule
+        --------------------------
+        PartialBacktracker may internally use canonical
+        physical edge identities:
+
+            (source, target, channel_key)
+
+        while Top-K / Bucket / PaymentSimulator may use
+        richer edge dictionaries.
+
+        Before executing a PartialBacktracker retry, the
+        environment restores the exact physical edge
+        representation used by the Bucket candidate.
         """
 
         current_bucket = self.current_bucket
@@ -1401,9 +1415,53 @@ class RoutingEnv(gym.Env):
 
                 if new_path and new_edges:
 
+                    # ------------------------------------------------
+                    # Validate the canonical route returned by
+                    # PartialBacktracker first.
+                    #
+                    # PartialBacktracker may use canonical physical
+                    # edge tuples internally. This validation confirms
+                    # that the route itself is structurally valid before
+                    # restoring the richer Bucket representation.
+                    # ------------------------------------------------
+
                     self._validate_route_edges(
                         new_path,
                         new_edges,
+                    )
+
+                    # ------------------------------------------------
+                    # Restore exact Bucket edge representation.
+                    #
+                    # PartialBacktracker internally works with:
+                    #
+                    #     (source, target, channel_key)
+                    #
+                    # whereas Top-K / Bucket may contain:
+                    #
+                    #     {
+                    #         "source": ...,
+                    #         "target": ...,
+                    #         "channel_key": ...,
+                    #         "scid": ...,
+                    #         "data": ...
+                    #     }
+                    #
+                    # The retry must use the same physical edge
+                    # representation that PaymentSimulator and the
+                    # FailureModel expect.
+                    # ------------------------------------------------
+
+                    retry_edges = (
+                        self._restore_retry_edges_from_bucket(
+                            route=new_path,
+                            edges=new_edges,
+                        )
+                    )
+
+                    self._validate_route_edges(
+                        new_path,
+                        retry_edges,
                     )
 
                     # The returned route is an actual retry
@@ -1419,7 +1477,7 @@ class RoutingEnv(gym.Env):
                     retry_result = (
                         self.payment_simulator.simulate_payment(
                             path=list(new_path),
-                            edges=list(new_edges),
+                            edges=list(retry_edges),
                             amount=tx.amount,
                             tx_id=tx.tx_id,
                         )
@@ -1475,17 +1533,23 @@ class RoutingEnv(gym.Env):
 
                     # ------------------------------------------------
                     # Alternative itself failed.
+                    #
+                    # IMPORTANT:
+                    #
+                    # Failure information must be resolved against
+                    # the exact edge representation that was actually
+                    # passed to PaymentSimulator.
                     # ------------------------------------------------
 
                     retry_failed_edge = self._resolve_failed_edge(
                         result=retry_dict,
-                        edges=new_edges,
+                        edges=retry_edges,
                     )
 
                     retry_failure_index = (
                         self._resolve_failure_index(
                             result=retry_dict,
-                            edges=new_edges,
+                            edges=retry_edges,
                             failed_edge=retry_failed_edge,
                         )
                     )
@@ -1493,9 +1557,9 @@ class RoutingEnv(gym.Env):
                     if (
                         retry_failure_index is not None
                         and
-                        0 <= retry_failure_index < len(new_edges)
+                        0 <= retry_failure_index < len(retry_edges)
                     ):
-                        retry_failed_edge = new_edges[
+                        retry_failed_edge = retry_edges[
                             retry_failure_index
                         ]
 
@@ -1620,6 +1684,322 @@ class RoutingEnv(gym.Env):
                 full_reroute_count
             ),
         }
+
+    # ======================================================
+    # RETRY EDGE REPRESENTATION
+    # ======================================================
+
+    def _restore_retry_edges_from_bucket(
+        self,
+        route,
+        edges,
+    ):
+        """
+        Restore the exact physical-edge representation used by
+        Top-K / Bucket for a PartialBacktracker retry.
+
+        PartialBacktracker operates internally on canonical
+        physical identities:
+
+            (source, target, channel_key)
+
+        while Top-K / Bucket candidates may carry richer edge
+        dictionaries:
+
+            {
+                "source": ...,
+                "target": ...,
+                "channel_key": ...,
+                "scid": ...,
+                "data": ...
+            }
+
+        The retry must preserve that exact representation when
+        passed back into PaymentSimulator and FailureModel.
+
+        Priority
+        --------
+        1. Find the exact alternative route in the active Bucket
+           and restore its original edge dictionaries.
+        2. If no exact Bucket candidate is found, reconstruct the
+           physical edges from the graph while preserving the exact
+           channel key.
+
+        This method does NOT select a new channel.
+
+        It only restores the representation of an already validated
+        physical channel.
+        """
+
+        if not isinstance(
+            route,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "Retry route must be a list or tuple."
+            )
+
+        if not isinstance(
+            edges,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "Retry edges must be a list or tuple."
+            )
+
+        route = list(route)
+        edges = list(edges)
+
+        if len(route) < 2:
+            raise ValueError(
+                "Retry route must contain at least two nodes."
+            )
+
+        if len(edges) != len(route) - 1:
+            raise ValueError(
+                "Retry route and edge counts do not match."
+            )
+
+        canonical_edges = []
+
+        for index, edge in enumerate(edges):
+
+            normalized = self._normalize_edge(
+                edge
+            )
+
+            if normalized is None:
+                raise ValueError(
+                    "Retry contains an invalid physical edge."
+                )
+
+            source, target, channel_key = normalized
+
+            if (
+                source != route[index]
+                or
+                target != route[index + 1]
+            ):
+                raise ValueError(
+                    "Retry edge does not match retry route."
+                )
+
+            canonical_edges.append(
+                normalized
+            )
+
+        # --------------------------------------------------
+        # Preferred source:
+        #
+        # The exact candidate already stored by Bucket.
+        #
+        # This is preferable to reconstructing from G because
+        # the candidate may contain additional physical-edge
+        # metadata such as scid and data.
+        # --------------------------------------------------
+
+        bucket = self.current_bucket
+
+        if bucket is not None:
+
+            bucket_candidates = getattr(
+                bucket,
+                "candidates",
+                None,
+            )
+
+            if isinstance(
+                bucket_candidates,
+                list,
+            ):
+
+                for candidate in bucket_candidates:
+
+                    if not isinstance(
+                        candidate,
+                        dict,
+                    ):
+                        continue
+
+                    candidate_path = candidate.get(
+                        "path"
+                    )
+
+                    if not isinstance(
+                        candidate_path,
+                        (list, tuple),
+                    ):
+                        continue
+
+                    candidate_path = list(
+                        candidate_path
+                    )
+
+                    if candidate_path != route:
+                        continue
+
+                    candidate_edges = candidate.get(
+                        "edges"
+                    )
+
+                    if not isinstance(
+                        candidate_edges,
+                        (list, tuple),
+                    ):
+                        continue
+
+                    candidate_edges = list(
+                        candidate_edges
+                    )
+
+                    if len(candidate_edges) != len(
+                        canonical_edges
+                    ):
+                        continue
+
+                    exact_match = True
+
+                    for (
+                        candidate_edge,
+                        canonical_edge,
+                    ) in zip(
+                        candidate_edges,
+                        canonical_edges,
+                    ):
+
+                        normalized_candidate = (
+                            self._normalize_edge(
+                                candidate_edge
+                            )
+                        )
+
+                        if normalized_candidate != (
+                            canonical_edge
+                        ):
+                            exact_match = False
+                            break
+
+                    if not exact_match:
+                        continue
+
+                    # Return copies of the exact candidate
+                    # dictionaries so later operations cannot
+                    # accidentally mutate Bucket's representation.
+                    restored = []
+
+                    for candidate_edge in candidate_edges:
+
+                        if isinstance(
+                            candidate_edge,
+                            dict,
+                        ):
+                            restored.append(
+                                dict(candidate_edge)
+                            )
+                        else:
+                            restored.append(
+                                candidate_edge
+                            )
+
+                    return restored
+
+        # --------------------------------------------------
+        # Fallback:
+        #
+        # Reconstruct exact physical edge dictionaries from
+        # the graph. The channel key is preserved.
+        # --------------------------------------------------
+
+        restored = []
+
+        for index, canonical_edge in enumerate(
+            canonical_edges
+        ):
+
+            source, target, channel_key = (
+                canonical_edge
+            )
+
+            if self.G.is_multigraph():
+
+                if channel_key is None:
+                    raise ValueError(
+                        "MultiGraph retry requires an exact "
+                        "channel key."
+                    )
+
+                edge_data = self.G.get_edge_data(
+                    source,
+                    target,
+                    channel_key,
+                )
+
+                if edge_data is None:
+                    raise ValueError(
+                        "Exact retry channel does not exist: "
+                        f"({source}, {target}, "
+                        f"{channel_key})."
+                    )
+
+                if not isinstance(
+                    edge_data,
+                    dict,
+                ):
+                    raise TypeError(
+                        "MultiGraph edge data must be a dictionary."
+                    )
+
+                restored_edge = {
+                    "source": source,
+                    "target": target,
+                    "channel_key": channel_key,
+                    "data": dict(edge_data),
+                }
+
+                if "scid" in edge_data:
+                    restored_edge["scid"] = (
+                        edge_data["scid"]
+                    )
+
+                restored.append(
+                    restored_edge
+                )
+
+            else:
+
+                if channel_key is not None:
+                    raise ValueError(
+                        "Simple graph retry must not contain "
+                        "a channel key."
+                    )
+
+                edge_data = self.G.get_edge_data(
+                    source,
+                    target,
+                )
+
+                if edge_data is None:
+                    raise ValueError(
+                        f"Retry edge ({source}, {target}) "
+                        "does not exist."
+                    )
+
+                if not isinstance(
+                    edge_data,
+                    dict,
+                ):
+                    raise TypeError(
+                        "Edge data must be a dictionary."
+                    )
+
+                restored.append(
+                    (
+                        source,
+                        target,
+                    )
+                )
+
+        return restored
 
     # ======================================================
     # FAILURE INFORMATION
@@ -3025,6 +3405,7 @@ class RoutingEnv(gym.Env):
 
         Accepted inputs
         ---------------
+
         - int
         - integer-like float
         - numeric string
@@ -3032,6 +3413,7 @@ class RoutingEnv(gym.Env):
 
         Returns
         -------
+
         int | None
             Normalized failure index, or None when the value cannot be
             interpreted as a valid non-negative index.
@@ -3054,12 +3436,15 @@ class RoutingEnv(gym.Env):
             if isinstance(value, float):
                 if not value.is_integer():
                     return None
+
                 value = int(value)
+
                 return value if value >= 0 else None
 
             # Numeric strings, e.g. "2".
             if isinstance(value, str):
                 value = value.strip()
+
                 if not value:
                     return None
 
@@ -3068,16 +3453,23 @@ class RoutingEnv(gym.Env):
                     return int(value)
 
                 parsed = float(value)
+
                 if not parsed.is_integer():
                     return None
 
                 parsed = int(parsed)
+
                 return parsed if parsed >= 0 else None
 
-        except (TypeError, ValueError, OverflowError):
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
             return None
 
         return None
+
 
 # ============================================================
 # End of RoutingEnv

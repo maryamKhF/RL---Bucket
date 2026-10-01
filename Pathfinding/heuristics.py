@@ -1,25 +1,79 @@
 """
+Pathfinding/heuristics.py
+
 Routing heuristics for Lightning-style payment networks.
 
 Core adaptive-cost model
 ------------------------
 
+    RGB
+      |
+      v
+    Carbon Proxy
+      |
+      v
     raw_h(u,v,eta)
-        |
-        v
-    normalized penalty
-        |
-        v
+      |
+      v
+    normalized adaptive penalty
+      |
+      v
     C'(u,v) = C_LND(u,v) * (1 + lambda_h * penalty)
 
-The same adaptive-cost definition is used by:
 
-    - Dijkstra
-    - Top-K candidate generation
-    - eta sensitivity tests
+Adaptive heuristic
+------------------
 
-Important:
-    capacity is NOT interpreted as directional liquidity.
+    h(u,v,eta)
+        =
+        eta * ((C_u + C_v) / 2)
+        +
+        (1 - eta) * (C_v - C_u)
+
+
+Carbon proxy
+------------
+
+    C = 0.299R + 0.587G + 0.114B
+
+The RGB luminance is used as a proxy because the Lightning
+GML snapshot does not provide a physical numeric carbon-intensity
+measurement.
+
+
+Routing objective
+-----------------
+
+    C_LND = fee + 0.5 * delay + 1
+
+    C_adaptive =
+        C_LND * (1 + lambda_h * penalty)
+
+
+Liquidity
+---------
+
+Liquidity is NOT part of the additive routing cost.
+
+It is a hard feasibility constraint handled by the pathfinding
+layer:
+
+    liquidity < amount
+        -> edge is infeasible
+
+
+Scientific-evaluation policy
+----------------------------
+
+This module does not fabricate missing values.
+
+For routing-cost calculations, required fields are mandatory.
+
+For descriptive path evaluation, optional metrics such as
+liquidity and failure probability are used only when explicitly
+available.
+
+No artificial value is inserted when a metric is absent.
 """
 
 import math
@@ -29,39 +83,55 @@ import math
 # Numeric Helpers
 # ==========================================================
 
-def _safe_float(value, default=0.0):
+def _to_float(value, name):
+    """
+    Convert value to a finite float.
+
+    Invalid values are never silently converted to zero.
+    """
+
     try:
-        value = float(value)
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be numeric; got {value!r}."
+        ) from exc
 
-        if not math.isfinite(value):
-            return float(default)
+    if not math.isfinite(result):
+        raise ValueError(
+            f"{name} must be finite; got {value!r}."
+        )
 
-        return value
-
-    except (TypeError, ValueError):
-        return float(default)
+    return result
 
 
 def _valid_number(value):
-    try:
-        value = float(value)
-        return math.isfinite(value)
+    """
+    Return True if value is numeric and finite.
+    """
 
+    try:
+        result = float(value)
     except (TypeError, ValueError):
         return False
+
+    return math.isfinite(result)
 
 
 def _valid_nonnegative(value):
+    """
+    Return True if value is finite and >= 0.
+    """
+
     try:
-        value = float(value)
-
-        return (
-            math.isfinite(value)
-            and value >= 0.0
-        )
-
+        result = float(value)
     except (TypeError, ValueError):
         return False
+
+    return (
+        math.isfinite(result)
+        and result >= 0.0
+    )
 
 
 # ==========================================================
@@ -70,28 +140,30 @@ def _valid_nonnegative(value):
 
 def validate_eta(eta):
     """
-    Validate and return eta.
+    Validate PPO-controlled eta.
 
-    The PPO action space is [0, 1], therefore the entire
-    routing pipeline uses the same interval.
+    Required range:
+
+        0 <= eta <= 1
+
+    No clipping is performed.
     """
 
     try:
         eta = float(eta)
-
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
         raise ValueError(
-            "eta must be numeric"
-        )
+            "eta must be numeric."
+        ) from exc
 
     if not math.isfinite(eta):
         raise ValueError(
-            "eta must be finite"
+            "eta must be finite."
         )
 
     if not 0.0 <= eta <= 1.0:
         raise ValueError(
-            "eta must satisfy 0 <= eta <= 1"
+            "eta must satisfy 0 <= eta <= 1."
         )
 
     return eta
@@ -103,26 +175,59 @@ def validate_eta(eta):
 
 def validate_lambda_h(lambda_h):
     """
-    Validate adaptive-cost weight.
+    Validate adaptive-cost coefficient.
+
+    Required:
+
+        lambda_h >= 0
     """
 
     try:
         lambda_h = float(lambda_h)
-
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
         raise ValueError(
-            "lambda_h must be numeric"
+            "lambda_h must be numeric."
+        ) from exc
+
+    if not math.isfinite(lambda_h):
+        raise ValueError(
+            "lambda_h must be finite."
         )
 
-    if (
-        not math.isfinite(lambda_h)
-        or lambda_h < 0.0
-    ):
+    if lambda_h < 0.0:
         raise ValueError(
-            "lambda_h must be finite and >= 0"
+            "lambda_h must be >= 0."
         )
 
     return lambda_h
+
+
+# ==========================================================
+# Required Field Helper
+# ==========================================================
+
+def _get_required_field(data, primary, alias):
+    """
+    Read a required field using one primary name and one alias.
+
+    No hidden default is allowed.
+    """
+
+    if not isinstance(data, dict):
+        raise TypeError(
+            "Channel data must be a dictionary."
+        )
+
+    if primary in data:
+        return data[primary]
+
+    if alias in data:
+        return data[alias]
+
+    raise KeyError(
+        f"Missing required channel field "
+        f"'{primary}'/'{alias}'."
+    )
 
 
 # ==========================================================
@@ -140,36 +245,63 @@ def channel_fee(data, amount):
             +
             amount * fee_rate / 1,000,000
 
-    fee_rate is interpreted as PPM.
+    Amount and fee fields must use the same graph unit.
     """
 
-    base_fee = _safe_float(
-        data.get(
+    if not isinstance(data, dict):
+        raise TypeError(
+            "Channel data must be a dictionary."
+        )
+
+    amount = _to_float(
+        amount,
+        "amount",
+    )
+
+    if amount < 0.0:
+        raise ValueError(
+            "amount must be >= 0."
+        )
+
+    base_fee = _to_float(
+        _get_required_field(
+            data,
             "fee_base",
-            data.get(
-                "fee_base_msat",
-                0.0,
-            ),
-        )
+            "fee_base_msat",
+        ),
+        "base_fee",
     )
 
-    fee_rate = _safe_float(
-        data.get(
+    fee_rate = _to_float(
+        _get_required_field(
+            data,
             "fee_rate",
-            data.get(
-                "fee_proportional_millionths",
-                0.0,
-            ),
-        )
+            "fee_proportional_millionths",
+        ),
+        "fee_rate",
     )
 
-    return (
+    if base_fee < 0.0:
+        raise ValueError(
+            f"base_fee must be >= 0; got {base_fee}."
+        )
+
+    if fee_rate < 0.0:
+        raise ValueError(
+            f"fee_rate must be >= 0; got {fee_rate}."
+        )
+
+    fee = (
         base_fee
-        +
-        amount
-        * fee_rate
-        / 1_000_000.0
+        + amount * fee_rate / 1_000_000.0
     )
+
+    if not _valid_nonnegative(fee):
+        raise ValueError(
+            "Calculated channel fee is invalid."
+        )
+
+    return float(fee)
 
 
 # ==========================================================
@@ -178,21 +310,42 @@ def channel_fee(data, amount):
 
 def channel_delay(data):
     """
-    Extract forwarding delay.
+    Extract channel forwarding delay.
+
+    Supported fields:
+
+        delay
+        cltv_expiry_delta
     """
 
-    return max(
-        0.0,
-        _safe_float(
-            data.get(
-                "delay",
-                data.get(
-                    "cltv_expiry_delta",
-                    0.0,
-                ),
-            )
-        ),
+    if not isinstance(data, dict):
+        raise TypeError(
+            "Channel data must be a dictionary."
+        )
+
+    if "delay" in data:
+        value = data["delay"]
+
+    elif "cltv_expiry_delta" in data:
+        value = data["cltv_expiry_delta"]
+
+    else:
+        raise KeyError(
+            "Missing required channel delay field "
+            "'delay'/'cltv_expiry_delta'."
+        )
+
+    delay = _to_float(
+        value,
+        "delay",
     )
+
+    if delay < 0.0:
+        raise ValueError(
+            f"delay must be >= 0; got {delay}."
+        )
+
+    return float(delay)
 
 
 # ==========================================================
@@ -207,14 +360,19 @@ def lnd_cost(
     amount,
 ):
     """
-    Native LND-style routing cost.
+    Native routing cost.
 
-    The native objective combines forwarding fee and delay.
+    Formula:
 
         C_LND = fee + 0.5 * delay + 1
 
-    The constant 1 keeps the edge cost strictly positive.
+    The graph and endpoint arguments are retained for API
+    compatibility with the routing pipeline.
     """
+
+    del G
+    del u
+    del v
 
     fee = channel_fee(
         data,
@@ -222,27 +380,148 @@ def lnd_cost(
     )
 
     delay = channel_delay(
-        data
+        data,
     )
 
     cost = (
         fee
-        +
-        0.5 * delay
-        +
-        1.0
+        + 0.5 * delay
+        + 1.0
     )
 
     if not _valid_nonnegative(cost):
         raise ValueError(
-            "Invalid native LND cost."
+            "Native LND cost is invalid."
         )
 
     return float(cost)
 
 
 # ==========================================================
-# Carbon / Geographic Feature
+# RGB Parsing
+# ==========================================================
+
+def _parse_rgb(rgb, node):
+    """
+    Parse RGB data into:
+
+        (R, G, B)
+
+    Supported forms:
+
+        [R, G, B]
+        (R, G, B)
+
+        {"r": R, "g": G, "b": B}
+        {"red": R, "green": G, "blue": B}
+
+        "#RRGGBB"
+        "RRGGBB"
+
+    All components must be in [0,255].
+    """
+
+    if isinstance(rgb, dict):
+
+        if all(
+            key in rgb
+            for key in ("r", "g", "b")
+        ):
+            values = [
+                rgb["r"],
+                rgb["g"],
+                rgb["b"],
+            ]
+
+        elif all(
+            key in rgb
+            for key in ("red", "green", "blue")
+        ):
+            values = [
+                rgb["red"],
+                rgb["green"],
+                rgb["blue"],
+            ]
+
+        else:
+            raise ValueError(
+                f"RGB dictionary for node {node!r} must contain "
+                f"either r/g/b or red/green/blue; got {rgb!r}."
+            )
+
+        values = [
+            _to_float(
+                value,
+                f"RGB component {index}",
+            )
+            for index, value in enumerate(values)
+        ]
+
+    elif isinstance(rgb, (list, tuple)):
+
+        if len(rgb) < 3:
+            raise ValueError(
+                f"RGB data for node {node!r} must contain "
+                f"at least three values; got {rgb!r}."
+            )
+
+        values = [
+            _to_float(
+                rgb[index],
+                f"RGB component {index}",
+            )
+            for index in range(3)
+        ]
+
+    elif isinstance(rgb, str):
+
+        text = rgb.strip()
+
+        if text.startswith("#"):
+            text = text[1:]
+
+        if len(text) != 6:
+            raise ValueError(
+                f"RGB string for node {node!r} must contain "
+                f"exactly 6 hexadecimal characters; got {rgb!r}."
+            )
+
+        try:
+            values = [
+                float(int(text[0:2], 16)),
+                float(int(text[2:4], 16)),
+                float(int(text[4:6], 16)),
+            ]
+
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid hexadecimal RGB value for "
+                f"node {node!r}: {rgb!r}."
+            ) from exc
+
+    else:
+        raise TypeError(
+            f"Unsupported RGB representation for node "
+            f"{node!r}: {type(rgb).__name__}."
+        )
+
+    for index, value in enumerate(values):
+
+        if not 0.0 <= value <= 255.0:
+            raise ValueError(
+                f"RGB component {index} for node {node!r} "
+                f"must be in [0,255]; got {value}."
+            )
+
+    return (
+        float(values[0]),
+        float(values[1]),
+        float(values[2]),
+    )
+
+
+# ==========================================================
+# Carbon / RGB Luminance
 # ==========================================================
 
 def node_carbon_intensity(
@@ -250,104 +529,65 @@ def node_carbon_intensity(
     node,
 ):
     """
-    Return node carbon intensity.
+    Calculate RGB luminance as the carbon-intensity proxy.
 
-    Supported attributes:
+    Formula:
 
-        rgb_color
-        carbon_intensity
+        C = 0.299R + 0.587G + 0.114B
 
-    Missing values default to zero.
+    This is a proxy, not a physical carbon-emission
+    measurement.
     """
 
     if node not in G:
-        return 0.0
-
-    data = G.nodes[node]
-
-    value = data.get(
-        "carbon_intensity",
-        None,
-    )
-
-    if value is not None:
-        value = _safe_float(
-            value,
-            default=0.0,
+        raise KeyError(
+            f"Node {node!r} does not exist in graph."
         )
 
-        if value >= 0.0:
-            return value
+    node_data = G.nodes[node]
 
-    rgb = data.get(
-        "rgb_color",
-        None,
-    )
+    if "rgb_color" in node_data:
+        rgb = node_data["rgb_color"]
 
-    if rgb is None:
-        return 0.0
+    elif "rgb" in node_data:
+        rgb = node_data["rgb"]
 
-    # ------------------------------------------------------
-    # Numeric RGB representation
-    # ------------------------------------------------------
+    elif "color" in node_data:
+        rgb = node_data["color"]
 
-    if isinstance(
+    elif "fill" in node_data:
+        rgb = node_data["fill"]
+
+    else:
+        raise KeyError(
+            f"Missing RGB data for node {node!r}. "
+            "Cannot compute carbon-intensity proxy."
+        )
+
+    r, g, b = _parse_rgb(
         rgb,
-        (list, tuple),
-    ) and len(rgb) >= 3:
+        node,
+    )
 
-        values = [
-            _safe_float(x)
-            for x in rgb[:3]
-        ]
+    carbon = (
+        0.299 * r
+        + 0.587 * g
+        + 0.114 * b
+    )
 
-        values = [
-            max(0.0, x)
-            for x in values
-        ]
-
-        return float(
-            sum(values) / len(values)
+    if not _valid_number(carbon):
+        raise ValueError(
+            f"Calculated carbon proxy for node "
+            f"{node!r} is not finite."
         )
 
-    # ------------------------------------------------------
-    # String RGB representation
-    # ------------------------------------------------------
+    if not 0.0 <= carbon <= 255.0:
+        raise ValueError(
+            f"Calculated carbon proxy for node "
+            f"{node!r} is outside [0,255]: {carbon}."
+        )
 
-    if isinstance(rgb, str):
-
-        text = rgb.strip()
-
-        if text.startswith("#"):
-            text = text[1:]
-
-        if len(text) == 6:
-
-            try:
-
-                r = int(
-                    text[0:2],
-                    16,
-                )
-
-                g = int(
-                    text[2:4],
-                    16,
-                )
-
-                b = int(
-                    text[4:6],
-                    16,
-                )
-
-                return float(
-                    (r + g + b) / 3.0
-                )
-
-            except ValueError:
-                pass
-
-    return 0.0
+    return float(carbon)
 
 
 # ==========================================================
@@ -361,33 +601,27 @@ def adaptive_heuristic(
     eta,
 ):
     """
-    Calculate the raw adaptive routing heuristic.
+    Calculate the raw adaptive routing signal.
 
     Formula:
 
-        h(u,v) =
+        h(u,v,eta)
+            =
             eta * ((C_u + C_v) / 2)
             +
             (1 - eta) * (C_v - C_u)
 
-    where:
+    Endpoint behavior:
 
-        C_u = carbon intensity of node u
-        C_v = carbon intensity of node v
+        eta = 0:
+            h = C_v - C_u
 
-    eta ∈ [0,1].
-
-    Important:
-        This function returns the raw signal.
-
-        It is NOT used directly as the final edge cost.
-
-        The raw signal is converted into a bounded,
-        non-negative penalty by adaptive_penalty().
+        eta = 1:
+            h = (C_u + C_v) / 2
     """
 
     eta = validate_eta(
-        eta
+        eta,
     )
 
     cu = node_carbon_intensity(
@@ -400,17 +634,18 @@ def adaptive_heuristic(
         v,
     )
 
+    average_component = (
+        cu + cv
+    ) / 2.0
+
+    transition_component = (
+        cv - cu
+    )
+
     value = (
-        eta
-        * (
-            (cu + cv)
-            / 2.0
-        )
+        eta * average_component
         +
-        (1.0 - eta)
-        * (
-            cv - cu
-        )
+        (1.0 - eta) * transition_component
     )
 
     if not _valid_number(value):
@@ -422,7 +657,7 @@ def adaptive_heuristic(
 
 
 # ==========================================================
-# Normalized Adaptive Penalty
+# Adaptive Penalty
 # ==========================================================
 
 def adaptive_penalty(
@@ -432,21 +667,24 @@ def adaptive_penalty(
     eta,
 ):
     """
-    Convert the raw adaptive heuristic into a stable
-    non-negative bounded penalty.
+    Convert raw adaptive signal into bounded penalty.
 
-    raw_h = adaptive_heuristic(...)
+    Normalization:
 
-    penalty =
-        |raw_h| / (1 + |raw_h|)
+        normalized_h = |raw_h| / 255
+
+    Penalty:
+
+        penalty =
+            normalized_h / (1 + normalized_h)
 
     Therefore:
 
-        0 <= penalty < 1
+        0 <= penalty <= 0.5
 
-    This prevents the adaptive signal from producing
-    negative edge costs or dominating the native routing
-    objective because of raw carbon-value scale.
+    The sign of raw_h is intentionally removed because the
+    current adaptive-cost formulation uses a non-negative
+    multiplicative penalty.
     """
 
     raw_h = adaptive_heuristic(
@@ -456,40 +694,35 @@ def adaptive_penalty(
         eta,
     )
 
-    magnitude = abs(
-        raw_h
+    normalized_h = (
+        abs(raw_h)
+        / 255.0
     )
 
     penalty = (
-        magnitude
+        normalized_h
         /
         (
             1.0
-            +
-            magnitude
+            + normalized_h
         )
     )
 
-    if not _valid_number(
-        penalty
-    ):
+    if not _valid_number(penalty):
         raise ValueError(
             "Adaptive penalty is not finite."
         )
 
-    penalty = min(
-        max(
-            penalty,
-            0.0,
-        ),
-        1.0,
-    )
+    if not 0.0 <= penalty <= 0.5:
+        raise ValueError(
+            f"Adaptive penalty outside [0,0.5]: {penalty}."
+        )
 
     return float(penalty)
 
 
 # ==========================================================
-# Adaptive Cost
+# Modified Cost
 # ==========================================================
 
 def modified_cost(
@@ -499,49 +732,45 @@ def modified_cost(
     lambda_h=1.0,
 ):
     """
-    Convert native routing cost into the common adaptive cost.
+    Calculate adaptive routing cost.
 
-    Final objective:
+    Formula:
 
-        C'(e) =
-            C_LND(e)
-            *
-            (
-                1
-                +
-                lambda_h * p(e)
-            )
-
-    where p(e) is the normalized adaptive penalty.
-
-    geo_penalty is expected to already be normalized to [0,1].
-
-    eta is retained in the signature for backward compatibility
-    and for explicit reporting, but the penalty itself is already
-    computed from eta before this function is called.
+        C' =
+            C_LND *
+            (1 + lambda_h * penalty)
     """
 
     if not _valid_nonnegative(
-        native_cost
+        native_cost,
     ):
         raise ValueError(
-            "native_cost must be finite and >= 0"
+            "native_cost must be finite and >= 0."
         )
 
     if not _valid_nonnegative(
-        geo_penalty
+        geo_penalty,
     ):
         raise ValueError(
-            "geo_penalty must be finite and >= 0"
+            "geo_penalty must be finite and >= 0."
         )
 
-    if geo_penalty > 1.0:
+    geo_penalty = float(
+        geo_penalty
+    )
+
+    if geo_penalty > 0.5:
         raise ValueError(
-            "geo_penalty must be normalized to [0,1]"
+            "geo_penalty must be normalized to [0,0.5]."
+        )
+
+    if eta is not None:
+        validate_eta(
+            eta,
         )
 
     lambda_h = validate_lambda_h(
-        lambda_h
+        lambda_h,
     )
 
     cost = (
@@ -549,15 +778,13 @@ def modified_cost(
         *
         (
             1.0
-            +
-            lambda_h
-            * float(geo_penalty)
+            + lambda_h * geo_penalty
         )
     )
 
     if not _valid_nonnegative(cost):
         raise ValueError(
-            "Modified cost is invalid."
+            "Modified adaptive cost is invalid."
         )
 
     return float(cost)
@@ -578,8 +805,7 @@ def adaptive_edge_cost(
     lambda_h=1.0,
 ):
     """
-    Unified edge-cost calculation used by both Dijkstra
-    and Top-K routing.
+    Unified adaptive edge-cost calculation.
 
     Returns:
 
@@ -590,20 +816,16 @@ def adaptive_edge_cost(
             "cost": ...
         }
 
-    PPO controls eta only.
+    A failing custom heuristic is never silently replaced.
     """
 
     eta = validate_eta(
-        eta
+        eta,
     )
 
     lambda_h = validate_lambda_h(
-        lambda_h
+        lambda_h,
     )
-
-    # ------------------------------------------------------
-    # Native cost
-    # ------------------------------------------------------
 
     if heuristic_fn is None:
 
@@ -617,41 +839,30 @@ def adaptive_edge_cost(
 
     else:
 
-        try:
-
-            native_cost = heuristic_fn(
-                G,
-                u,
-                v,
-                data,
-                amount,
+        if not callable(heuristic_fn):
+            raise TypeError(
+                "heuristic_fn must be callable."
             )
 
-        except (
-            TypeError,
-            ValueError,
-            KeyError,
-            AttributeError,
-        ):
-
-            native_cost = lnd_cost(
-                G,
-                u,
-                v,
-                data,
-                amount,
-            )
-
-    if not _valid_nonnegative(
-        native_cost
-    ):
-        raise ValueError(
-            "Native routing cost is invalid."
+        native_cost = heuristic_fn(
+            G,
+            u,
+            v,
+            data,
+            amount,
         )
 
-    # ------------------------------------------------------
-    # Raw adaptive signal
-    # ------------------------------------------------------
+        if not _valid_nonnegative(
+            native_cost,
+        ):
+            raise ValueError(
+                "heuristic_fn returned an invalid "
+                "native routing cost."
+            )
+
+        native_cost = float(
+            native_cost
+        )
 
     raw_h = adaptive_heuristic(
         G,
@@ -660,20 +871,12 @@ def adaptive_edge_cost(
         eta,
     )
 
-    # ------------------------------------------------------
-    # Normalized adaptive penalty
-    # ------------------------------------------------------
-
     penalty = adaptive_penalty(
         G,
         u,
         v,
         eta,
     )
-
-    # ------------------------------------------------------
-    # Final cost
-    # ------------------------------------------------------
 
     cost = modified_cost(
         native_cost=native_cost,
@@ -683,18 +886,10 @@ def adaptive_edge_cost(
     )
 
     return {
-        "native_cost": float(
-            native_cost
-        ),
-        "raw_heuristic": float(
-            raw_h
-        ),
-        "adaptive_penalty": float(
-            penalty
-        ),
-        "cost": float(
-            cost
-        ),
+        "native_cost": float(native_cost),
+        "raw_heuristic": float(raw_h),
+        "adaptive_penalty": float(penalty),
+        "cost": float(cost),
     }
 
 
@@ -712,13 +907,8 @@ def adaptive_lnd_cost(
     lambda_h=1.0,
 ):
     """
-    Convenience wrapper around the unified adaptive cost.
-
-    Use this function when an external component explicitly
-    requests an adaptive LND edge cost.
-
-    Dijkstra and Top-K should normally call adaptive_edge_cost()
-    directly so the native cost is not accidentally wrapped twice.
+    Convenience wrapper around adaptive_edge_cost()
+    using native LND cost.
     """
 
     result = adaptive_edge_cost(
@@ -738,7 +928,7 @@ def adaptive_lnd_cost(
 
 
 # ==========================================================
-# Auxiliary Enhanced Cost
+# Enhanced Diagnostic Cost
 # ==========================================================
 
 def enhanced_cost(
@@ -749,12 +939,29 @@ def enhanced_cost(
     amount,
 ):
     """
-    Auxiliary multi-factor cost.
+    Auxiliary diagnostic cost.
 
-    This function is not the PPO-controlled objective.
+    Formula:
 
-    It can be used for diagnostics or future ablation studies.
+        fee
+        +
+        0.5 * delay
+        +
+        failure_probability
+        +
+        1
+
+    This is NOT the PPO-controlled objective.
     """
+
+    del G
+    del u
+    del v
+
+    if not isinstance(data, dict):
+        raise TypeError(
+            "Channel data must be a dictionary."
+        )
 
     fee = channel_fee(
         data,
@@ -762,42 +969,621 @@ def enhanced_cost(
     )
 
     delay = channel_delay(
-        data
+        data,
     )
 
-    failure_probability = _safe_float(
-        data.get(
-            "failure_probability",
-            0.01,
-        ),
-        default=0.01,
+    if "failure_probability" not in data:
+        raise KeyError(
+            "Missing 'failure_probability' for enhanced_cost()."
+        )
+
+    failure_probability = _to_float(
+        data["failure_probability"],
+        "failure_probability",
     )
 
-    failure_probability = min(
-        max(
-            failure_probability,
-            0.0,
-        ),
-        1.0,
-    )
-
-    reliability_penalty = (
-        failure_probability
-    )
+    if not 0.0 <= failure_probability <= 1.0:
+        raise ValueError(
+            "failure_probability must be in [0,1]."
+        )
 
     cost = (
         fee
-        +
-        0.5 * delay
-        +
-        reliability_penalty
-        +
-        1.0
+        + 0.5 * delay
+        + failure_probability
+        + 1.0
     )
 
-    return max(
-        1e-9,
-        float(cost),
+    if not _valid_nonnegative(cost):
+        raise ValueError(
+            "Enhanced cost is invalid."
+        )
+
+    return float(cost)
+
+
+# ==========================================================
+# MultiGraph Detection
+# ==========================================================
+
+def _is_multigraph(G):
+    """
+    Return True if G is a NetworkX MultiGraph/MultiDiGraph.
+    """
+
+    if hasattr(G, "is_multigraph"):
+        return bool(
+            G.is_multigraph()
+        )
+
+    return False
+
+
+# ==========================================================
+# Path Edge Resolution
+# ==========================================================
+
+def _resolve_path_edge(
+    G,
+    u,
+    v,
+    edge_key=None,
+):
+    """
+    Resolve the exact physical edge used by a path.
+
+    MultiGraph:
+
+        edge_key supplied
+            -> exact channel
+
+        edge_key omitted
+            -> allowed only if exactly one channel exists
+
+    No arbitrary channel is selected.
+    """
+
+    if not G.has_edge(u, v):
+        raise KeyError(
+            f"Path contains missing edge ({u!r}, {v!r})."
+        )
+
+    if _is_multigraph(G):
+
+        channels = G.get_edge_data(
+            u,
+            v,
+        )
+
+        if channels is None:
+            raise KeyError(
+                f"No edge data for ({u!r}, {v!r})."
+            )
+
+        if edge_key is not None:
+
+            if edge_key not in channels:
+                raise KeyError(
+                    f"Edge key {edge_key!r} does not exist "
+                    f"for ({u!r}, {v!r})."
+                )
+
+            edge_data = channels[
+                edge_key
+            ]
+
+            if not isinstance(
+                edge_data,
+                dict,
+            ):
+                raise TypeError(
+                    f"Channel data for "
+                    f"({u!r}, {v!r}, {edge_key!r}) "
+                    f"must be a dictionary."
+                )
+
+            return edge_data
+
+        keys = list(
+            channels.keys()
+        )
+
+        if len(keys) != 1:
+            raise ValueError(
+                f"Multiple channels exist between "
+                f"({u!r}, {v!r}), but no edge key "
+                f"was supplied."
+            )
+
+        edge_data = channels[
+            keys[0]
+        ]
+
+        if not isinstance(
+            edge_data,
+            dict,
+        ):
+            raise TypeError(
+                f"Channel data for "
+                f"({u!r}, {v!r}) must be a dictionary."
+            )
+
+        return edge_data
+
+    if edge_key is not None:
+        raise ValueError(
+            f"edge_key={edge_key!r} supplied for "
+            f"a non-multigraph."
+        )
+
+    edge_data = G.get_edge_data(
+        u,
+        v,
+    )
+
+    if not isinstance(
+        edge_data,
+        dict,
+    ):
+        raise TypeError(
+            f"Edge data for ({u!r}, {v!r}) "
+            f"must be a dictionary."
+        )
+
+    return edge_data
+
+
+# ==========================================================
+# Path Representation Helpers
+# ==========================================================
+
+def _is_single_edge_tuple(G, path):
+    """
+    Determine whether a bare 3-tuple represents one exact
+    MultiGraph edge:
+
+        (u, v, edge_key)
+
+    This prevents ambiguity between:
+
+        ("A", "B", "C")
+
+    as a node path and:
+
+        ("A", "B", "AB-1")
+
+    as one exact channel.
+
+    A bare edge tuple is treated as edge-aware only when the
+    graph confirms that the third item is an actual edge key.
+    """
+
+    if not isinstance(path, tuple):
+        return False
+
+    if len(path) != 3:
+        return False
+
+    if not _is_multigraph(G):
+        return False
+
+    u, v, key = path
+
+    if not G.has_edge(u, v):
+        return False
+
+    channels = G.get_edge_data(
+        u,
+        v,
+    )
+
+    if not isinstance(channels, dict):
+        return False
+
+    return key in channels
+
+
+# ==========================================================
+# Path Transition Builder
+# ==========================================================
+
+def _build_path_transitions(
+    G,
+    path,
+):
+    """
+    Convert path representation into:
+
+        (u, v, edge_key)
+
+    Supported representations:
+
+    1. Node path:
+
+        ["A", "B", "C"]
+
+    2. Edge-aware path:
+
+        [
+            ("A", "B", "AB-1"),
+            ("B", "C", "BC-1")
+        ]
+
+    3. Single-edge edge-aware path:
+
+        [
+            ("A", "B", "AB-1")
+        ]
+
+    4. Bare single-edge tuple:
+
+        ("A", "B", "AB-1")
+
+    The fourth representation is recognized only when
+    the graph confirms that "AB-1" is an actual MultiGraph
+    edge key between A and B.
+
+    No arbitrary parallel channel is selected.
+    """
+
+    if path is None:
+        return []
+
+    if not isinstance(
+        path,
+        (list, tuple),
+    ):
+        raise TypeError(
+            "path must be a list or tuple."
+        )
+
+    if len(path) == 0:
+        return []
+
+    # ======================================================
+    # BARE SINGLE EDGE
+    # ======================================================
+
+    if _is_single_edge_tuple(
+        G,
+        path,
+    ):
+
+        u, v, key = path
+
+        return [
+            (
+                u,
+                v,
+                key,
+            )
+        ]
+
+    # ======================================================
+    # EDGE-AWARE SEQUENCE
+    # ======================================================
+
+    first_item = path[0]
+
+    if (
+        isinstance(first_item, tuple)
+        and len(first_item) == 3
+    ):
+
+        transitions = []
+
+        for index, item in enumerate(path):
+
+            if not (
+                isinstance(item, tuple)
+                and len(item) == 3
+            ):
+                raise ValueError(
+                    "An edge-aware path must contain "
+                    "only (u,v,key) tuples."
+                )
+
+            u, v, key = item
+
+            if index > 0:
+
+                previous = path[
+                    index - 1
+                ]
+
+                previous_v = previous[1]
+
+                if previous_v != u:
+                    raise ValueError(
+                        "Edge-aware path is discontinuous: "
+                        f"{previous_v!r} -> {u!r}."
+                    )
+
+            transitions.append(
+                (
+                    u,
+                    v,
+                    key,
+                )
+            )
+
+        return transitions
+
+    # ======================================================
+    # NODE PATH
+    # ======================================================
+
+    if len(path) < 2:
+        return []
+
+    transitions = []
+
+    for index in range(
+        len(path) - 1
+    ):
+
+        transitions.append(
+            (
+                path[index],
+                path[index + 1],
+                None,
+            )
+        )
+
+    return transitions
+
+
+# ==========================================================
+# Optional Failure Probability
+# ==========================================================
+
+def _optional_failure_probability(
+    edge_data,
+    edge_description,
+):
+    """
+    Resolve failure probability when available.
+
+    Supported forms:
+
+        failure_probability
+
+    or:
+
+        success_count
+        failure_count
+
+    Returns:
+
+        None
+            if no reliability information exists.
+
+        float in [0,1]
+            if reliability information exists.
+
+    No artificial fallback is created.
+    """
+
+    if (
+        "success_count" in edge_data
+        and "failure_count" in edge_data
+    ):
+
+        success = _to_float(
+            edge_data["success_count"],
+            f"success_count[{edge_description}]",
+        )
+
+        failure = _to_float(
+            edge_data["failure_count"],
+            f"failure_count[{edge_description}]",
+        )
+
+        if success < 0.0:
+            raise ValueError(
+                f"success_count must be >= 0 "
+                f"for {edge_description}."
+            )
+
+        if failure < 0.0:
+            raise ValueError(
+                f"failure_count must be >= 0 "
+                f"for {edge_description}."
+            )
+
+        total = (
+            success
+            + failure
+        )
+
+        if total > 0.0:
+
+            probability = (
+                failure / total
+            )
+
+        elif "failure_probability" in edge_data:
+
+            probability = _to_float(
+                edge_data["failure_probability"],
+                f"failure_probability[{edge_description}]",
+            )
+
+        else:
+
+            return None
+
+    elif "failure_probability" in edge_data:
+
+        probability = _to_float(
+            edge_data["failure_probability"],
+            f"failure_probability[{edge_description}]",
+        )
+
+    else:
+
+        return None
+
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(
+            f"failure_probability for "
+            f"{edge_description} must be in [0,1]; "
+            f"got {probability}."
+        )
+
+    return float(
+        probability
+    )
+
+
+# ==========================================================
+# Optional Liquidity
+# ==========================================================
+
+def _optional_edge_liquidity(
+    edge_data,
+    edge_description,
+):
+    """
+    Resolve directional liquidity when available.
+
+    Supported fields:
+
+        estimated_liquidity
+        liquidity_uv
+        balance_uv
+
+    Returns None when the graph does not provide a recognized
+    liquidity field.
+
+    No artificial liquidity value is created.
+    """
+
+    if "estimated_liquidity" in edge_data:
+
+        liquidity = _to_float(
+            edge_data["estimated_liquidity"],
+            f"estimated_liquidity[{edge_description}]",
+        )
+
+    elif "liquidity_uv" in edge_data:
+
+        liquidity = _to_float(
+            edge_data["liquidity_uv"],
+            f"liquidity_uv[{edge_description}]",
+        )
+
+    elif "balance_uv" in edge_data:
+
+        liquidity = _to_float(
+            edge_data["balance_uv"],
+            f"balance_uv[{edge_description}]",
+        )
+
+    else:
+
+        return None
+
+    if liquidity < 0.0:
+        raise ValueError(
+            f"Liquidity must be >= 0 for "
+            f"{edge_description}."
+        )
+
+    return float(
+        liquidity
+    )
+
+
+# ==========================================================
+# Backward-Compatible Liquidity Resolver
+# ==========================================================
+
+def _edge_liquidity(
+    edge_data,
+    edge_description,
+):
+    """
+    Strict liquidity resolver.
+
+    This function is retained for callers that explicitly
+    require liquidity.
+
+    evaluate_path() uses the optional resolver because
+    descriptive evaluation must not fabricate or require a
+    metric that is absent from the graph.
+    """
+
+    liquidity = _optional_edge_liquidity(
+        edge_data,
+        edge_description,
+    )
+
+    if liquidity is None:
+        raise KeyError(
+            f"Missing directional liquidity information "
+            f"for {edge_description}."
+        )
+
+    return liquidity
+
+
+# ==========================================================
+# Geographic Coordinates
+# ==========================================================
+
+def _node_coordinates(
+    G,
+    node,
+):
+    """
+    Return validated:
+
+        latitude, longitude
+    """
+
+    if node not in G:
+        raise KeyError(
+            f"Node {node!r} does not exist in graph."
+        )
+
+    node_data = G.nodes[node]
+
+    if "latitude" not in node_data:
+        raise KeyError(
+            f"Missing latitude for node {node!r}."
+        )
+
+    if "longitude" not in node_data:
+        raise KeyError(
+            f"Missing longitude for node {node!r}."
+        )
+
+    latitude = _to_float(
+        node_data["latitude"],
+        f"latitude[{node!r}]",
+    )
+
+    longitude = _to_float(
+        node_data["longitude"],
+        f"longitude[{node!r}]",
+    )
+
+    if not -90.0 <= latitude <= 90.0:
+        raise ValueError(
+            f"latitude[{node!r}] outside [-90,90]: "
+            f"{latitude}"
+        )
+
+    if not -180.0 <= longitude <= 180.0:
+        raise ValueError(
+            f"longitude[{node!r}] outside [-180,180]: "
+            f"{longitude}"
+        )
+
+    return (
+        latitude,
+        longitude,
     )
 
 
@@ -811,142 +1597,281 @@ def evaluate_path(
     amount,
 ):
     """
-    Calculate descriptive metrics for a completed path.
+    Evaluate a path descriptively.
 
-    This function does not determine the route.
+    Supported:
+
+        Node path:
+            ["A", "B", "C"]
+
+        Edge-aware path:
+            [
+                ("A", "B", "AB-1"),
+                ("B", "C", "BC-1")
+            ]
+
+        Single edge:
+            [
+                ("A", "B", "AB-1")
+            ]
+
+        Bare single edge:
+            ("A", "B", "AB-1")
+
+    Returned metrics:
+
+        success
+        total_fee
+        total_delay
+        min_liquidity
+        reliability
+        total_distance_km
+        total_carbon
+
+    Important rules:
+
+    1. Exact channel key is respected.
+    2. No arbitrary parallel channel is selected.
+    3. Carbon is counted once per unique node.
+    4. Missing optional liquidity does not become zero.
+    5. Missing optional reliability does not become zero.
     """
 
-    if not path or len(path) < 2:
-        return {
-            "success": False,
-            "total_fee": 0.0,
-            "total_delay": 0.0,
-            "min_liquidity": None,
-            "reliability": 0.0,
-            "total_distance_km": 0.0,
-            "total_carbon": 0.0,
-        }
+    empty_result = {
+        "success": False,
+        "total_fee": 0.0,
+        "total_delay": 0.0,
+        "min_liquidity": None,
+        "reliability": None,
+        "total_distance_km": 0.0,
+        "total_carbon": 0.0,
+    }
+
+    # ======================================================
+    # PATH INPUT
+    # ======================================================
+
+    if path is None:
+        return empty_result
+
+    if not isinstance(
+        path,
+        (list, tuple),
+    ):
+        raise TypeError(
+            "path must be a list or tuple."
+        )
+
+    if len(path) == 0:
+        return empty_result
+
+    amount = _to_float(
+        amount,
+        "amount",
+    )
+
+    if amount < 0.0:
+        raise ValueError(
+            "amount must be >= 0."
+        )
+
+    # ======================================================
+    # BUILD TRANSITIONS
+    # ======================================================
+
+    transitions = _build_path_transitions(
+        G,
+        path,
+    )
+
+    if not transitions:
+        return empty_result
+
+    # ======================================================
+    # ACCUMULATORS
+    # ======================================================
 
     total_fee = 0.0
     total_delay = 0.0
     total_distance = 0.0
-    total_carbon = 0.0
 
-    reliability = 1.0
     known_liquidity = []
+    reliability_values = []
 
-    for u, v in zip(
-        path[:-1],
-        path[1:],
-    ):
+    # ======================================================
+    # ORDERED NODES
+    # ======================================================
 
-        if not G.has_edge(u, v):
-            return {
-                "success": False,
-                "total_fee": 0.0,
-                "total_delay": 0.0,
-                "min_liquidity": None,
-                "reliability": 0.0,
-                "total_distance_km": 0.0,
-                "total_carbon": 0.0,
-            }
+    ordered_nodes = []
 
-        data = G[u][v]
+    for index, (
+        u,
+        v,
+        edge_key,
+    ) in enumerate(transitions):
 
-        if hasattr(
-            data,
-            "items",
-        ) and data and all(
-            isinstance(value, dict)
-            for value in data.values()
-        ):
-            # MultiDiGraph: use first channel for descriptive
-            # evaluation when no explicit key is supplied.
-            key = next(
-                iter(data)
+        if index == 0:
+
+            ordered_nodes.append(
+                u
             )
-            edge_data = data[key]
 
         else:
-            edge_data = data
+
+            previous_v = transitions[
+                index - 1
+            ][1]
+
+            if previous_v != u:
+                raise ValueError(
+                    "Path transitions are not continuous: "
+                    f"{previous_v!r} -> {u!r}."
+                )
+
+        ordered_nodes.append(
+            v
+        )
+
+    # ======================================================
+    # EDGE EVALUATION
+    # ======================================================
+
+    for u, v, edge_key in transitions:
+
+        edge_description = (
+            f"({u!r},{v!r},{edge_key!r})"
+        )
+
+        # --------------------------------------------------
+        # EXACT CHANNEL
+        # --------------------------------------------------
+
+        edge_data = _resolve_path_edge(
+            G,
+            u,
+            v,
+            edge_key,
+        )
+
+        # --------------------------------------------------
+        # FEE
+        # --------------------------------------------------
 
         total_fee += channel_fee(
             edge_data,
             amount,
         )
 
+        # --------------------------------------------------
+        # DELAY
+        # --------------------------------------------------
+
         total_delay += channel_delay(
-            edge_data
+            edge_data,
         )
 
-        success = _safe_float(
-            edge_data.get(
-                "success_count",
-                0.0,
+        # --------------------------------------------------
+        # OPTIONAL RELIABILITY
+        # --------------------------------------------------
+
+        failure_probability = (
+            _optional_failure_probability(
+                edge_data,
+                edge_description,
             )
         )
 
-        failure = _safe_float(
-            edge_data.get(
-                "failure_count",
-                0.0,
+        if failure_probability is not None:
+
+            reliability_values.append(
+                1.0
+                - failure_probability
             )
+
+        # --------------------------------------------------
+        # OPTIONAL LIQUIDITY
+        # --------------------------------------------------
+
+        liquidity = _optional_edge_liquidity(
+            edge_data,
+            edge_description,
         )
-
-        total = success + failure
-
-        if total > 0:
-            failure_probability = (
-                failure / total
-            )
-
-        else:
-            failure_probability = _safe_float(
-                edge_data.get(
-                    "failure_probability",
-                    0.01,
-                ),
-                default=0.01,
-            )
-
-        failure_probability = min(
-            max(
-                failure_probability,
-                0.0,
-            ),
-            1.0,
-        )
-
-        reliability *= (
-            1.0
-            -
-            failure_probability
-        )
-
-        liquidity = None
-
-        for field in (
-            "estimated_liquidity",
-            "liquidity_uv",
-            "balance_uv",
-        ):
-
-            if field not in edge_data:
-                continue
-
-            value = _safe_float(
-                edge_data.get(field),
-                default=-1.0,
-            )
-
-            if value >= 0.0:
-                liquidity = value
-                break
 
         if liquidity is not None:
+
             known_liquidity.append(
                 liquidity
             )
+
+        # --------------------------------------------------
+        # GEOGRAPHIC DISTANCE
+        # --------------------------------------------------
+
+        lat1, lon1 = _node_coordinates(
+            G,
+            u,
+        )
+
+        lat2, lon2 = _node_coordinates(
+            G,
+            v,
+        )
+
+        total_distance += (
+            _haversine_distance_km(
+                lat1,
+                lon1,
+                lat2,
+                lon2,
+            )
+        )
+
+    # ======================================================
+    # UNIQUE NODE CARBON
+    # ======================================================
+
+    unique_nodes = []
+    seen_nodes = set()
+
+    for node in ordered_nodes:
+
+        if node not in seen_nodes:
+
+            seen_nodes.add(node)
+            unique_nodes.append(node)
+
+    total_carbon = 0.0
+
+    for node in unique_nodes:
+
+        total_carbon += (
+            node_carbon_intensity(
+                G,
+                node,
+            )
+        )
+
+    # ======================================================
+    # PATH RELIABILITY
+    # ======================================================
+
+    if reliability_values:
+
+        path_reliability = 1.0
+
+        for edge_reliability in reliability_values:
+
+            path_reliability *= (
+                edge_reliability
+            )
+
+    else:
+
+        path_reliability = None
+
+    # ======================================================
+    # FINAL RESULT
+    # ======================================================
 
     return {
         "success": True,
@@ -961,8 +1886,10 @@ def evaluate_path(
             if known_liquidity
             else None
         ),
-        "reliability": float(
-            reliability
+        "reliability": (
+            float(path_reliability)
+            if path_reliability is not None
+            else None
         ),
         "total_distance_km": float(
             total_distance
@@ -971,3 +1898,121 @@ def evaluate_path(
             total_carbon
         ),
     }
+
+
+# ==========================================================
+# Haversine Distance
+# ==========================================================
+
+def _haversine_distance_km(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+):
+    """
+    Calculate geographic distance using the Haversine formula.
+
+    Earth radius:
+
+        R = 6371 km
+    """
+
+    lat1 = _to_float(
+        lat1,
+        "lat1",
+    )
+
+    lon1 = _to_float(
+        lon1,
+        "lon1",
+    )
+
+    lat2 = _to_float(
+        lat2,
+        "lat2",
+    )
+
+    lon2 = _to_float(
+        lon2,
+        "lon2",
+    )
+
+    if not -90.0 <= lat1 <= 90.0:
+        raise ValueError(
+            f"lat1 outside [-90,90]: {lat1}"
+        )
+
+    if not -90.0 <= lat2 <= 90.0:
+        raise ValueError(
+            f"lat2 outside [-90,90]: {lat2}"
+        )
+
+    if not -180.0 <= lon1 <= 180.0:
+        raise ValueError(
+            f"lon1 outside [-180,180]: {lon1}"
+        )
+
+    if not -180.0 <= lon2 <= 180.0:
+        raise ValueError(
+            f"lon2 outside [-180,180]: {lon2}"
+        )
+
+    radius_km = 6371.0
+
+    phi1 = math.radians(
+        lat1
+    )
+
+    phi2 = math.radians(
+        lat2
+    )
+
+    dphi = math.radians(
+        lat2 - lat1
+    )
+
+    dlambda = math.radians(
+        lon2 - lon1
+    )
+
+    a = (
+        math.sin(dphi / 2.0) ** 2
+        +
+        math.cos(phi1)
+        *
+        math.cos(phi2)
+        *
+        math.sin(dlambda / 2.0) ** 2
+    )
+
+    # Numerical round-off protection only.
+    a = min(
+        1.0,
+        max(
+            0.0,
+            a,
+        ),
+    )
+
+    c = (
+        2.0
+        *
+        math.atan2(
+            math.sqrt(a),
+            math.sqrt(
+                1.0 - a
+            ),
+        )
+    )
+
+    distance = (
+        radius_km * c
+    )
+
+    if not _valid_nonnegative(distance):
+        raise ValueError(
+            "Calculated Haversine distance is invalid."
+        )
+
+    return float(distance)

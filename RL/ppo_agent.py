@@ -1,5 +1,7 @@
 # RL/ppo_agent.py
 
+from numbers import Real
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 
@@ -19,14 +21,58 @@ def build_ppo(
         - Payment simulation
         - Failure handling
         - Reward calculation
+        - Mapping PPO action to the routing parameter eta
 
     PPO is responsible for learning the routing heuristic
     parameter eta from the observed network state.
+
+    Important routing constraint
+    ----------------------------
+    The number of candidate routes k is NOT controlled by PPO.
+
+    k is fixed by the routing configuration and is assumed to be:
+
+        k = 5
+
+    Therefore the PPO action space is intended to control
+    eta only.
+
+    PPO flow
+    --------
+
+        Network State
+             |
+             v
+        Observation
+             |
+             v
+            PPO
+             |
+             v
+          Action
+             |
+             v
+            eta
+             |
+             v
+        Modified Heuristic
+             |
+             v
+          Top-K
+          k = 5
+             |
+             v
+          Bucket
     """
 
     # =====================================================
     # RL CONFIGURATION
     # =====================================================
+
+    if not isinstance(cfg, dict):
+        raise TypeError(
+            "'cfg' must be a dictionary."
+        )
 
     if "rl" not in cfg:
         raise KeyError(
@@ -34,6 +80,11 @@ def build_ppo(
         )
 
     rl_cfg = cfg["rl"]
+
+    if not isinstance(rl_cfg, dict):
+        raise TypeError(
+            "'rl' configuration must be a dictionary."
+        )
 
     # =====================================================
     # ENVIRONMENT CHECK
@@ -56,6 +107,39 @@ def build_ppo(
     if not hasattr(env, "action_space"):
         raise AttributeError(
             "Environment must define action_space."
+        )
+
+    if env.observation_space is None:
+        raise ValueError(
+            "Environment observation_space cannot be None."
+        )
+
+    if env.action_space is None:
+        raise ValueError(
+            "Environment action_space cannot be None."
+        )
+
+    # =====================================================
+    # FIXED TOP-K CONFIGURATION
+    # =====================================================
+
+    # k is intentionally fixed and is NOT an RL action.
+    #
+    # The routing architecture used by this project is:
+    #
+    #     PPO -> eta -> heuristic -> Top-K
+    #
+    # with:
+    #
+    #     k = 5
+    #
+    # Therefore PPO learns only eta.
+
+    fixed_k = 5
+
+    if fixed_k != 5:
+        raise RuntimeError(
+            "The routing configuration requires fixed k = 5."
         )
 
     # =====================================================
@@ -85,15 +169,30 @@ def build_ppo(
             "'hidden_layers' cannot be empty."
         )
 
-    hidden_layers = [
-        int(layer)
-        for layer in hidden_layers
-    ]
+    validated_hidden_layers = []
 
-    if any(layer <= 0 for layer in hidden_layers):
-        raise ValueError(
-            "All hidden-layer sizes must be positive."
+    for layer in hidden_layers:
+
+        if isinstance(layer, bool):
+            raise TypeError(
+                "Hidden-layer sizes must be integers."
+            )
+
+        if not isinstance(layer, int):
+            raise TypeError(
+                "Hidden-layer sizes must be integers."
+            )
+
+        if layer <= 0:
+            raise ValueError(
+                "All hidden-layer sizes must be positive."
+            )
+
+        validated_hidden_layers.append(
+            layer
         )
+
+    hidden_layers = validated_hidden_layers
 
     policy_kwargs = {
         "net_arch": hidden_layers
@@ -108,53 +207,175 @@ def build_ppo(
         3e-4
     )
 
-    n_steps = int(
-        rl_cfg.get(
-            "n_steps",
-            2048
-        )
+    n_steps = rl_cfg.get(
+        "n_steps",
+        2048
     )
 
-    batch_size = int(
-        rl_cfg.get(
-            "batch_size",
-            64
-        )
+    batch_size = rl_cfg.get(
+        "batch_size",
+        64
     )
 
-    n_epochs = int(
-        rl_cfg.get(
-            "n_epochs",
-            10
-        )
+    n_epochs = rl_cfg.get(
+        "n_epochs",
+        10
     )
+
+    gamma = rl_cfg.get(
+        "gamma",
+        0.99
+    )
+
+    gae_lambda = rl_cfg.get(
+        "gae_lambda",
+        0.95
+    )
+
+    clip_range = rl_cfg.get(
+        "clip_range",
+        0.2
+    )
+
+    ent_coef = rl_cfg.get(
+        "ent_coef",
+        0.0
+    )
+
+    # =====================================================
+    # HYPERPARAMETER TYPE VALIDATION
+    # =====================================================
+
+    # -----------------------------------------------------
+    # learning_rate
+    # -----------------------------------------------------
+
+    if isinstance(learning_rate, bool):
+        raise TypeError(
+            "'learning_rate' must be a real numeric value."
+        )
+
+    if not isinstance(learning_rate, Real):
+        raise TypeError(
+            "'learning_rate' must be a real numeric value."
+        )
+
+    learning_rate = float(
+        learning_rate
+    )
+
+    # -----------------------------------------------------
+    # n_steps
+    # -----------------------------------------------------
+
+    if isinstance(n_steps, bool):
+        raise TypeError(
+            "'n_steps' must be an integer."
+        )
+
+    if not isinstance(n_steps, int):
+        raise TypeError(
+            "'n_steps' must be an integer."
+        )
+
+    # -----------------------------------------------------
+    # batch_size
+    # -----------------------------------------------------
+
+    if isinstance(batch_size, bool):
+        raise TypeError(
+            "'batch_size' must be an integer."
+        )
+
+    if not isinstance(batch_size, int):
+        raise TypeError(
+            "'batch_size' must be an integer."
+        )
+
+    # -----------------------------------------------------
+    # n_epochs
+    # -----------------------------------------------------
+
+    if isinstance(n_epochs, bool):
+        raise TypeError(
+            "'n_epochs' must be an integer."
+        )
+
+    if not isinstance(n_epochs, int):
+        raise TypeError(
+            "'n_epochs' must be an integer."
+        )
+
+    # -----------------------------------------------------
+    # gamma
+    # -----------------------------------------------------
+
+    if isinstance(gamma, bool):
+        raise TypeError(
+            "'gamma' must be a real numeric value."
+        )
+
+    if not isinstance(gamma, Real):
+        raise TypeError(
+            "'gamma' must be a real numeric value."
+        )
 
     gamma = float(
-        rl_cfg.get(
-            "gamma",
-            0.99
-        )
+        gamma
     )
+
+    # -----------------------------------------------------
+    # gae_lambda
+    # -----------------------------------------------------
+
+    if isinstance(gae_lambda, bool):
+        raise TypeError(
+            "'gae_lambda' must be a real numeric value."
+        )
+
+    if not isinstance(gae_lambda, Real):
+        raise TypeError(
+            "'gae_lambda' must be a real numeric value."
+        )
 
     gae_lambda = float(
-        rl_cfg.get(
-            "gae_lambda",
-            0.95
-        )
+        gae_lambda
     )
+
+    # -----------------------------------------------------
+    # clip_range
+    # -----------------------------------------------------
+
+    if isinstance(clip_range, bool):
+        raise TypeError(
+            "'clip_range' must be a real numeric value."
+        )
+
+    if not isinstance(clip_range, Real):
+        raise TypeError(
+            "'clip_range' must be a real numeric value."
+        )
 
     clip_range = float(
-        rl_cfg.get(
-            "clip_range",
-            0.2
-        )
+        clip_range
     )
 
-    ent_coef = float(
-        rl_cfg.get(
-            "ent_coef",
-            0.0
+    # -----------------------------------------------------
+    # ent_coef
+    # -----------------------------------------------------
+
+    if isinstance(ent_coef, bool):
+        raise TypeError(
+            "'ent_coef' must be a real numeric value."
         )
+
+    if not isinstance(ent_coef, Real):
+        raise TypeError(
+            "'ent_coef' must be a real numeric value."
+        )
+
+    ent_coef = float(
+        ent_coef
     )
 
     # =====================================================
@@ -175,6 +396,18 @@ def build_ppo(
         raise ValueError(
             "'batch_size' cannot be larger than 'n_steps'."
         )
+
+    # -----------------------------------------------------
+    # Experimental configuration constraint
+    # -----------------------------------------------------
+    #
+    # This is a project-level constraint for the current
+    # PPO experiments. It is not a fundamental requirement
+    # of PPO itself.
+    #
+    # Keeping n_steps divisible by batch_size provides a
+    # clean and deterministic minibatch configuration for
+    # the experiments.
 
     if n_steps % batch_size != 0:
         raise ValueError(
@@ -213,6 +446,94 @@ def build_ppo(
         )
 
     # =====================================================
+    # SEED VALIDATION
+    # =====================================================
+
+    if isinstance(seed, bool):
+        raise TypeError(
+            "'seed' must be an integer or None."
+        )
+
+    if seed is not None:
+
+        if not isinstance(seed, int):
+            raise TypeError(
+                "'seed' must be an integer or None."
+            )
+
+        if seed < 0:
+            raise ValueError(
+                "'seed' must be non-negative."
+            )
+
+    # =====================================================
+    # VERBOSE VALIDATION
+    # =====================================================
+
+    verbose = rl_cfg.get(
+        "verbose",
+        1
+    )
+
+    if isinstance(verbose, bool):
+        raise TypeError(
+            "'verbose' must be an integer."
+        )
+
+    if not isinstance(verbose, int):
+        raise TypeError(
+            "'verbose' must be an integer."
+        )
+
+    if verbose not in (0, 1, 2):
+        raise ValueError(
+            "'verbose' must be 0, 1, or 2."
+        )
+
+    # =====================================================
+    # TENSORBOARD CONFIGURATION
+    # =====================================================
+
+    tensorboard_log = rl_cfg.get(
+        "tensorboard_log",
+        "./logs/"
+    )
+
+    if tensorboard_log is not None:
+
+        if not isinstance(
+            tensorboard_log,
+            str
+        ):
+            raise TypeError(
+                "'tensorboard_log' must be a string or None."
+            )
+
+        if tensorboard_log == "":
+            raise ValueError(
+                "'tensorboard_log' cannot be an empty string."
+            )
+
+    # =====================================================
+    # DEVICE CONFIGURATION
+    # =====================================================
+
+    device = rl_cfg.get(
+        "device",
+        "auto"
+    )
+
+    if not isinstance(device, str):
+        raise TypeError(
+            "'device' must be a string."
+        )
+
+    if device == "":
+        raise ValueError(
+            "'device' cannot be an empty string."
+        )
+
+    # =====================================================
     # PPO MODEL
     # =====================================================
 
@@ -232,10 +553,7 @@ def build_ppo(
         # Training output
         # -------------------------------------------------
 
-        verbose=rl_cfg.get(
-            "verbose",
-            1
-        ),
+        verbose=verbose,
 
         # -------------------------------------------------
         # PPO hyperparameters
@@ -267,19 +585,13 @@ def build_ppo(
         # TensorBoard
         # -------------------------------------------------
 
-        tensorboard_log=rl_cfg.get(
-            "tensorboard_log",
-            "./logs/"
-        ),
+        tensorboard_log=tensorboard_log,
 
         # -------------------------------------------------
         # Device
         # -------------------------------------------------
 
-        device=rl_cfg.get(
-            "device",
-            "auto"
-        )
+        device=device
     )
 
     return model

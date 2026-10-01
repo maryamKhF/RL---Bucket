@@ -6,34 +6,44 @@ Lightning Network failure simulation model.
 Responsibilities
 ----------------
 1. Assign static failure probabilities to channels.
-2. Evaluate node/channel/liquidity failures during payment execution.
+2. Evaluate node/channel/liquidity failures during one payment.
 3. Return the exact failed element and failure position.
 4. Provide failure information required by Partial Backtracking.
 5. Reset temporary runtime failure state between episodes.
 
-Design
-------
+Architecture
+------------
 The NetworkX graph G is the single source of truth for network state.
 
-The model is intentionally separated from:
+FailureModel is intentionally separated from:
+
     - routing
     - Bucket
     - Partial Backtracking
     - PPO
     - Onion routing
+    - settlement
 
 Important semantic rules
 ------------------------
 - Channel capacity is NOT directional liquidity.
 - Unknown directional liquidity is NOT treated as zero.
-- A known directional liquidity value may reject a payment.
-- A stochastic liquidity/forwarding failure may still occur when
-  liquidity is unknown or sufficient.
-- Exact MultiDiGraph channel keys are preserved whenever available.
-- FailureModel evaluates exactly one payment attempt.
-- Bucket and Backtracking logic are handled outside this module.
+- Known insufficient directional liquidity causes deterministic failure.
+- Known sufficient or unknown liquidity may still experience
+  stochastic forwarding failure.
+- Exact MultiDiGraph channel keys are mandatory when the graph
+  contains parallel channels.
+- FailureModel evaluates exactly ONE payment attempt.
 - FailureModel never selects an alternative route.
 - FailureModel never modifies Bucket state.
+- FailureModel never performs backtracking.
+- FailureModel never performs settlement.
+- Explicitly malformed probability attributes are rejected.
+- No arbitrary parallel channel is selected silently.
+- A node's stochastic failure state is evaluated at most once
+  during a single payment attempt.
+- Geographic intercontinental classification uses country
+  information first and Haversine distance only as fallback.
 """
 
 from __future__ import annotations
@@ -41,7 +51,7 @@ from __future__ import annotations
 from datetime import datetime
 import math
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -56,7 +66,7 @@ def assign_failure_probabilities(
     seed=42,
 ):
     """
-    Assign static channel-specific failure probabilities.
+    Assign deterministic channel-specific failure probabilities.
 
     Static channel attributes
     -------------------------
@@ -74,15 +84,15 @@ def assign_failure_probabilities(
         Network graph.
 
     average_rate : float
-        Mean channel failure probability.
+        Mean channel failure probability in [0, 1].
 
     seed : int
-        Seed used for deterministic probability assignment.
+        Deterministic NumPy RNG seed.
 
     Returns
     -------
     networkx.Graph
-        The same graph instance after attributes are assigned.
+        The same graph instance.
     """
 
     if G is None:
@@ -95,18 +105,13 @@ def assign_failure_probabilities(
         "average_rate",
     )
 
-    try:
-        seed = int(seed)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "seed must be an integer."
-        )
+    seed = _validate_seed(
+        seed
+    )
 
-    rng = np.random.default_rng(seed)
-
-    # --------------------------------------------------------
-    # MultiGraph / MultiDiGraph
-    # --------------------------------------------------------
+    rng = np.random.default_rng(
+        seed
+    )
 
     if G.is_multigraph():
 
@@ -126,16 +131,13 @@ def assign_failure_probabilities(
                 rng=rng,
             )
 
-            data["failure_probability"] = probability
+            data["failure_probability"] = (
+                probability
+            )
 
-            # Runtime failure state.
             data["available"] = True
             data["failure_count"] = 0
             data["last_failure"] = None
-
-    # --------------------------------------------------------
-    # Graph / DiGraph
-    # --------------------------------------------------------
 
     else:
 
@@ -154,9 +156,10 @@ def assign_failure_probabilities(
                 rng=rng,
             )
 
-            data["failure_probability"] = probability
+            data["failure_probability"] = (
+                probability
+            )
 
-            # Runtime failure state.
             data["available"] = True
             data["failure_count"] = 0
             data["last_failure"] = None
@@ -173,22 +176,34 @@ def _validate_probability(
     name,
 ):
     """
-    Validate a probability value.
+    Validate probability in [0, 1].
 
-    Returns
-    -------
-    float
-        Valid probability in [0, 1].
+    bool is rejected explicitly.
     """
+
+    if isinstance(
+        value,
+        bool,
+    ):
+        raise TypeError(
+            f"{name} must be numeric, not bool."
+        )
 
     try:
         value = float(value)
-    except (TypeError, ValueError):
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+
         raise ValueError(
             f"{name} must be numeric."
-        )
+        ) from exc
 
-    if not math.isfinite(value):
+    if not math.isfinite(
+        value
+    ):
         raise ValueError(
             f"{name} must be finite."
         )
@@ -202,6 +217,38 @@ def _validate_probability(
 
 
 # ============================================================
+# Seed Validation
+# ============================================================
+
+def _validate_seed(
+    seed,
+):
+    """
+    Validate integer RNG seed.
+
+    bool is rejected.
+    """
+
+    if isinstance(
+        seed,
+        bool,
+    ):
+        raise TypeError(
+            "seed must be an integer."
+        )
+
+    if not isinstance(
+        seed,
+        (int, np.integer),
+    ):
+        raise TypeError(
+            "seed must be an integer."
+        )
+
+    return int(seed)
+
+
+# ============================================================
 # Amount Validation
 # ============================================================
 
@@ -209,20 +256,32 @@ def _validate_amount(
     amount,
 ):
     """
-    Validate payment amount.
+    Validate positive finite payment amount.
 
     Returns
     -------
     float or None
-        Valid positive amount, otherwise None.
+        Valid amount, otherwise None.
     """
+
+    if isinstance(
+        amount,
+        bool,
+    ):
+        return None
 
     try:
         amount = float(amount)
-    except (TypeError, ValueError):
+
+    except (
+        TypeError,
+        ValueError,
+    ):
         return None
 
-    if not math.isfinite(amount):
+    if not math.isfinite(
+        amount
+    ):
         return None
 
     if amount <= 0.0:
@@ -243,23 +302,51 @@ def _calculate_failure_probability(
     rng,
 ):
     """
-    Calculate channel failure probability using
-    topology/geography factors.
+    Calculate channel failure probability.
 
-    The resulting probability is always capped at 0.95.
+    Factors
+    -------
+    Same country:
+        0.7
+
+    Intercontinental:
+        2.0
+
+    Other:
+        1.0
+
+    Random multiplier:
+        uniform(0.8, 1.2)
+
+    Final value is clipped to [0, 0.95].
     """
 
     country_u = G.nodes[u].get(
-        "country",
-        "",
+        "country"
     )
 
     country_v = G.nodes[v].get(
-        "country",
-        "",
+        "country"
     )
 
-    if country_u == country_v:
+    normalized_country_u = (
+        country_u.strip().upper()
+        if isinstance(country_u, str)
+        else None
+    )
+
+    normalized_country_v = (
+        country_v.strip().upper()
+        if isinstance(country_v, str)
+        else None
+    )
+
+    if (
+        normalized_country_u
+        and normalized_country_v
+        and normalized_country_u
+        == normalized_country_v
+    ):
 
         factor = 0.7
 
@@ -278,7 +365,12 @@ def _calculate_failure_probability(
     probability = (
         float(average_rate)
         * factor
-        * float(rng.uniform(0.8, 1.2))
+        * float(
+            rng.uniform(
+                0.8,
+                1.2,
+            )
+        )
     )
 
     return float(
@@ -293,6 +385,193 @@ def _calculate_failure_probability(
 
 
 # ============================================================
+# Country -> Continent
+# ============================================================
+
+def _country_to_continent(
+    country,
+):
+    """
+    Convert ISO-like country code to a continent.
+
+    Unknown countries return None.
+
+    This mapping is deliberately explicit. It does not infer
+    a continent from an unknown country code.
+    """
+
+    if not isinstance(
+        country,
+        str,
+    ):
+        return None
+
+    country = country.strip().upper()
+
+    if not country:
+        return None
+
+    country_to_continent = {
+
+        # ----------------------------------------------------
+        # North America
+        # ----------------------------------------------------
+
+        "US": "North America",
+        "CA": "North America",
+        "MX": "North America",
+        "GT": "North America",
+        "BZ": "North America",
+        "SV": "North America",
+        "HN": "North America",
+        "NI": "North America",
+        "CR": "North America",
+        "PA": "North America",
+        "CU": "North America",
+        "JM": "North America",
+        "HT": "North America",
+        "DO": "North America",
+
+        # ----------------------------------------------------
+        # South America
+        # ----------------------------------------------------
+
+        "BR": "South America",
+        "AR": "South America",
+        "CL": "South America",
+        "CO": "South America",
+        "PE": "South America",
+        "VE": "South America",
+        "EC": "South America",
+        "BO": "South America",
+        "PY": "South America",
+        "UY": "South America",
+        "GY": "South America",
+        "SR": "South America",
+
+        # ----------------------------------------------------
+        # Europe
+        # ----------------------------------------------------
+
+        "FR": "Europe",
+        "DE": "Europe",
+        "GB": "Europe",
+        "IT": "Europe",
+        "ES": "Europe",
+        "PT": "Europe",
+        "NL": "Europe",
+        "BE": "Europe",
+        "CH": "Europe",
+        "AT": "Europe",
+        "SE": "Europe",
+        "NO": "Europe",
+        "DK": "Europe",
+        "FI": "Europe",
+        "PL": "Europe",
+        "CZ": "Europe",
+        "SK": "Europe",
+        "HU": "Europe",
+        "RO": "Europe",
+        "BG": "Europe",
+        "GR": "Europe",
+        "IE": "Europe",
+        "IS": "Europe",
+        "LU": "Europe",
+        "SI": "Europe",
+        "HR": "Europe",
+        "RS": "Europe",
+        "BA": "Europe",
+        "ME": "Europe",
+        "AL": "Europe",
+        "MK": "Europe",
+        "EE": "Europe",
+        "LV": "Europe",
+        "LT": "Europe",
+        "MT": "Europe",
+        "CY": "Europe",
+        "UA": "Europe",
+        "MD": "Europe",
+
+        # ----------------------------------------------------
+        # Asia
+        # ----------------------------------------------------
+
+        "CN": "Asia",
+        "JP": "Asia",
+        "KR": "Asia",
+        "IN": "Asia",
+        "IR": "Asia",
+        "TR": "Asia",
+        "AE": "Asia",
+        "SA": "Asia",
+        "IL": "Asia",
+        "IQ": "Asia",
+        "JO": "Asia",
+        "LB": "Asia",
+        "SY": "Asia",
+        "YE": "Asia",
+        "OM": "Asia",
+        "QA": "Asia",
+        "KW": "Asia",
+        "BH": "Asia",
+        "PK": "Asia",
+        "BD": "Asia",
+        "LK": "Asia",
+        "NP": "Asia",
+        "TH": "Asia",
+        "VN": "Asia",
+        "MY": "Asia",
+        "SG": "Asia",
+        "ID": "Asia",
+        "PH": "Asia",
+        "TW": "Asia",
+        "HK": "Asia",
+        "KZ": "Asia",
+        "UZ": "Asia",
+        "TM": "Asia",
+        "KG": "Asia",
+        "TJ": "Asia",
+        "MN": "Asia",
+
+        # ----------------------------------------------------
+        # Africa
+        # ----------------------------------------------------
+
+        "EG": "Africa",
+        "ZA": "Africa",
+        "NG": "Africa",
+        "KE": "Africa",
+        "MA": "Africa",
+        "DZ": "Africa",
+        "TN": "Africa",
+        "LY": "Africa",
+        "ET": "Africa",
+        "GH": "Africa",
+        "TZ": "Africa",
+        "UG": "Africa",
+        "SN": "Africa",
+        "CI": "Africa",
+        "CM": "Africa",
+        "SD": "Africa",
+
+        # ----------------------------------------------------
+        # Oceania
+        # ----------------------------------------------------
+
+        "AU": "Oceania",
+        "NZ": "Oceania",
+        "FJ": "Oceania",
+        "PG": "Oceania",
+        "WS": "Oceania",
+        "TO": "Oceania",
+    }
+
+    return country_to_continent.get(
+        country
+    )
+
+
+# ============================================================
 # Geographic Helper
 # ============================================================
 
@@ -302,62 +581,265 @@ def _intercontinental(
     v,
 ):
     """
-    Detect a long-distance/intercontinental connection.
+    Estimate whether u -> v is intercontinental.
 
-    This is a simulation abstraction and does not represent
-    actual geographical routing information.
+    Priority
+    --------
+    1. Country-based continent classification.
+    2. Geographic-distance fallback.
+
+    Country-based classification
+    ----------------------------
+    If both country codes are recognized, their mapped
+    continents are compared directly.
+
+    Geographic fallback
+    --------------------
+    If one or both countries are unknown, a Haversine
+    great-circle distance is used.
+
+    A distance >= 3000 km is treated as a geographic
+    intercontinental proxy.
+
+    Important
+    ---------
+    This is a simulation proxy, not a geographic database.
     """
 
+    if G is None:
+        return False
+
     try:
+
+        if u not in G.nodes:
+            return False
+
+        if v not in G.nodes:
+            return False
+
         node_u = G.nodes[u]
         node_v = G.nodes[v]
+
     except Exception:
         return False
 
-    longitude_u = node_u.get(
-        "longitude",
-        0,
+    # --------------------------------------------------------
+    # Country-based classification
+    # --------------------------------------------------------
+
+    country_u = node_u.get(
+        "country"
     )
 
-    longitude_v = node_v.get(
-        "longitude",
-        0,
+    country_v = node_v.get(
+        "country"
     )
 
-    latitude_u = node_u.get(
-        "latitude",
-        0,
+    continent_u = _country_to_continent(
+        country_u
     )
 
-    latitude_v = node_v.get(
-        "latitude",
-        0,
+    continent_v = _country_to_continent(
+        country_v
     )
+
+    if (
+        continent_u is not None
+        and continent_v is not None
+    ):
+
+        return (
+            continent_u
+            != continent_v
+        )
+
+    # --------------------------------------------------------
+    # Geographic fallback
+    # --------------------------------------------------------
+
+    latitude_u = _finite_coordinate(
+        node_u.get(
+            "latitude"
+        )
+    )
+
+    longitude_u = _finite_coordinate(
+        node_u.get(
+            "longitude"
+        )
+    )
+
+    latitude_v = _finite_coordinate(
+        node_v.get(
+            "latitude"
+        )
+    )
+
+    longitude_v = _finite_coordinate(
+        node_v.get(
+            "longitude"
+        )
+    )
+
+    if (
+        latitude_u is None
+        or longitude_u is None
+        or latitude_v is None
+        or longitude_v is None
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # Geographic range validation
+    # --------------------------------------------------------
+
+    if not (
+        -90.0
+        <= latitude_u
+        <= 90.0
+    ):
+        raise ValueError(
+            "latitude_u must be in [-90, 90]."
+        )
+
+    if not (
+        -90.0
+        <= latitude_v
+        <= 90.0
+    ):
+        raise ValueError(
+            "latitude_v must be in [-90, 90]."
+        )
+
+    if not (
+        -180.0
+        <= longitude_u
+        <= 180.0
+    ):
+        raise ValueError(
+            "longitude_u must be in [-180, 180]."
+        )
+
+    if not (
+        -180.0
+        <= longitude_v
+        <= 180.0
+    ):
+        raise ValueError(
+            "longitude_v must be in [-180, 180]."
+        )
+
+    # --------------------------------------------------------
+    # Haversine great-circle distance
+    # --------------------------------------------------------
+
+    earth_radius_km = 6371.0
+
+    latitude_u_rad = math.radians(
+        latitude_u
+    )
+
+    latitude_v_rad = math.radians(
+        latitude_v
+    )
+
+    delta_lat_rad = math.radians(
+        latitude_v
+        - latitude_u
+    )
+
+    delta_lon_rad = math.radians(
+        longitude_v
+        - longitude_u
+    )
+
+    haversine_a = (
+        math.sin(
+            delta_lat_rad / 2.0
+        ) ** 2
+        +
+        math.cos(
+            latitude_u_rad
+        )
+        *
+        math.cos(
+            latitude_v_rad
+        )
+        *
+        math.sin(
+            delta_lon_rad / 2.0
+        ) ** 2
+    )
+
+    # Numerical protection for floating-point roundoff.
+    haversine_a = min(
+        1.0,
+        max(
+            0.0,
+            haversine_a,
+        ),
+    )
+
+    angular_distance = (
+        2.0
+        *
+        math.atan2(
+            math.sqrt(
+                haversine_a
+            ),
+            math.sqrt(
+                1.0
+                -
+                haversine_a
+            ),
+        )
+    )
+
+    distance_km = (
+        earth_radius_km
+        *
+        angular_distance
+    )
+
+    return (
+        distance_km >= 3000.0
+    )
+
+
+# ============================================================
+# Coordinate Validation
+# ============================================================
+
+def _finite_coordinate(
+    value,
+):
+    """
+    Return a finite coordinate or None.
+
+    bool is rejected.
+    """
+
+    if isinstance(
+        value,
+        bool,
+    ):
+        return None
 
     try:
-
-        longitude_distance = abs(
-            float(longitude_u)
-            - float(longitude_v)
-        )
-
-        latitude_distance = abs(
-            float(latitude_u)
-            - float(latitude_v)
-        )
+        value = float(value)
 
     except (
         TypeError,
         ValueError,
     ):
+        return None
 
-        return False
+    if not math.isfinite(
+        value
+    ):
+        return None
 
-    return (
-        longitude_distance > 45.0
-        and
-        latitude_distance > 10.0
-    )
+    return value
 
 
 # ============================================================
@@ -366,37 +848,28 @@ def _intercontinental(
 
 class FailureModel:
     """
-    Runtime failure evaluator for Lightning payment simulation.
+    Runtime failure evaluator for one Lightning payment attempt.
 
     Failure categories
     ------------------
-    1. node_failure
-    2. channel_failure
-    3. liquidity_failure
-    4. missing_channel
-    5. invalid_route
-    6. invalid_amount
-    7. invalid_edge
-    8. invalid_route_edges
-    9. edge_path_mismatch
-    10. settlement-related failures are NOT handled here.
+    node_failure
+    channel_failure
+    liquidity_failure
+    missing_channel
+    invalid_route
+    invalid_amount
+    invalid_edge
+    invalid_route_edges
+    edge_path_mismatch
 
-    Important
-    ---------
-    This class evaluates exactly one payment attempt.
+    This class does not:
 
-    It does NOT:
         - select routes
         - generate routes
         - manage Bucket
         - perform backtracking
         - choose PPO actions
-        - perform onion routing
         - perform settlement
-
-    Temporary channel failures are stored in the graph and may
-    affect subsequent attempts until reset_runtime_state() is
-    called.
     """
 
     def __init__(
@@ -406,26 +879,30 @@ class FailureModel:
         seed=42,
     ):
 
-        self.node_failure_probability = _validate_probability(
-            node_failure_probability,
-            "node_failure_probability",
-        )
-
-        self.liquidity_failure_probability = _validate_probability(
-            liquidity_failure_probability,
-            "liquidity_failure_probability",
-        )
-
-        try:
-            self.seed = int(seed)
-        except (TypeError, ValueError):
-            raise ValueError(
-                "seed must be an integer."
+        self.node_failure_probability = (
+            _validate_probability(
+                node_failure_probability,
+                "node_failure_probability",
             )
+        )
+
+        self.liquidity_failure_probability = (
+            _validate_probability(
+                liquidity_failure_probability,
+                "liquidity_failure_probability",
+            )
+        )
+
+        self.seed = _validate_seed(
+            seed
+        )
 
         self.rng = random.Random(
             self.seed
         )
+
+        # Per-payment node evaluation cache.
+        self._node_attempt_cache = None
 
     # ========================================================
     # Reset Runtime State
@@ -438,19 +915,9 @@ class FailureModel:
         reset_rng=False,
     ):
         """
-        Reset temporary runtime failure state.
+        Reset temporary runtime graph state.
 
-        Static failure_probability values are preserved.
-
-        Parameters
-        ----------
-        G : networkx graph
-
-        reset_counters : bool
-            Reset failure_count and last_failure.
-
-        reset_rng : bool
-            Re-seed the runtime RNG.
+        Static failure_probability attributes are preserved.
         """
 
         if G is None:
@@ -458,8 +925,24 @@ class FailureModel:
                 "G cannot be None."
             )
 
+        if not isinstance(
+            reset_counters,
+            bool,
+        ):
+            raise TypeError(
+                "reset_counters must be bool."
+            )
+
+        if not isinstance(
+            reset_rng,
+            bool,
+        ):
+            raise TypeError(
+                "reset_rng must be bool."
+            )
+
         # ----------------------------------------------------
-        # Channel runtime state
+        # Channel state
         # ----------------------------------------------------
 
         if G.is_multigraph():
@@ -469,7 +952,6 @@ class FailureModel:
                 data=True,
             ):
 
-                # 'available' is the runtime failure state.
                 data["available"] = True
 
                 if reset_counters:
@@ -491,7 +973,7 @@ class FailureModel:
                     data["last_failure"] = None
 
         # ----------------------------------------------------
-        # Node runtime state
+        # Node state
         # ----------------------------------------------------
 
         for _, data in G.nodes(
@@ -508,7 +990,13 @@ class FailureModel:
                 data["online"] = True
 
         # ----------------------------------------------------
-        # RNG reset
+        # Runtime attempt cache
+        # ----------------------------------------------------
+
+        self._node_attempt_cache = None
+
+        # ----------------------------------------------------
+        # RNG
         # ----------------------------------------------------
 
         if reset_rng:
@@ -527,8 +1015,10 @@ class FailureModel:
         node,
     ):
         """
-        Check whether a node is unavailable or fails
-        stochastically.
+        Evaluate node availability/failure.
+
+        Within one payment attempt, a node is evaluated at
+        most once.
 
         Returns
         -------
@@ -542,33 +1032,58 @@ class FailureModel:
         if node not in G.nodes:
             return True
 
+        # ----------------------------------------------------
+        # Per-payment cache
+        # ----------------------------------------------------
+
+        if self._node_attempt_cache is not None:
+
+            if node in self._node_attempt_cache:
+
+                return (
+                    self._node_attempt_cache[node]
+                )
+
         data = G.nodes[node]
+
+        # ----------------------------------------------------
+        # Explicit runtime state
+        # ----------------------------------------------------
 
         if data.get(
             "available",
             True,
         ) is False:
 
-            return True
+            result = True
 
-        if data.get(
+        elif data.get(
             "is_online",
             True,
         ) is False:
 
-            return True
+            result = True
 
-        if data.get(
+        elif data.get(
             "online",
             True,
         ) is False:
 
-            return True
+            result = True
 
-        return (
-            self.rng.random()
-            < self.node_failure_probability
-        )
+        else:
+
+            result = (
+                self.rng.random()
+                <
+                self.node_failure_probability
+            )
+
+        if self._node_attempt_cache is not None:
+
+            self._node_attempt_cache[node] = result
+
+        return result
 
     # ========================================================
     # Channel Failure
@@ -582,15 +1097,9 @@ class FailureModel:
         key=None,
     ):
         """
-        Check static/runtime channel failure.
+        Evaluate exact channel failure.
 
-        If a stochastic channel failure occurs, the exact
-        channel is marked temporarily unavailable.
-
-        Returns
-        -------
-        bool
-            True means channel failure.
+        MultiGraph / MultiDiGraph requires key.
         """
 
         edge = self._get_edge(
@@ -610,54 +1119,60 @@ class FailureModel:
 
             return True
 
-        probability = edge.get(
-            "failure_probability",
-            0.01,
-        )
+        if "failure_probability" not in edge:
 
-        try:
-            probability = float(
-                probability
+            raise ValueError(
+                "Channel is missing required "
+                "'failure_probability' attribute."
             )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            probability = 0.01
 
-        if not math.isfinite(
-            probability
-        ):
-            probability = 0.01
-
-        probability = min(
-            1.0,
-            max(
-                0.0,
-                probability,
-            ),
+        probability = _validate_probability(
+            edge["failure_probability"],
+            "failure_probability",
         )
 
         failed = (
             self.rng.random()
-            < probability
+            <
+            probability
         )
 
         if failed:
 
-            edge["failure_count"] = (
-                int(
-                    edge.get(
-                        "failure_count",
-                        0,
-                    )
-                )
-                + 1
+            failure_count = edge.get(
+                "failure_count",
+                0,
             )
 
-            edge["last_failure"] = datetime.now()
+            if isinstance(
+                failure_count,
+                bool,
+            ):
+                raise TypeError(
+                    "failure_count must be an integer."
+                )
 
-            # Temporary runtime failure.
+            if not isinstance(
+                failure_count,
+                int,
+            ):
+                raise TypeError(
+                    "failure_count must be an integer."
+                )
+
+            if failure_count < 0:
+                raise ValueError(
+                    "failure_count cannot be negative."
+                )
+
+            edge["failure_count"] = (
+                failure_count + 1
+            )
+
+            edge["last_failure"] = (
+                datetime.now()
+            )
+
             edge["available"] = False
 
         return failed
@@ -680,21 +1195,21 @@ class FailureModel:
         3. liquidity
         4. estimated_liquidity
 
-        IMPORTANT
-        ---------
         capacity is intentionally excluded.
 
         Returns
         -------
         float or None
-            None means directional liquidity is unknown.
+            None means unknown.
         """
 
         if not isinstance(
             edge,
             dict,
         ):
-            return None
+            raise TypeError(
+                "edge must be a dictionary."
+            )
 
         for field in (
             "balance_uv",
@@ -703,35 +1218,45 @@ class FailureModel:
             "estimated_liquidity",
         ):
 
-            value = edge.get(
-                field,
-                None,
-            )
+            if field not in edge:
+                continue
+
+            value = edge[field]
 
             if value is None:
                 continue
 
-            try:
-
-                value = float(
-                    value
+            if isinstance(
+                value,
+                bool,
+            ):
+                raise TypeError(
+                    f"{field} must be numeric, not bool."
                 )
+
+            try:
+                value = float(value)
 
             except (
                 TypeError,
                 ValueError,
-            ):
+            ) as exc:
 
-                continue
+                raise ValueError(
+                    f"{field} must be numeric."
+                ) from exc
 
             if not math.isfinite(
                 value
             ):
-
-                continue
+                raise ValueError(
+                    f"{field} must be finite."
+                )
 
             if value < 0:
-                continue
+                raise ValueError(
+                    f"{field} cannot be negative."
+                )
 
             return value
 
@@ -750,38 +1275,22 @@ class FailureModel:
         key=None,
     ):
         """
-        Evaluate directional liquidity.
+        Evaluate directional liquidity and stochastic
+        forwarding failure.
 
-        Semantic rules
-        --------------
-        capacity
+        Rules
+        -----
+        capacity:
             ignored
 
-        balance_uv
-            used when available
-
-        liquidity_uv
-            used when available
-
-        liquidity
-            used when available
-
-        estimated_liquidity
-            used when available
-
-        Known insufficient directional liquidity
+        known liquidity < amount:
             deterministic failure
 
-        Unknown directional liquidity
-            NOT treated as zero
+        unknown liquidity:
+            not automatically a failure
 
-        Known sufficient directional liquidity
-            may still experience stochastic forwarding failure
-
-        Returns
-        -------
-        bool
-            True means liquidity/forwarding failure.
+        sufficient known liquidity:
+            stochastic forwarding failure may still occur
         """
 
         edge = self._get_edge(
@@ -807,29 +1316,15 @@ class FailureModel:
             )
         )
 
-        # ----------------------------------------------------
-        # Known directional liquidity
-        # ----------------------------------------------------
-
         if directional_liquidity is not None:
 
             if valid_amount > directional_liquidity:
                 return True
 
-        # ----------------------------------------------------
-        # Unknown or sufficient liquidity
-        # ----------------------------------------------------
-        #
-        # Unknown liquidity is NOT failure by itself.
-        #
-        # Sufficient known liquidity is NOT a guarantee of
-        # forwarding success because a stochastic forwarding
-        # failure can still occur.
-        # ----------------------------------------------------
-
         return (
             self.rng.random()
-            < self.liquidity_failure_probability
+            <
+            self.liquidity_failure_probability
         )
 
     # ========================================================
@@ -846,14 +1341,6 @@ class FailureModel:
     ):
         """
         Evaluate exactly one directed channel traversal.
-
-        Returns
-        -------
-        dict
-            success
-            reason
-            failed_node
-            failed_edge
         """
 
         valid_amount = _validate_amount(
@@ -964,7 +1451,7 @@ class FailureModel:
             }
 
         # ----------------------------------------------------
-        # Directional liquidity / stochastic forwarding
+        # Directional liquidity / forwarding
         # ----------------------------------------------------
 
         if self.check_liquidity_failure(
@@ -986,10 +1473,6 @@ class FailureModel:
                 ),
             }
 
-        # ----------------------------------------------------
-        # Successful hop
-        # ----------------------------------------------------
-
         return {
             "success": True,
             "reason": None,
@@ -998,7 +1481,7 @@ class FailureModel:
         }
 
     # ========================================================
-    # Full Route Evaluation
+    # Full Payment Evaluation
     # ========================================================
 
     def evaluate_payment_failure(
@@ -1009,45 +1492,13 @@ class FailureModel:
         route_edges=None,
     ):
         """
-        Evaluate exactly one complete payment attempt.
+        Evaluate exactly one payment attempt.
 
-        Parameters
-        ----------
-        route : list
-            Ordered node path.
+        Exact route-edge information is required for a
+        MultiGraph / MultiDiGraph.
 
-        amount : float
-            Positive payment amount.
-
-        network : networkx.Graph
-            Graph containing exact runtime state.
-
-        route_edges : list, optional
-            Exact channel edges.
-
-            Each edge may be:
-                (u, v)
-
-            or:
-                (u, v, key)
-
-        Returns
-        -------
-        dict
-
-        Example
-        -------
-        Route:
-
-            A -> B -> C -> D
-
-        Failure:
-
-            B -> C
-
-        Result:
-
-            failure_index = 1
+        The node cache is active only during this method and is
+        cleared in the finally block.
         """
 
         if network is None:
@@ -1056,17 +1507,13 @@ class FailureModel:
                 "network cannot be None."
             )
 
-        # ----------------------------------------------------
-        # Validate route
-        # ----------------------------------------------------
-
         if not isinstance(
             route,
             (list, tuple),
         ):
 
             return self._failure_result(
-                reason="invalid_route",
+                reason="invalid_route"
             )
 
         route = list(route)
@@ -1074,12 +1521,8 @@ class FailureModel:
         if len(route) < 2:
 
             return self._failure_result(
-                reason="invalid_route",
+                reason="invalid_route"
             )
-
-        # ----------------------------------------------------
-        # Validate amount
-        # ----------------------------------------------------
 
         valid_amount = _validate_amount(
             amount
@@ -1088,152 +1531,219 @@ class FailureModel:
         if valid_amount is None:
 
             return self._failure_result(
-                reason="invalid_amount",
+                reason="invalid_amount"
             )
-
-        visited_edges = []
 
         # ----------------------------------------------------
-        # Resolve exact edges
+        # Start one-payment node cache.
         # ----------------------------------------------------
 
-        if route_edges is None:
+        previous_cache = (
+            self._node_attempt_cache
+        )
 
-            route_edges = self._resolve_route_edges(
-                network,
-                route,
-            )
-
-        if route_edges is None:
-
-            return self._failure_result(
-                reason="missing_channel",
-                failure_index=0,
-                visited_edges=[],
-            )
+        self._node_attempt_cache = {}
 
         try:
-            route_edges = list(
-                route_edges
-            )
-        except TypeError:
 
-            return self._failure_result(
-                reason="invalid_route_edges",
-                failure_index=0,
-                visited_edges=[],
-            )
+            visited_edges = []
 
-        if len(route_edges) != len(route) - 1:
+            # ------------------------------------------------
+            # Resolve route edges.
+            # ------------------------------------------------
 
-            return self._failure_result(
-                reason="invalid_route_edges",
-                failure_index=0,
-                visited_edges=[],
-            )
+            if route_edges is None:
 
-        # ----------------------------------------------------
-        # Evaluate hops sequentially
-        # ----------------------------------------------------
-
-        for index, edge_info in enumerate(
-            route_edges
-        ):
-
-            parsed = self._parse_edge(
-                edge_info
-            )
-
-            if parsed is None:
-
-                return self._failure_result(
-                    reason="invalid_edge",
-                    failed_edge=edge_info,
-                    failure_index=index,
-                    visited_edges=visited_edges,
+                route_edges = (
+                    self._resolve_route_edges(
+                        network,
+                        route,
+                    )
                 )
 
-            u, v, key = parsed
+            if route_edges is None:
 
-            # ------------------------------------------------
-            # Route-edge correspondence
-            # ------------------------------------------------
+                return self._failure_result(
+                    reason="invalid_route_edges",
+                    failure_index=0,
+                    visited_edges=[],
+                )
 
-            expected_u = route[index]
-            expected_v = route[index + 1]
+            try:
 
-            if (
-                u != expected_u
-                or
-                v != expected_v
+                route_edges = list(
+                    route_edges
+                )
+
+            except TypeError:
+
+                return self._failure_result(
+                    reason="invalid_route_edges",
+                    failure_index=0,
+                    visited_edges=[],
+                )
+
+            if len(route_edges) != (
+                len(route) - 1
             ):
 
                 return self._failure_result(
-                    reason="edge_path_mismatch",
-                    failed_edge=(
+                    reason="invalid_route_edges",
+                    failure_index=0,
+                    visited_edges=[],
+                )
+
+            # ------------------------------------------------
+            # Sequential hop evaluation
+            # ------------------------------------------------
+
+            for index, edge_info in enumerate(
+                route_edges
+            ):
+
+                parsed = self._parse_edge(
+                    edge_info
+                )
+
+                if parsed is None:
+
+                    return self._failure_result(
+                        reason="invalid_edge",
+                        failed_edge=edge_info,
+                        failure_index=index,
+                        visited_edges=visited_edges,
+                    )
+
+                u, v, key = parsed
+
+                expected_u = route[index]
+                expected_v = route[index + 1]
+
+                if (
+                    u != expected_u
+                    or
+                    v != expected_v
+                ):
+
+                    return self._failure_result(
+                        reason="edge_path_mismatch",
+                        failed_edge=(
+                            u,
+                            v,
+                            key,
+                        ),
+                        failure_index=index,
+                        visited_edges=visited_edges,
+                    )
+
+                # --------------------------------------------
+                # MultiGraph exact-key requirement
+                # --------------------------------------------
+
+                if network.is_multigraph():
+
+                    if key is None:
+
+                        return self._failure_result(
+                            reason="missing_channel_key",
+                            failed_edge=(
+                                u,
+                                v,
+                                key,
+                            ),
+                            failure_index=index,
+                            visited_edges=visited_edges,
+                        )
+
+                else:
+
+                    if key is not None:
+
+                        return self._failure_result(
+                            reason="unexpected_channel_key",
+                            failed_edge=(
+                                u,
+                                v,
+                                key,
+                            ),
+                            failure_index=index,
+                            visited_edges=visited_edges,
+                        )
+
+                result = self.evaluate_edge(
+                    network,
+                    u,
+                    v,
+                    valid_amount,
+                    key,
+                )
+
+                if not isinstance(
+                    result,
+                    dict,
+                ):
+
+                    raise TypeError(
+                        "evaluate_edge() must return dict."
+                    )
+
+                if "success" not in result:
+
+                    raise ValueError(
+                        "evaluate_edge() result must contain "
+                        "'success'."
+                    )
+
+                if not isinstance(
+                    result["success"],
+                    bool,
+                ):
+
+                    raise TypeError(
+                        "evaluate_edge() success must be bool."
+                    )
+
+                if not result["success"]:
+
+                    return self._failure_result(
+                        reason=result["reason"],
+                        failed_node=result.get(
+                            "failed_node"
+                        ),
+                        failed_edge=result.get(
+                            "failed_edge"
+                        ),
+                        failure_index=index,
+                        visited_edges=visited_edges,
+                    )
+
+                visited_edges.append(
+                    (
                         u,
                         v,
                         key,
-                    ),
-                    failure_index=index,
-                    visited_edges=visited_edges,
+                    )
                 )
 
-            # ------------------------------------------------
-            # Evaluate exact channel
-            # ------------------------------------------------
+            return {
+                "success": True,
+                "reason": None,
+                "failed_node": None,
+                "failed_edge": None,
+                "failure_index": None,
+                "visited_edges": list(
+                    visited_edges
+                ),
+            }
 
-            result = self.evaluate_edge(
-                network,
-                u,
-                v,
-                valid_amount,
-                key,
+        finally:
+
+            self._node_attempt_cache = (
+                previous_cache
             )
-
-            if not result["success"]:
-
-                return self._failure_result(
-                    reason=result["reason"],
-                    failed_node=result.get(
-                        "failed_node"
-                    ),
-                    failed_edge=result.get(
-                        "failed_edge"
-                    ),
-                    failure_index=index,
-                    visited_edges=visited_edges,
-                )
-
-            # ------------------------------------------------
-            # Record successfully traversed edge
-            # ------------------------------------------------
-
-            visited_edges.append(
-                (
-                    u,
-                    v,
-                    key,
-                )
-            )
-
-        # ----------------------------------------------------
-        # Complete success
-        # ----------------------------------------------------
-
-        return {
-            "success": True,
-            "reason": None,
-            "failed_node": None,
-            "failed_edge": None,
-            "failure_index": None,
-            "visited_edges": list(
-                visited_edges
-            ),
-        }
 
     # ========================================================
-    # Standard Failure Result
+    # Failure Result
     # ========================================================
 
     @staticmethod
@@ -1245,11 +1755,27 @@ class FailureModel:
         visited_edges=None,
     ):
         """
-        Build a normalized failure result.
+        Build normalized failure result.
         """
+
+        if not isinstance(
+            reason,
+            str,
+        ):
+            raise TypeError(
+                "reason must be a string."
+            )
 
         if visited_edges is None:
             visited_edges = []
+
+        if not isinstance(
+            visited_edges,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "visited_edges must be a list or tuple."
+            )
 
         return {
             "success": False,
@@ -1272,26 +1798,39 @@ class FailureModel:
         route,
     ):
         """
-        Resolve node-path edges when exact edge information
-        was not supplied.
+        Resolve route edges only when this is unambiguous.
 
-        Important
-        ---------
-        This is a compatibility fallback.
+        Simple Graph / DiGraph
+        ----------------------
+        A node path uniquely identifies an edge.
 
-        The main Top-K / PaymentSimulator pipeline should
-        supply exact route_edges with channel keys.
+        MultiGraph / MultiDiGraph
+        -------------------------
+        A node path does NOT uniquely identify a channel.
 
-        For MultiDiGraph:
-            - only available channels are considered
-            - one available channel is selected deterministically
-              according to graph iteration order
+        Therefore this method returns None for a MultiGraph
+        when exact route_edges were not supplied.
+
+        This prevents silent parallel-channel selection.
         """
 
         if G is None:
             return None
 
-        if route is None:
+        if not isinstance(
+            route,
+            (list, tuple),
+        ):
+            return None
+
+        if len(route) < 2:
+            return None
+
+        # ----------------------------------------------------
+        # Parallel channels require exact identity.
+        # ----------------------------------------------------
+
+        if G.is_multigraph():
             return None
 
         edges = []
@@ -1303,80 +1842,40 @@ class FailureModel:
             u = route[i]
             v = route[i + 1]
 
-            if not G.has_edge(
-                u,
-                v,
-            ):
+            try:
 
-                return None
-
-            # ------------------------------------------------
-            # MultiGraph / MultiDiGraph
-            # ------------------------------------------------
-
-            if G.is_multigraph():
-
-                edge_data = G.get_edge_data(
+                if not G.has_edge(
                     u,
                     v,
-                )
-
-                if not edge_data:
+                ):
                     return None
-
-                selected_key = None
-
-                for key, data in edge_data.items():
-
-                    if data.get(
-                        "available",
-                        True,
-                    ) is False:
-
-                        continue
-
-                    selected_key = key
-                    break
-
-                if selected_key is None:
-                    return None
-
-                edges.append(
-                    (
-                        u,
-                        v,
-                        selected_key,
-                    )
-                )
-
-            # ------------------------------------------------
-            # Graph / DiGraph
-            # ------------------------------------------------
-
-            else:
 
                 data = G.get_edge_data(
                     u,
                     v,
                 )
 
-                if data is None:
-                    return None
+            except Exception:
 
-                if data.get(
-                    "available",
-                    True,
-                ) is False:
+                return None
 
-                    return None
+            if data is None:
+                return None
 
-                edges.append(
-                    (
-                        u,
-                        v,
-                        None,
-                    )
+            if data.get(
+                "available",
+                True,
+            ) is False:
+
+                return None
+
+            edges.append(
+                (
+                    u,
+                    v,
+                    None,
                 )
+            )
 
         return edges
 
@@ -1389,51 +1888,41 @@ class FailureModel:
         edge_info,
     ):
         """
-        Normalize a 2-tuple or 3-tuple edge description.
+        Normalize:
 
-        Returns
-        -------
-        tuple or None
+            (u, v)
 
-        (u, v, None)
-        or
-        (u, v, key)
+        or:
+
+            (u, v, key)
         """
-
-        if edge_info is None:
-            return None
 
         if not isinstance(
             edge_info,
             (list, tuple),
         ):
-
             return None
 
         if len(edge_info) == 2:
 
-            u, v = edge_info
-
             return (
-                u,
-                v,
+                edge_info[0],
+                edge_info[1],
                 None,
             )
 
         if len(edge_info) == 3:
 
-            u, v, key = edge_info
-
             return (
-                u,
-                v,
-                key,
+                edge_info[0],
+                edge_info[1],
+                edge_info[2],
             )
 
         return None
 
     # ========================================================
-    # Graph Edge Access
+    # Exact Graph Edge Access
     # ========================================================
 
     @staticmethod
@@ -1444,18 +1933,17 @@ class FailureModel:
         key=None,
     ):
         """
-        Return graph edge data.
+        Return exact edge data.
 
         MultiGraph / MultiDiGraph
         -------------------------
-        key != None:
-            exact channel only.
+        key is mandatory.
 
-        key == None:
-            first currently available channel as compatibility
-            fallback.
+        Graph / DiGraph
+        ---------------
+        key must be None.
 
-        The main payment pipeline should provide exact keys.
+        No arbitrary parallel channel is selected.
         """
 
         if G is None:
@@ -1467,7 +1955,6 @@ class FailureModel:
                 u,
                 v,
             ):
-
                 return None
 
         except Exception:
@@ -1480,50 +1967,27 @@ class FailureModel:
 
         if G.is_multigraph():
 
+            if key is None:
+                return None
+
             try:
 
-                edge_data = G.get_edge_data(
+                return G.get_edge_data(
                     u,
                     v,
+                    key,
                 )
 
             except Exception:
 
                 return None
 
-            if not edge_data:
-                return None
-
-            # ------------------------------------------------
-            # Exact channel requested
-            # ------------------------------------------------
-
-            if key is not None:
-
-                return edge_data.get(
-                    key
-                )
-
-            # ------------------------------------------------
-            # Compatibility fallback
-            # ------------------------------------------------
-
-            for _, data in edge_data.items():
-
-                if data.get(
-                    "available",
-                    True,
-                ) is False:
-
-                    continue
-
-                return data
-
-            return None
-
         # ----------------------------------------------------
         # Graph / DiGraph
         # ----------------------------------------------------
+
+        if key is not None:
+            return None
 
         try:
 
@@ -1538,22 +2002,12 @@ class FailureModel:
 
 
 # ============================================================
-# Standalone Functional Test
+# Deterministic Standalone Test
 # ============================================================
 
 def _run_standalone_test():
     """
-    Internal deterministic smoke test.
-
-    This test verifies:
-
-    1. capacity is NOT used as liquidity
-    2. exact MultiDiGraph key is preserved
-    3. known insufficient liquidity fails
-    4. unknown liquidity is not rejected as zero
-    5. failure_index is correct
-    6. visited_edges are correct
-    7. runtime channel failure is stored on exact channel
+    Deterministic smoke test.
     """
 
     import networkx as nx
@@ -1563,29 +2017,32 @@ def _run_standalone_test():
     print("FAILURE MODEL STANDALONE TEST")
     print("=" * 72)
 
-    # --------------------------------------------------------
-    # Build graph
-    # --------------------------------------------------------
-
     G = nx.MultiDiGraph()
 
     G.add_node(
         "A",
         available=True,
+        country="US",
+        latitude=40,
+        longitude=-74,
     )
 
     G.add_node(
         "B",
         available=True,
+        country="US",
+        latitude=41,
+        longitude=-73,
     )
 
     G.add_node(
         "C",
         available=True,
+        country="FR",
+        latitude=48,
+        longitude=2,
     )
 
-    # Channel A -> B, key 0.
-    # capacity is large, directional liquidity is small.
     G.add_edge(
         "A",
         "B",
@@ -1598,8 +2055,6 @@ def _run_standalone_test():
         last_failure=None,
     )
 
-    # Parallel channel A -> B, key 1.
-    # This verifies exact key handling.
     G.add_edge(
         "A",
         "B",
@@ -1612,8 +2067,6 @@ def _run_standalone_test():
         last_failure=None,
     )
 
-    # B -> C.
-    # No directional liquidity information.
     G.add_edge(
         "B",
         "C",
@@ -1632,17 +2085,11 @@ def _run_standalone_test():
     )
 
     # --------------------------------------------------------
-    # Test 1: capacity must NOT be treated as liquidity
+    # 1. Capacity semantics
     # --------------------------------------------------------
 
-    print()
-    print("[1] CAPACITY SEMANTICS")
-
     result = model.evaluate_payment_failure(
-        route=[
-            "B",
-            "C",
-        ],
+        route=["B", "C"],
         amount=5000,
         network=G,
         route_edges=[
@@ -1653,21 +2100,15 @@ def _run_standalone_test():
     assert result["success"] is True
 
     print(
-        "  PASS: capacity is not treated as directional liquidity."
+        "[01] capacity is not liquidity                 PASS"
     )
 
     # --------------------------------------------------------
-    # Test 2: known insufficient directional liquidity
+    # 2. Known insufficient liquidity
     # --------------------------------------------------------
 
-    print()
-    print("[2] KNOWN LIQUIDITY")
-
     result = model.evaluate_payment_failure(
-        route=[
-            "A",
-            "B",
-        ],
+        route=["A", "B"],
         amount=600,
         network=G,
         route_edges=[
@@ -1685,21 +2126,15 @@ def _run_standalone_test():
     assert result["failure_index"] == 0
 
     print(
-        "  PASS: insufficient known directional liquidity fails."
+        "[02] insufficient directional liquidity        PASS"
     )
 
     # --------------------------------------------------------
-    # Test 3: exact parallel channel
+    # 3. Exact parallel channel
     # --------------------------------------------------------
 
-    print()
-    print("[3] EXACT MULTIDIGRAPH CHANNEL")
-
     result = model.evaluate_payment_failure(
-        route=[
-            "A",
-            "B",
-        ],
+        route=["A", "B"],
         amount=600,
         network=G,
         route_edges=[
@@ -1708,33 +2143,61 @@ def _run_standalone_test():
     )
 
     assert result["success"] is True
+
     assert result["visited_edges"] == [
-        (
-            "A",
-            "B",
-            1,
-        )
+        ("A", "B", 1)
     ]
 
     print(
-        "  PASS: exact channel key is preserved."
+        "[03] exact parallel channel                    PASS"
     )
 
     # --------------------------------------------------------
-    # Test 4: exact failure index
+    # 4. Missing key
     # --------------------------------------------------------
 
-    print()
-    print("[4] FAILURE INDEX")
+    result = model.evaluate_payment_failure(
+        route=["A", "B"],
+        amount=100,
+        network=G,
+        route_edges=[
+            ("A", "B"),
+        ],
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "missing_channel_key"
+
+    print(
+        "[04] missing MultiDiGraph key rejected          PASS"
+    )
+
+    # --------------------------------------------------------
+    # 5. No automatic parallel selection
+    # --------------------------------------------------------
+
+    result = model.evaluate_payment_failure(
+        route=["A", "B"],
+        amount=100,
+        network=G,
+        route_edges=None,
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "invalid_route_edges"
+
+    print(
+        "[05] no automatic parallel-channel selection   PASS"
+    )
+
+    # --------------------------------------------------------
+    # 6. Failure index
+    # --------------------------------------------------------
 
     G["B"]["C"][0]["failure_probability"] = 1.0
 
     result = model.evaluate_payment_failure(
-        route=[
-            "A",
-            "B",
-            "C",
-        ],
+        route=["A", "B", "C"],
         amount=100,
         network=G,
         route_edges=[
@@ -1744,45 +2207,42 @@ def _run_standalone_test():
     )
 
     assert result["success"] is False
-    assert result["reason"] == "channel_failure"
+
+    assert result["reason"] == (
+        "channel_failure"
+    )
+
     assert result["failed_edge"] == (
         "B",
         "C",
         0,
     )
+
     assert result["failure_index"] == 1
+
     assert result["visited_edges"] == [
-        (
-            "A",
-            "B",
-            1,
-        )
+        ("A", "B", 1)
     ]
 
     print(
-        "  PASS: failure_index and visited_edges are correct."
+        "[06] failure index and visited edges            PASS"
     )
 
     # --------------------------------------------------------
-    # Test 5: runtime failure state
+    # 7. Runtime state
     # --------------------------------------------------------
 
-    print()
-    print("[5] RUNTIME FAILURE STATE")
-
     assert G["B"]["C"][0]["available"] is False
+
     assert G["B"]["C"][0]["failure_count"] == 1
 
     print(
-        "  PASS: exact failed channel is marked unavailable."
+        "[07] runtime channel failure state              PASS"
     )
 
     # --------------------------------------------------------
-    # Test 6: reset
+    # 8. Reset
     # --------------------------------------------------------
-
-    print()
-    print("[6] RESET RUNTIME STATE")
 
     model.reset_runtime_state(
         G,
@@ -1791,11 +2251,60 @@ def _run_standalone_test():
     )
 
     assert G["B"]["C"][0]["available"] is True
+
     assert G["B"]["C"][0]["failure_count"] == 0
+
     assert G["B"]["C"][0]["last_failure"] is None
 
     print(
-        "  PASS: runtime state and RNG can be reset."
+        "[08] runtime state reset                        PASS"
+    )
+
+    # --------------------------------------------------------
+    # 9. Country-based classification
+    # --------------------------------------------------------
+
+    assert _intercontinental(
+        G,
+        "A",
+        "B",
+    ) is False
+
+    assert _intercontinental(
+        G,
+        "B",
+        "C",
+    ) is True
+
+    print(
+        "[09] country-based continent classification    PASS"
+    )
+
+    # --------------------------------------------------------
+    # 10. Invalid probability
+    # --------------------------------------------------------
+
+    G["A"]["B"][0]["failure_probability"] = "INVALID"
+
+    raised = False
+
+    try:
+
+        model.check_channel_failure(
+            G,
+            "A",
+            "B",
+            0,
+        )
+
+    except ValueError:
+
+        raised = True
+
+    assert raised is True
+
+    print(
+        "[10] invalid probability rejected               PASS"
     )
 
     # --------------------------------------------------------
@@ -1804,7 +2313,7 @@ def _run_standalone_test():
 
     print()
     print("=" * 72)
-    print("FAILURE MODEL STATUS : SUCCESS")
+    print("FAILURE MODEL STANDALONE TEST: PASS")
     print("=" * 72)
 
 

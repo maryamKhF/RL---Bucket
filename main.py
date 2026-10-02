@@ -1,10 +1,12 @@
 # main.py
 
 import copy
+import io
 import os
 import random
 import time
 import yaml
+import zipfile
 import numpy as np
 import networkx as nx
 import traceback
@@ -14,7 +16,13 @@ import threading
 
 from pathlib import Path
 
+import torch
 from stable_baselines3 import PPO
+
+# Stable-Baselines3 modules are imported explicitly because
+# PPO.load() resolves load_from_zip_file through BaseAlgorithm.
+import stable_baselines3.common.save_util as sb3_save_util
+import stable_baselines3.common.base_class as sb3_base_class
 
 
 # ============================================================
@@ -44,50 +52,6 @@ HEARTBEAT_STOP_EVENT = threading.Event()
 # Runtime Mode
 # ============================================================
 
-# Fast validation:
-#
-#     GML snapshot
-#          |
-#          v
-#     Graph construction
-#          |
-#          v
-#     Existing PPO model
-#          |
-#          v
-#     PPO -> eta
-#          |
-#          v
-#     Adaptive Routing
-#          |
-#          v
-#     Top-K (k=5)
-#          |
-#          v
-#     Bucket
-#          |
-#          v
-#     Payment Simulation
-#          |
-#          v
-#     Failure Model
-#          |
-#          v
-#     Partial Backtracking
-#
-# Only repeated PPO training is skipped.
-#
-# Default:
-#     FAST_VALIDATION = True
-#
-# Normal training:
-#     set RL_FAST_VALIDATION=0
-#     py main.py
-#
-# Fast validation:
-#     set RL_FAST_VALIDATION=1
-#     py main.py
-
 FAST_VALIDATION = (
     os.environ.get(
         "RL_FAST_VALIDATION",
@@ -102,6 +66,81 @@ FAST_VALIDATION = (
 )
 
 MODEL_NAME = "end_to_end"
+
+
+# ============================================================
+# Evaluation Configuration
+# ============================================================
+
+# IMPORTANT:
+#
+# Every execution evaluates EXACTLY 10 independent payment
+# transactions.
+#
+# This is intentionally fixed at 10 so that:
+#
+#     py main.py
+#
+# always produces 10 evaluation results.
+#
+# PPO is loaded/trained only once, then one PPO inference is
+# performed independently for each of the 10 transactions.
+EVAL_TRANSACTION_COUNT = 10
+
+EVAL_TRANSACTION_ENV = "RL_EVAL_TRANSACTIONS"
+
+
+def get_evaluation_transaction_count(cfg):
+
+    """
+    Return the exact number of evaluation transactions.
+
+    Project evaluation policy:
+        EXACTLY 10 transactions per execution.
+
+    The environment variable RL_EVAL_TRANSACTIONS is retained
+    for compatibility with previous runs, but the project-level
+    experimental requirement is fixed at 10.
+    """
+
+    configured_env_value = os.environ.get(
+        EVAL_TRANSACTION_ENV
+    )
+
+    if configured_env_value is not None:
+
+        try:
+
+            requested_count = int(
+                configured_env_value
+            )
+
+            if requested_count != EVAL_TRANSACTION_COUNT:
+
+                print(
+                    "\nWarning: "
+                    f"{EVAL_TRANSACTION_ENV}={requested_count} "
+                    "was requested, but this experiment requires "
+                    "exactly 10 evaluation transactions."
+                )
+
+                print(
+                    "The evaluation count will remain fixed at 10."
+                )
+
+        except Exception:
+
+            print(
+                f"\nWarning: invalid "
+                f"{EVAL_TRANSACTION_ENV}="
+                f"{configured_env_value!r}."
+            )
+
+            print(
+                "The evaluation count will remain fixed at 10."
+            )
+
+    return EVAL_TRANSACTION_COUNT
 
 
 # ============================================================
@@ -212,7 +251,9 @@ def print_progress(
             )
 
         current_progress = CURRENT_PROGRESS
+
         current_step = CURRENT_STEP
+
         current_step_name = CURRENT_STEP_NAME
 
     elapsed = _format_elapsed(
@@ -789,17 +830,6 @@ def write_runtime_error(
 
 def load_cfg():
 
-    # Support both:
-    #
-    #     Configs/config.yaml
-    #
-    # and:
-    #
-    #     configs/config.yaml
-    #
-    # Windows is case-insensitive, but this also keeps the
-    # project portable to case-sensitive systems.
-
     possible_paths = [
 
         Path("Configs/config.yaml"),
@@ -861,6 +891,14 @@ def set_seed(seed):
     random.seed(seed)
 
     np.random.seed(seed)
+
+    try:
+
+        torch.manual_seed(seed)
+
+    except Exception:
+
+        pass
 
 
 # ============================================================
@@ -1005,7 +1043,7 @@ class ReportWriter:
     def item(self, key, value):
 
         self.add(
-            f"{key:<28}: {value}"
+            f"{key:<32}: {value}"
         )
 
     def save(self):
@@ -1032,6 +1070,418 @@ def safe_value(value, default=None):
     return value
 
 
+def safe_float(value, default=0.0):
+
+    try:
+
+        if value is None:
+
+            return float(
+                default
+            )
+
+        result = float(
+            value
+        )
+
+        if not np.isfinite(
+            result
+        ):
+
+            return float(
+                default
+            )
+
+        return result
+
+    except Exception:
+
+        return float(
+            default
+        )
+
+
+def safe_int(value, default=0):
+
+    try:
+
+        if value is None:
+
+            return int(
+                default
+            )
+
+        return int(
+            value
+        )
+
+    except Exception:
+
+        return int(
+            default
+        )
+
+
+def format_metric(value, digits=6):
+
+    if value is None:
+
+        return "N/A"
+
+    if isinstance(
+        value,
+        float
+    ):
+
+        return f"{value:.{digits}f}"
+
+    return str(
+        value
+    )
+
+
+# ============================================================
+# SB3 MODEL ARCHIVE VALIDATION
+# ============================================================
+
+def _validate_ppo_archive(model_path):
+
+    """
+    Validate the outer Stable-Baselines3 ZIP archive.
+    """
+
+    model_path = Path(
+        model_path
+    )
+
+    if not model_path.exists():
+
+        raise FileNotFoundError(
+            f"PPO model not found: {model_path}"
+        )
+
+    file_size = model_path.stat().st_size
+
+    if file_size <= 0:
+
+        raise RuntimeError(
+            f"PPO model is empty: {model_path}"
+        )
+
+    try:
+
+        with zipfile.ZipFile(
+            model_path,
+            mode="r"
+        ) as archive:
+
+            bad_file = archive.testzip()
+
+            if bad_file is not None:
+
+                raise RuntimeError(
+                    "PPO model ZIP contains a corrupted "
+                    f"member: {bad_file}"
+                )
+
+            names = archive.namelist()
+
+            required_files = {
+                "data",
+                "policy.pth",
+            }
+
+            missing_files = [
+
+                name
+
+                for name in required_files
+
+                if name not in names
+
+            ]
+
+            if missing_files:
+
+                raise RuntimeError(
+
+                    "PPO model archive is missing required "
+                    f"files: {missing_files}"
+
+                )
+
+            pytorch_files = [
+
+                name
+
+                for name in names
+
+                if name.endswith(".pth")
+
+            ]
+
+            if not pytorch_files:
+
+                raise RuntimeError(
+                    "PPO model archive contains no .pth files."
+                )
+
+            print(
+                "\n[PPO ARCHIVE]"
+            )
+
+            print(
+                "ZIP integrity       : OK"
+            )
+
+            print(
+                f"Archive size        : "
+                f"{file_size:,} bytes"
+            )
+
+            print(
+                f"Archive members     : "
+                f"{len(names)}"
+            )
+
+            print(
+                "PyTorch members     : "
+                + ", ".join(pytorch_files)
+            )
+
+            return {
+                "size": file_size,
+                "members": names,
+                "pytorch_members": pytorch_files,
+            }
+
+    except zipfile.BadZipFile as exc:
+
+        raise RuntimeError(
+            f"PPO model is not a valid ZIP archive: "
+            f"{model_path}"
+        ) from exc
+
+
+# ============================================================
+# SB3 ZIP/PyTorch Compatibility Loader
+# ============================================================
+
+def _load_from_zip_file_bytesio(
+    load_path,
+    load_data=True,
+    custom_objects=None,
+    device="auto",
+    verbose=0,
+    print_system_info=False,
+):
+
+    if custom_objects is None:
+
+        custom_objects = {}
+
+    load_path = Path(
+        load_path
+    )
+
+    if not load_path.exists():
+
+        raise FileNotFoundError(
+            f"PPO checkpoint not found: {load_path}"
+        )
+
+    device = sb3_save_util.get_device(
+        device=device
+    )
+
+    if verbose >= 1:
+
+        print(
+            f"[SB3 COMPAT] Loading: {load_path}"
+        )
+
+        print(
+            f"[SB3 COMPAT] Device: {device}"
+        )
+
+    data = None
+
+    params = {}
+
+    pytorch_variables = {}
+
+    with zipfile.ZipFile(
+        load_path,
+        mode="r"
+    ) as archive:
+
+        names = archive.namelist()
+
+        # ----------------------------------------------------
+        # System information
+        # ----------------------------------------------------
+
+        if print_system_info:
+
+            if "system_info.txt" in names:
+
+                print(
+                    "== SAVED MODEL SYSTEM INFO =="
+                )
+
+                try:
+
+                    saved_system_info = (
+                        archive.read(
+                            "system_info.txt"
+                        ).decode(
+                            "utf-8",
+                            errors="replace"
+                        )
+                    )
+
+                    print(
+                        saved_system_info
+                    )
+
+                except Exception:
+
+                    pass
+
+        # ----------------------------------------------------
+        # JSON metadata
+        # ----------------------------------------------------
+
+        if (
+            load_data
+            and
+            "data" in names
+        ):
+
+            json_data = archive.read(
+                "data"
+            ).decode(
+                "utf-8"
+            )
+
+            data = sb3_save_util.json_to_data(
+
+                json_data,
+
+                custom_objects=custom_objects
+
+            )
+
+        # ----------------------------------------------------
+        # PyTorch parameter files
+        # ----------------------------------------------------
+
+        pth_files = [
+
+            name
+
+            for name in names
+
+            if name.endswith(".pth")
+
+        ]
+
+        if not pth_files:
+
+            raise RuntimeError(
+                "No PyTorch parameter files were found "
+                "inside the PPO archive."
+            )
+
+        for file_path in pth_files:
+
+            if verbose >= 2:
+
+                print(
+                    f"[SB3 COMPAT] Reading: {file_path}"
+                )
+
+            raw_bytes = archive.read(
+                file_path
+            )
+
+            if not raw_bytes:
+
+                raise RuntimeError(
+                    f"Empty PyTorch parameter file: "
+                    f"{file_path}"
+                )
+
+            if verbose >= 2:
+
+                print(
+                    f"[SB3 COMPAT] Size: "
+                    f"{len(raw_bytes):,} bytes"
+                )
+
+            buffer = io.BytesIO(
+                raw_bytes
+            )
+
+            try:
+
+                th_object = torch.load(
+
+                    buffer,
+
+                    map_location=device,
+
+                    weights_only=True
+
+                )
+
+            finally:
+
+                buffer.close()
+
+            if file_path in {
+                "pytorch_variables.pth",
+                "tensors.pth",
+            }:
+
+                pytorch_variables = th_object
+
+            else:
+
+                parameter_name = Path(
+                    file_path
+                ).stem
+
+                params[
+                    parameter_name
+                ] = th_object
+
+    return (
+        data,
+        params,
+        pytorch_variables
+    )
+
+
+# ============================================================
+# Install SB3 Compatibility Loader
+# ============================================================
+
+def _install_ppo_loader_compatibility():
+
+    sb3_save_util.load_from_zip_file = (
+        _load_from_zip_file_bytesio
+    )
+
+    sb3_base_class.load_from_zip_file = (
+        _load_from_zip_file_bytesio
+    )
+
+    print(
+        "[SB3 COMPAT] ZIP -> BytesIO loader installed."
+    )
+
+
 # ============================================================
 # PPO Model Loading
 # ============================================================
@@ -1040,36 +1490,6 @@ def load_existing_ppo_model(
     model_path,
     env=None
 ):
-    """
-    Load an existing PPO model for fast validation.
-
-    The loaded PPO model is still used for the routing
-    decision:
-
-        observation -> PPO -> eta
-
-    The runtime environment continues with:
-
-        eta
-          |
-          v
-        Adaptive Routing
-          |
-          v
-        Top-K (k=5)
-          |
-          v
-        Bucket
-          |
-          v
-        Payment Simulation
-          |
-          v
-        Failure Model
-          |
-          v
-        Partial Backtracking
-    """
 
     model_path = Path(
         model_path
@@ -1119,10 +1539,28 @@ def load_existing_ppo_model(
     )
 
     print(
-        f"Model : {zip_path.resolve()}"
+        f"Model path : {zip_path.resolve()}"
+    )
+
+    print(
+        "Loading mode: PROJECT-LOCAL ZIP/BytesIO COMPATIBILITY"
     )
 
     load_start = time.time()
+
+    _validate_ppo_archive(
+        zip_path
+    )
+
+    print(
+        "Archive validation : SUCCESS"
+    )
+
+    _install_ppo_loader_compatibility()
+
+    print(
+        "PPO.load()         : STARTED"
+    )
 
     model = PPO.load(
         str(zip_path),
@@ -1136,43 +1574,814 @@ def load_existing_ppo_model(
     )
 
     print(
-        f"PPO model loaded in {load_time:.4f} seconds."
+        "PPO.load()         : SUCCESS"
+    )
+
+    print(
+        "Loader             : ZIP -> BytesIO -> torch.load"
+    )
+
+    print(
+        f"Model load time    : {load_time:.4f} seconds"
     )
 
     return model, load_time
 
 
 # ============================================================
-# Select Random Payment Scenario
+# Generate Evaluation Transactions
 # ============================================================
 
-def select_payment_scenario(
+def generate_evaluation_transactions(
     G,
     cfg,
-    seed
+    seed,
+    count
 ):
+
+    # --------------------------------------------------------
+    # Hard project requirement:
+    # exactly 10 independent evaluation transactions.
+    # --------------------------------------------------------
+
+    if count != EVAL_TRANSACTION_COUNT:
+
+        raise ValueError(
+            "Evaluation transaction count must be exactly "
+            f"{EVAL_TRANSACTION_COUNT}, got {count}."
+        )
+
+    min_amount = cfg["simulation"]["min_amount"]
+
+    max_amount = cfg["simulation"]["max_amount"]
 
     transactions = generate_transactions(
 
         G,
 
-        1,
+        count,
 
         seed,
 
-        cfg["simulation"]["min_amount"],
+        min_amount,
 
-        cfg["simulation"]["max_amount"]
+        max_amount
 
     )
 
     if not transactions:
 
         raise RuntimeError(
-            "Could not generate a payment transaction."
+            "Could not generate evaluation transactions."
         )
 
-    return transactions[0]
+    if len(transactions) != count:
+
+        raise RuntimeError(
+
+            "Evaluation transaction generator returned "
+            f"{len(transactions)} transactions, but exactly "
+            f"{count} are required."
+
+        )
+
+    # --------------------------------------------------------
+    # Make sure all 10 evaluation transactions are independent
+    # objects. This also prevents accidental object reuse.
+    # --------------------------------------------------------
+
+    transactions = [
+        copy.deepcopy(
+            transaction
+        )
+        for transaction in transactions
+    ]
+
+    # --------------------------------------------------------
+    # Assign evaluation transaction IDs explicitly.
+    #
+    # This does NOT change source, destination or amount.
+    # --------------------------------------------------------
+
+    for index, transaction in enumerate(
+        transactions,
+        start=1
+    ):
+
+        try:
+
+            transaction.tx_id = index
+
+        except Exception:
+
+            pass
+
+    return transactions
+
+
+# ============================================================
+# Single Evaluation Result Extraction
+# ============================================================
+
+def extract_episode_result(
+    transaction,
+    reward,
+    terminated,
+    truncated,
+    info,
+    episode_index
+):
+
+    success = bool(
+        info.get(
+            "success",
+            False
+        )
+    )
+
+    eta = safe_value(
+        info.get(
+            "eta"
+        )
+    )
+
+    top_k = safe_int(
+        info.get(
+            "top_k"
+        ),
+        5
+    )
+
+    candidate_count = safe_int(
+        info.get(
+            "candidate_path_count"
+        ),
+        0
+    )
+
+    usable_candidate_count = safe_int(
+        info.get(
+            "usable_candidate_count"
+        ),
+        0
+    )
+
+    bucket_size = safe_int(
+        info.get(
+            "bucket_size"
+        ),
+        0
+    )
+
+    final_path = safe_value(
+        info.get(
+            "path"
+        ),
+        []
+    )
+
+    path_length = safe_int(
+        info.get(
+            "path_length"
+        ),
+        0
+    )
+
+    fee = safe_float(
+        info.get(
+            "fee"
+        ),
+        0.0
+    )
+
+    delay = safe_float(
+        info.get(
+            "delay"
+        ),
+        0.0
+    )
+
+    carbon = safe_float(
+        info.get(
+            "carbon"
+        ),
+        0.0
+    )
+
+    attempt_count = safe_int(
+        info.get(
+            "attempt_count"
+        ),
+        0
+    )
+
+    backtrack_count = safe_int(
+        info.get(
+            "backtrack_count"
+        ),
+        0
+    )
+
+    partial_backtrack_count = safe_int(
+        info.get(
+            "partial_backtrack_count"
+        ),
+        0
+    )
+
+    partial_backtrack_success = safe_int(
+        info.get(
+            "partial_backtrack_success"
+        ),
+        0
+    )
+
+    full_reroute_count = safe_int(
+        info.get(
+            "full_reroute_count"
+        ),
+        0
+    )
+
+    failure_probability = safe_float(
+        info.get(
+            "failure_probability"
+        ),
+        0.0
+    )
+
+    reason = safe_value(
+        info.get(
+            "reason"
+        ),
+        ""
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Do NOT infer candidate rank from:
+    #
+    #     partial_backtrack_count
+    #
+    # or:
+    #
+    #     attempt_count
+    #
+    # The environment must explicitly report the successful
+    # Bucket candidate rank.
+    # --------------------------------------------------------
+
+    successful_bucket_rank = info.get(
+        "successful_bucket_rank"
+    )
+
+    if successful_bucket_rank is not None:
+
+        try:
+
+            successful_bucket_rank = int(
+                successful_bucket_rank
+            )
+
+        except Exception:
+
+            successful_bucket_rank = None
+
+    if (
+        successful_bucket_rank is not None
+        and
+        (
+            successful_bucket_rank < 1
+            or
+            (
+                bucket_size > 0
+                and
+                successful_bucket_rank > bucket_size
+            )
+        )
+    ):
+
+        successful_bucket_rank = None
+
+    return {
+
+        "episode_index":
+            episode_index,
+
+        "transaction_id":
+            safe_value(
+                getattr(
+                    transaction,
+                    "tx_id",
+                    episode_index
+                ),
+                episode_index
+            ),
+
+        "source":
+            str(
+                getattr(
+                    transaction,
+                    "source",
+                    ""
+                )
+            ),
+
+        "destination":
+            str(
+                getattr(
+                    transaction,
+                    "destination",
+                    ""
+                )
+            ),
+
+        "amount":
+            safe_float(
+                getattr(
+                    transaction,
+                    "amount",
+                    0.0
+                ),
+                0.0
+            ),
+
+        "success":
+            success,
+
+        "terminated":
+            bool(
+                terminated
+            ),
+
+        "truncated":
+            bool(
+                truncated
+            ),
+
+        "eta":
+            eta,
+
+        "top_k":
+            top_k,
+
+        "candidate_count":
+            candidate_count,
+
+        "usable_candidate_count":
+            usable_candidate_count,
+
+        "bucket_size":
+            bucket_size,
+
+        "successful_bucket_rank":
+            successful_bucket_rank,
+
+        "attempt_count":
+            attempt_count,
+
+        "backtrack_count":
+            backtrack_count,
+
+        "partial_backtrack_count":
+            partial_backtrack_count,
+
+        "partial_backtrack_success":
+            partial_backtrack_success,
+
+        "full_reroute_count":
+            full_reroute_count,
+
+        "failure_probability":
+            failure_probability,
+
+        "fee":
+            fee,
+
+        "delay":
+            delay,
+
+        "carbon":
+            carbon,
+
+        "reward":
+            safe_float(
+                reward,
+                0.0
+            ),
+
+        "reason":
+            reason,
+
+        "path":
+            final_path,
+
+        "hops":
+            max(
+                0,
+                path_length - 1
+            ),
+
+        "info_keys":
+            list(
+                info.keys()
+            ),
+
+        "raw_info":
+            info,
+
+    }
+
+
+# ============================================================
+# Aggregate Evaluation Results
+# ============================================================
+
+def aggregate_evaluation_results(
+    results
+):
+
+    total = len(
+        results
+    )
+
+    successful = sum(
+        1
+        for result in results
+        if result["success"]
+    )
+
+    failed = (
+        total
+        -
+        successful
+    )
+
+    def mean(
+        key,
+        only_success=False
+    ):
+
+        values = []
+
+        for result in results:
+
+            if (
+                only_success
+                and
+                not result["success"]
+            ):
+
+                continue
+
+            value = result.get(
+                key
+            )
+
+            if value is None:
+
+                continue
+
+            try:
+
+                value = float(
+                    value
+                )
+
+            except Exception:
+
+                continue
+
+            if np.isfinite(
+                value
+            ):
+
+                values.append(
+                    value
+                )
+
+        if not values:
+
+            return None
+
+        return float(
+            np.mean(
+                values
+            )
+        )
+
+    rank_counts = {}
+
+    unknown_success_rank = 0
+
+    for result in results:
+
+        if not result["success"]:
+
+            continue
+
+        rank = result.get(
+            "successful_bucket_rank"
+        )
+
+        if rank is None:
+
+            unknown_success_rank += 1
+
+        else:
+
+            rank_counts[rank] = (
+                rank_counts.get(
+                    rank,
+                    0
+                )
+                +
+                1
+            )
+
+    bucket_exhausted = sum(
+
+        1
+
+        for result in results
+
+        if (
+            not result["success"]
+            and
+            result["bucket_size"] > 0
+            and
+            result["attempt_count"]
+            >=
+            result["bucket_size"]
+        )
+
+    )
+
+    total_partial_backtracks = sum(
+        result["partial_backtrack_count"]
+        for result in results
+    )
+
+    total_partial_backtrack_success = sum(
+        result["partial_backtrack_success"]
+        for result in results
+    )
+
+    total_full_reroutes = sum(
+        result["full_reroute_count"]
+        for result in results
+    )
+
+    total_attempts = sum(
+        result["attempt_count"]
+        for result in results
+    )
+
+    return {
+
+        "total_transactions":
+            total,
+
+        "successful_transactions":
+            successful,
+
+        "failed_transactions":
+            failed,
+
+        "success_rate":
+            (
+                successful / total * 100.0
+                if total > 0
+                else 0.0
+            ),
+
+        "failure_rate":
+            (
+                failed / total * 100.0
+                if total > 0
+                else 0.0
+            ),
+
+        "average_attempts":
+            mean(
+                "attempt_count"
+            ),
+
+        "average_hops":
+            mean(
+                "hops",
+                only_success=True
+            ),
+
+        "average_fee":
+            mean(
+                "fee",
+                only_success=True
+            ),
+
+        "average_delay":
+            mean(
+                "delay",
+                only_success=True
+            ),
+
+        "average_carbon":
+            mean(
+                "carbon",
+                only_success=True
+            ),
+
+        "average_reward":
+            mean(
+                "reward"
+            ),
+
+        "average_eta":
+            mean(
+                "eta"
+            ),
+
+        "average_candidates":
+            mean(
+                "candidate_count"
+            ),
+
+        "average_usable_candidates":
+            mean(
+                "usable_candidate_count"
+            ),
+
+        "average_bucket_size":
+            mean(
+                "bucket_size"
+            ),
+
+        "total_attempts":
+            total_attempts,
+
+        "total_partial_backtracks":
+            total_partial_backtracks,
+
+        "total_partial_backtrack_success":
+            total_partial_backtrack_success,
+
+        "total_full_reroutes":
+            total_full_reroutes,
+
+        "bucket_exhausted":
+            bucket_exhausted,
+
+        "successful_bucket_rank_counts":
+            rank_counts,
+
+        "successful_rank_unknown":
+            unknown_success_rank,
+
+    }
+
+
+# ============================================================
+# Print Evaluation Summary
+# ============================================================
+
+def print_evaluation_summary(
+    aggregate
+):
+
+    print(
+        "\n============================================================"
+    )
+
+    print(
+        "MULTI-TRANSACTION EVALUATION SUMMARY"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Transactions evaluated : "
+        f"{aggregate['total_transactions']}"
+    )
+
+    print(
+        f"Successful payments    : "
+        f"{aggregate['successful_transactions']}"
+    )
+
+    print(
+        f"Failed payments        : "
+        f"{aggregate['failed_transactions']}"
+    )
+
+    print(
+        f"Success rate           : "
+        f"{aggregate['success_rate']:.2f}%"
+    )
+
+    print(
+        f"Failure rate           : "
+        f"{aggregate['failure_rate']:.2f}%"
+    )
+
+    print(
+        f"Average attempts       : "
+        f"{format_metric(aggregate['average_attempts'], 4)}"
+    )
+
+    print(
+        f"Average hops           : "
+        f"{format_metric(aggregate['average_hops'], 4)}"
+    )
+
+    print(
+        f"Average fee            : "
+        f"{format_metric(aggregate['average_fee'], 6)}"
+    )
+
+    print(
+        f"Average delay          : "
+        f"{format_metric(aggregate['average_delay'], 4)}"
+    )
+
+    print(
+        f"Average carbon         : "
+        f"{format_metric(aggregate['average_carbon'], 6)}"
+    )
+
+    print(
+        f"Average reward         : "
+        f"{format_metric(aggregate['average_reward'], 6)}"
+    )
+
+    print(
+        f"Average eta            : "
+        f"{format_metric(aggregate['average_eta'], 6)}"
+    )
+
+    print(
+        f"Total partial backtracks: "
+        f"{aggregate['total_partial_backtracks']}"
+    )
+
+    print(
+        f"Partial backtrack successes: "
+        f"{aggregate['total_partial_backtrack_success']}"
+    )
+
+    print(
+        f"Total full reroutes    : "
+        f"{aggregate['total_full_reroutes']}"
+    )
+
+    print(
+        "\nSuccessful Bucket candidate distribution:"
+    )
+
+    rank_counts = aggregate[
+        "successful_bucket_rank_counts"
+    ]
+
+    if rank_counts:
+
+        for rank in sorted(
+            rank_counts
+        ):
+
+            count = rank_counts[
+                rank
+            ]
+
+            print(
+                f"  Candidate #{rank}: {count}"
+            )
+
+    else:
+
+        print(
+            "  No explicit successful candidate "
+            "rank was reported by the environment."
+        )
+
+    if aggregate[
+        "successful_rank_unknown"
+    ] > 0:
+
+        print(
+            f"  Successful rank unknown: "
+            f"{aggregate['successful_rank_unknown']}"
+        )
+
+    print(
+        f"\nBucket exhausted          : "
+        f"{aggregate['bucket_exhausted']}"
+    )
+
+    print(
+        "============================================================"
+    )
 
 
 # ============================================================
@@ -1206,7 +2415,8 @@ def main():
         "Execution mode",
         "FAST VALIDATION"
         if FAST_VALIDATION
-        else "NORMAL TRAINING"
+        else
+        "NORMAL TRAINING"
     )
 
     report.item(
@@ -1224,6 +2434,11 @@ def main():
         "0/10"
     )
 
+    report.item(
+        "Evaluation transaction count",
+        "EXACTLY 10"
+    )
+
     report.save()
 
     runtime_env = None
@@ -1232,11 +2447,15 @@ def main():
 
     model_load_time = 0.0
 
-    prediction_time = 0.0
+    prediction_time_total = 0.0
 
-    execution_time = 0.0
+    execution_time_total = 0.0
 
     model = None
+
+    evaluation_results = []
+
+    aggregate = None
 
     try:
 
@@ -1269,6 +2488,25 @@ def main():
             seed
         )
 
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Evaluation is always exactly 10 transactions.
+        # ----------------------------------------------------
+
+        evaluation_transaction_count = (
+            get_evaluation_transaction_count(
+                cfg
+            )
+        )
+
+        if evaluation_transaction_count != 10:
+
+            raise RuntimeError(
+                "Internal configuration error: evaluation "
+                "transaction count is not 10."
+            )
+
         report.item(
             "Configuration",
             "SUCCESS"
@@ -1283,7 +2521,18 @@ def main():
             "Execution mode",
             "FAST VALIDATION"
             if FAST_VALIDATION
-            else "NORMAL TRAINING"
+            else
+            "NORMAL TRAINING"
+        )
+
+        report.item(
+            "Evaluation transactions",
+            evaluation_transaction_count
+        )
+
+        report.item(
+            "Evaluation transaction policy",
+            "EXACTLY 10 PER EXECUTION"
         )
 
         complete_step(
@@ -1319,7 +2568,9 @@ def main():
 
         report.item(
             "Snapshot path",
-            str(snapshot_path.resolve())
+            str(
+                snapshot_path.resolve()
+            )
         )
 
         report.item(
@@ -1332,6 +2583,11 @@ def main():
             time.strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
+        )
+
+        report.item(
+            "Evaluation transactions",
+            evaluation_transaction_count
         )
 
         # ====================================================
@@ -1524,17 +2780,6 @@ def main():
             cfg["n_transactions"]
         )
 
-        # ----------------------------------------------------
-        # Fast validation optimization
-        # ----------------------------------------------------
-        #
-        # The final end-to-end validation uses exactly one
-        # payment transaction.
-        #
-        # Therefore generating thousands of training
-        # transactions is unnecessary when PPO training is
-        # skipped.
-
         if FAST_VALIDATION:
 
             training_transaction_count = 1
@@ -1611,7 +2856,7 @@ def main():
 
             report.item(
                 "Transaction generation mode",
-                "FAST VALIDATION - MINIMAL"
+                "FAST VALIDATION - MINIMAL PPO TRAINING DATA"
             )
 
         else:
@@ -1725,6 +2970,11 @@ def main():
                 )
             )
 
+            report.item(
+                "PPO checkpoint loader",
+                "PROJECT-LOCAL ZIP/BytesIO COMPATIBILITY"
+            )
+
             model, model_load_time = (
                 load_existing_ppo_model(
                     model_path,
@@ -1764,6 +3014,11 @@ def main():
                 "reused the existing trained PPO model."
             )
 
+            report.add(
+                "The PPO checkpoint was loaded through a "
+                "project-local ZIP-to-BytesIO compatibility loader."
+            )
+
             complete_step(
                 4,
                 "STEP 4 - PPO TRAINING",
@@ -1783,11 +3038,6 @@ def main():
 
             print(
                 "Progress shown here is stage-level."
-            )
-
-            print(
-                "A real PPO timestep percentage requires "
-                "a callback inside RL/train.py."
             )
 
             report.item(
@@ -1863,7 +3113,7 @@ def main():
 
             report.add(
                 "The PPO agent was trained on the same "
-                "snapshot that will be used for the payment scenario."
+                "snapshot that will be used for evaluation."
             )
 
             print(
@@ -1879,22 +3129,22 @@ def main():
             )
 
         # ====================================================
-        # STEP 5
+        # STEP 5 - MULTIPLE PAYMENT SCENARIOS
         # ====================================================
 
         set_stage(
-            "STEP 5 - PAYMENT SCENARIO"
+            "STEP 5 - GENERATE PAYMENT SCENARIOS"
         )
 
         report.section(
-            "STEP 5 - PAYMENT SCENARIO"
+            "STEP 5 - PAYMENT SCENARIOS"
         )
 
         begin_step(
             5,
-            "STEP 5 - PAYMENT SCENARIO",
+            "STEP 5 - GENERATE PAYMENT SCENARIOS",
             report,
-            "Creating payment scenario..."
+            "Generating exactly 10 independent evaluation transactions..."
         )
 
         print(
@@ -1902,7 +3152,7 @@ def main():
         )
 
         print(
-            "STEP 5 - CREATING PAYMENT SCENARIO"
+            "STEP 5 - GENERATING 10 PAYMENT SCENARIOS"
         )
 
         print(
@@ -1910,91 +3160,147 @@ def main():
         )
 
         scenario_seed = (
-            seed + 1
+            seed + 1000
         )
 
-        transaction = select_payment_scenario(
+        evaluation_transactions = (
+            generate_evaluation_transactions(
 
-            G,
+                G,
 
-            cfg,
+                cfg,
 
+                scenario_seed,
+
+                evaluation_transaction_count
+
+            )
+        )
+
+        # ----------------------------------------------------
+        # Hard validation.
+        # ----------------------------------------------------
+
+        if len(evaluation_transactions) != 10:
+
+            raise RuntimeError(
+
+                "Exactly 10 evaluation transactions were "
+                "required, but "
+                f"{len(evaluation_transactions)} were generated."
+
+            )
+
+        report.item(
+            "Configured evaluation transactions",
+            evaluation_transaction_count
+        )
+
+        report.item(
+            "Generated evaluation transactions",
+            len(
+                evaluation_transactions
+            )
+        )
+
+        report.item(
+            "Evaluation seed",
             scenario_seed
-
-        )
-
-        source = str(
-            transaction.source
-        )
-
-        destination = str(
-            transaction.destination
-        )
-
-        amount = float(
-            transaction.amount
         )
 
         report.item(
-            "Source",
-            source
-        )
-
-        report.item(
-            "Destination",
-            destination
-        )
-
-        report.item(
-            "Payment amount",
-            amount
-        )
-
-        report.item(
-            "Transaction ID",
-            transaction.tx_id
+            "Evaluation transaction policy",
+            "EXACTLY 10"
         )
 
         print(
-            f"Source      : {source}"
+            f"Evaluation transactions requested : "
+            f"{evaluation_transaction_count}"
         )
 
         print(
-            f"Destination : {destination}"
+            f"Evaluation transactions generated : "
+            f"{len(evaluation_transactions)}"
         )
 
-        print(
-            f"Amount      : {amount}"
+        report.add("")
+
+        report.add(
+            "Each evaluation transaction is executed "
+            "independently."
         )
+
+        report.add(
+            "Source, destination and amount are generated "
+            "independently for the evaluation set."
+        )
+
+        report.add(
+            "The same trained PPO model is reused, but PPO "
+            "makes exactly one prediction for each transaction."
+        )
+
+        report.add(
+            "Each transaction receives its own evaluation "
+            "graph, failure model and network dynamics instance."
+        )
+
+        # ----------------------------------------------------
+        # Scenario list
+        # ----------------------------------------------------
+
+        report.add("")
+
+        report.add(
+            "Evaluation transaction list:"
+        )
+
+        for index, transaction in enumerate(
+            evaluation_transactions,
+            start=1
+        ):
+
+            report.item(
+                f"Transaction #{index}",
+                (
+                    f"id={getattr(transaction, 'tx_id', index)}, "
+                    f"source={getattr(transaction, 'source', '')}, "
+                    f"destination={getattr(transaction, 'destination', '')}, "
+                    f"amount={getattr(transaction, 'amount', '')}"
+                )
+            )
+
+            print(
+                f"TX #{index:02d} | "
+                f"source={getattr(transaction, 'source', '')} | "
+                f"destination={getattr(transaction, 'destination', '')} | "
+                f"amount={getattr(transaction, 'amount', '')}"
+            )
 
         complete_step(
             5,
-            "STEP 5 - PAYMENT SCENARIO",
+            "STEP 5 - GENERATE PAYMENT SCENARIOS",
             report,
-            "PAYMENT SCENARIO READY"
+            "10 PAYMENT SCENARIOS READY"
         )
 
         # ====================================================
-        # STEP 6
+        # STEP 6 - EVALUATION GRAPHS
         # ====================================================
 
         set_stage(
-            "STEP 6 - CREATE PAYMENT GRAPH"
+            "STEP 6 - PREPARE EVALUATION GRAPHS"
         )
 
         report.section(
-            "STEP 6 - PAYMENT GRAPH"
+            "STEP 6 - EVALUATION GRAPHS"
         )
 
         begin_step(
             6,
-            "STEP 6 - CREATE PAYMENT GRAPH",
+            "STEP 6 - PREPARE EVALUATION GRAPHS",
             report,
-            "Preparing evaluation graph..."
-        )
-
-        G_eval = copy.deepcopy(
-            G
+            "Preparing independent evaluation graphs..."
         )
 
         payment_failure_rate = float(
@@ -2004,44 +3310,52 @@ def main():
             )
         )
 
-        assign_failure_probabilities(
-
-            G_eval,
-
-            payment_failure_rate,
-
-            seed + 1
-
-        )
-
         report.item(
             "Payment failure rate",
             payment_failure_rate
         )
 
         report.item(
+            "Evaluation graph policy",
+            "Independent graph per transaction"
+        )
+
+        report.item(
+            "Evaluation graph source",
+            snapshot_path.name
+        )
+
+        report.item(
             "Evaluation nodes",
-            G_eval.number_of_nodes()
+            G.number_of_nodes()
         )
 
         report.item(
             "Evaluation channels",
-            G_eval.number_of_edges()
+            G.number_of_edges()
+        )
+
+        report.add("")
+
+        report.add(
+            "Evaluation graphs are copied from the original "
+            "snapshot for each payment and receive their own "
+            "failure probabilities."
         )
 
         complete_step(
             6,
-            "STEP 6 - CREATE PAYMENT GRAPH",
+            "STEP 6 - PREPARE EVALUATION GRAPHS",
             report,
-            "PAYMENT GRAPH READY"
+            "EVALUATION GRAPHS READY"
         )
 
         # ====================================================
-        # STEP 7
+        # STEP 7 - RUNTIME ENVIRONMENT
         # ====================================================
 
         set_stage(
-            "STEP 7 - CREATE RUNTIME ENVIRONMENT"
+            "STEP 7 - CREATE RUNTIME ENVIRONMENTS"
         )
 
         report.section(
@@ -2050,9 +3364,9 @@ def main():
 
         begin_step(
             7,
-            "STEP 7 - CREATE RUNTIME ENVIRONMENT",
+            "STEP 7 - CREATE RUNTIME ENVIRONMENTS",
             report,
-            "Creating runtime routing environment..."
+            "Preparing 10 independent routing environments..."
         )
 
         print(
@@ -2060,187 +3374,160 @@ def main():
         )
 
         print(
-            "STEP 7 - END-TO-END ROUTING"
+            "STEP 7 - MULTI-TRANSACTION END-TO-END ROUTING"
         )
 
         print(
             "============================================================"
         )
 
-        dynamics = NetworkDynamics(
-            G_eval
-        )
-
-        failure_model = FailureModel(
-            seed=seed + 1
-        )
-
-        payment_simulator = PaymentSimulator(
-
-            G=G_eval,
-
-            failure_model=failure_model,
-
-            network_dynamics=dynamics
-
-        )
-
         report.item(
             "Network dynamics",
-            type(dynamics).__name__
+            "One independent instance per transaction"
         )
 
         report.item(
             "Failure model",
-            type(failure_model).__name__
+            "One independent instance per transaction"
         )
 
         report.item(
             "Payment simulator",
-            type(payment_simulator).__name__
-        )
-
-        runtime_cfg = copy.deepcopy(
-            cfg
-        )
-
-        runtime_env = RoutingEnv(
-
-            G=G_eval,
-
-            transactions=[transaction],
-
-            heuristic_fn=lnd_cost,
-
-            config=runtime_cfg,
-
-            mode="eval"
-
-        )
-
-        # ----------------------------------------------------
-        # Attach evaluation environment to loaded/trained PPO
-        # ----------------------------------------------------
-
-        if model is None:
-
-            raise RuntimeError(
-                "PPO model is not available before evaluation."
-            )
-
-        try:
-
-            model.set_env(
-                runtime_env
-            )
-
-            report.item(
-                "PPO runtime environment",
-                "ATTACHED"
-            )
-
-        except Exception as env_attach_exc:
-
-            report.item(
-                "PPO runtime environment",
-                f"ATTACHMENT FAILED: {env_attach_exc}"
-            )
-
-            raise
-
-        observation, reset_info = runtime_env.reset(
-            seed=seed + 1
+            "Created internally by RoutingEnv from "
+            "the transaction-specific failure model and dynamics"
         )
 
         report.item(
-            "Environment reset",
-            "SUCCESS"
+            "PPO runtime environment",
+            "One independent RoutingEnv per transaction"
         )
 
         report.item(
-            "Reset info",
-            reset_info
+            "PPO model",
+            "One shared trained/loaded model"
+        )
+
+        report.item(
+            "Evaluation count",
+            len(
+                evaluation_transactions
+            )
+        )
+
+        report.item(
+            "PPO predictions per transaction",
+            "1"
+        )
+
+        report.item(
+            "Top-K",
+            "5 (fixed by RoutingEnv)"
+        )
+
+        report.item(
+            "Bucket candidates",
+            "Up to 5 candidates per transaction"
         )
 
         complete_step(
             7,
-            "STEP 7 - CREATE RUNTIME ENVIRONMENT",
+            "STEP 7 - CREATE RUNTIME ENVIRONMENTS",
             report,
-            "RUNTIME ENVIRONMENT READY"
+            "RUNTIME ENVIRONMENT POLICY READY"
         )
 
         # ====================================================
-        # STEP 8
+        # STEP 8 - PPO DECISIONS
         # ====================================================
 
         set_stage(
-            "STEP 8 - PPO ROUTING DECISION"
+            "STEP 8 - PPO ROUTING DECISIONS"
         )
 
         report.section(
-            "STEP 8 - PPO ROUTING DECISION"
+            "STEP 8 - PPO ROUTING DECISIONS"
         )
 
         begin_step(
             8,
-            "STEP 8 - PPO ROUTING DECISION",
+            "STEP 8 - PPO ROUTING DECISIONS",
             report,
-            "PPO selecting routing action..."
+            "One PPO decision will be made for every transaction..."
         )
 
         print(
-            "\nPPO is selecting the routing decision..."
+            "\n============================================================"
         )
 
-        prediction_start = time.time()
-
-        action, _state = model.predict(
-
-            observation,
-
-            deterministic=True
-
+        print(
+            "STEP 8 - PPO ROUTING DECISIONS"
         )
 
-        prediction_time = (
-            time.time()
-            -
-            prediction_start
+        print(
+            "============================================================"
         )
 
         report.item(
-            "PPO prediction",
-            "SUCCESS"
-        )
-
-        report.item(
-            "Raw action",
-            np.asarray(
-                action
-            ).tolist()
-        )
-
-        report.item(
-            "Prediction time (seconds)",
-            round(
-                prediction_time,
-                6
+            "Transactions",
+            len(
+                evaluation_transactions
             )
+        )
+
+        report.item(
+            "Expected PPO predictions",
+            len(
+                evaluation_transactions
+            )
+        )
+
+        report.item(
+            "Expected PPO predictions per transaction",
+            "1"
+        )
+
+        report.item(
+            "Top-K",
+            "5"
+        )
+
+        report.item(
+            "PPO action",
+            "eta only"
+        )
+
+        report.add("")
+
+        report.add(
+            "PPO does not select a fixed Bucket candidate."
+        )
+
+        report.add(
+            "For every transaction, PPO predicts eta exactly once."
+        )
+
+        report.add(
+            "The downstream RoutingEnv then performs the fixed "
+            "Top-K=5 candidate generation and Bucket pipeline."
+        )
+
+        report.add(
+            "The Bucket candidate that succeeds is not predetermined."
         )
 
         complete_step(
             8,
-            "STEP 8 - PPO ROUTING DECISION",
+            "STEP 8 - PPO ROUTING DECISIONS",
             report,
-            "PPO ROUTING DECISION READY"
+            "PPO DECISION STAGE READY"
         )
 
         # ====================================================
-        # STEP 9
+        # STEP 9 - MULTI-TRANSACTION PIPELINE
         # ====================================================
 
         set_stage(
-            "STEP 9 - EXECUTE BUCKET PAYMENT FAILURE BACKTRACKING"
+            "STEP 9 - EXECUTE MULTI-TRANSACTION ROUTING"
         )
 
         report.section(
@@ -2249,401 +3536,1075 @@ def main():
 
         begin_step(
             9,
-            "STEP 9 - EXECUTE BUCKET PAYMENT FAILURE BACKTRACKING",
+            "STEP 9 - EXECUTE MULTI-TRANSACTION ROUTING",
             report,
-            "Executing complete routing pipeline..."
+            "Executing all 10 independent payment scenarios..."
         )
 
         print(
-            "\nExecuting:"
+            "\n============================================================"
         )
 
         print(
-            "PPO -> Adaptive Routing -> Top-K -> "
+            "STEP 9 - MULTI-TRANSACTION ROUTING"
+        )
+
+        print(
+            "============================================================"
+        )
+
+        print(
+            "Pipeline:"
+        )
+
+        print(
+            "PPO -> Adaptive Routing -> Top-K=5 -> "
             "Bucket -> Payment -> Failure -> Backtracking"
         )
 
-        execution_start = time.time()
-
-        (
-            observation,
-            reward,
-            terminated,
-            truncated,
-            info
-        ) = runtime_env.step(
-            action
-        )
-
-        execution_time = (
-            time.time()
-            -
-            execution_start
-        )
-
-        # ====================================================
-        # BASIC RESULT
-        # ====================================================
-
-        success = bool(
-            info.get(
-                "success",
-                False
-            )
-        )
-
-        eta = safe_value(
-            info.get(
-                "eta"
-            )
-        )
-
-        top_k = safe_value(
-            info.get(
-                "top_k"
-            ),
-            5
-        )
-
-        candidate_count = safe_value(
-            info.get(
-                "candidate_path_count"
-            ),
-            0
-        )
-
-        usable_candidate_count = safe_value(
-            info.get(
-                "usable_candidate_count"
-            ),
-            0
-        )
-
-        bucket_size = safe_value(
-            info.get(
-                "bucket_size"
-            ),
-            0
-        )
-
-        final_path = safe_value(
-            info.get(
-                "path"
-            ),
-            []
-        )
-
-        path_length = safe_value(
-            info.get(
-                "path_length"
-            ),
-            0
-        )
-
-        fee = float(
-            safe_value(
-                info.get(
-                    "fee"
-                ),
-                0.0
-            )
-        )
-
-        delay = float(
-            safe_value(
-                info.get(
-                    "delay"
-                ),
-                0.0
-            )
-        )
-
-        carbon = float(
-            safe_value(
-                info.get(
-                    "carbon"
-                ),
-                0.0
-            )
-        )
-
-        attempt_count = int(
-            safe_value(
-                info.get(
-                    "attempt_count"
-                ),
-                0
-            )
-        )
-
-        backtrack_count = int(
-            safe_value(
-                info.get(
-                    "backtrack_count"
-                ),
-                0
-            )
-        )
-
-        partial_backtrack_count = int(
-            safe_value(
-                info.get(
-                    "partial_backtrack_count"
-                ),
-                0
-            )
-        )
-
-        partial_backtrack_success = int(
-            safe_value(
-                info.get(
-                    "partial_backtrack_success"
-                ),
-                0
-            )
-        )
-
-        full_reroute_count = int(
-            safe_value(
-                info.get(
-                    "full_reroute_count"
-                ),
-                0
-            )
-        )
-
-        failure_probability = float(
-            safe_value(
-                info.get(
-                    "failure_probability"
-                ),
-                0.0
-            )
-        )
-
-        reason = safe_value(
-            info.get(
-                "reason"
-            ),
-            ""
-        )
-
-        reward = float(
-            reward
-        )
-
-        report.item(
-            "Terminated",
-            terminated
-        )
-
-        report.item(
-            "Truncated",
-            truncated
-        )
-
-        report.item(
-            "Execution info keys",
-            list(info.keys())
-        )
-
-        report.item(
-            "Adaptive eta",
-            eta
-        )
-
-        report.item(
-            "Requested Top-K",
-            top_k
-        )
-
-        report.item(
-            "Generated candidates",
-            candidate_count
-        )
-
-        report.item(
-            "Usable candidates",
-            usable_candidate_count
-        )
-
-        report.item(
-            "Bucket size",
-            bucket_size
-        )
-
         report.add("")
 
         report.add(
-            "The routing pipeline generated the candidate "
-            "routes and placed the usable candidates into the Bucket."
-        )
-
-        report.add("")
-
-        report.add(
-            "Bucket routing policy:"
+            "Each of the 10 transactions is evaluated independently."
         )
 
         report.add(
-            "Route #1 is tested first."
+            "Each transaction receives exactly one PPO inference."
         )
 
         report.add(
-            "If Route #1 fails, partial/onion backtracking "
-            "moves to the next available candidate."
+            "Each PPO decision produces eta only."
         )
 
         report.add(
-            "The process continues until the payment succeeds "
-            "or the Bucket is exhausted."
+            "Top-K remains fixed at 5 inside RoutingEnv."
         )
 
-        complete_step(
-            9,
-            "STEP 9 - EXECUTE BUCKET PAYMENT FAILURE BACKTRACKING",
-            report,
-            "ROUTING PIPELINE EXECUTED"
+        report.add(
+            "The five selected candidates are handled by the "
+            "Bucket/payment/backtracking pipeline."
+        )
+
+        report.add(
+            "No successful Bucket candidate is predetermined."
+        )
+
+        report.add(
+            "The successful candidate may therefore be #1, #2, "
+            "#3, #4, #5, or no candidate if the Bucket is exhausted."
+        )
+
+        for episode_index, transaction in enumerate(
+            evaluation_transactions,
+            start=1
+        ):
+
+            episode_start = time.time()
+
+            source = str(
+                transaction.source
+            )
+
+            destination = str(
+                transaction.destination
+            )
+
+            amount = float(
+                transaction.amount
+            )
+
+            tx_id = safe_value(
+                getattr(
+                    transaction,
+                    "tx_id",
+                    episode_index
+                ),
+                episode_index
+            )
+
+            print(
+                "\n------------------------------------------------------------"
+            )
+
+            print(
+                f"EVALUATION TRANSACTION "
+                f"{episode_index}/10"
+            )
+
+            print(
+                "------------------------------------------------------------"
+            )
+
+            print(
+                f"Transaction ID : {tx_id}"
+            )
+
+            print(
+                f"Source         : {source}"
+            )
+
+            print(
+                f"Destination    : {destination}"
+            )
+
+            print(
+                f"Amount         : {amount}"
+            )
+
+            # ------------------------------------------------
+            # Independent graph
+            # ------------------------------------------------
+
+            G_eval = copy.deepcopy(
+                G
+            )
+
+            evaluation_seed = (
+                seed
+                +
+                1001
+                +
+                episode_index
+            )
+
+            assign_failure_probabilities(
+
+                G_eval,
+
+                payment_failure_rate,
+
+                evaluation_seed
+
+            )
+
+            # ------------------------------------------------
+            # Independent runtime objects
+            # ------------------------------------------------
+
+            dynamics = NetworkDynamics(
+                G_eval
+            )
+
+            failure_model = FailureModel(
+                seed=evaluation_seed
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # RoutingEnv internally constructs the
+            # PaymentSimulator using the exact failure_model
+            # and network_dynamics supplied below.
+            #
+            # This avoids having an unused second simulator.
+            # ------------------------------------------------
+
+            runtime_cfg = copy.deepcopy(
+                cfg
+            )
+
+            runtime_env = RoutingEnv(
+
+                G=G_eval,
+
+                transactions=[transaction],
+
+                heuristic_fn=lnd_cost,
+
+                config=runtime_cfg,
+
+                mode="eval",
+
+                failure_model=failure_model,
+
+                network_dynamics=dynamics
+
+            )
+
+            try:
+
+                # --------------------------------------------
+                # Attach same PPO model to this environment
+                # --------------------------------------------
+
+                model.set_env(
+                    runtime_env
+                )
+
+                # --------------------------------------------
+                # Reset
+                # --------------------------------------------
+
+                observation, reset_info = (
+                    runtime_env.reset(
+                        seed=evaluation_seed
+                    )
+                )
+
+                # --------------------------------------------
+                # PPO prediction
+                #
+                # EXACTLY ONE prediction for this transaction.
+                # --------------------------------------------
+
+                prediction_start = time.time()
+
+                action, _state = model.predict(
+
+                    observation,
+
+                    deterministic=True
+
+                )
+
+                prediction_time = (
+                    time.time()
+                    -
+                    prediction_start
+                )
+
+                prediction_time_total += (
+                    prediction_time
+                )
+
+                # --------------------------------------------
+                # Execute complete pipeline
+                #
+                # The same PPO action is passed once to step().
+                # --------------------------------------------
+
+                execution_start = time.time()
+
+                (
+                    next_observation,
+                    reward,
+                    terminated,
+                    truncated,
+                    info
+                ) = runtime_env.step(
+                    action
+                )
+
+                episode_execution_time = (
+                    time.time()
+                    -
+                    execution_start
+                )
+
+                execution_time_total += (
+                    episode_execution_time
+                )
+
+                # --------------------------------------------
+                # Extract result
+                # --------------------------------------------
+
+                result = extract_episode_result(
+
+                    transaction,
+
+                    reward,
+
+                    terminated,
+
+                    truncated,
+
+                    info,
+
+                    episode_index
+
+                )
+
+                result[
+                    "prediction_time"
+                ] = prediction_time
+
+                result[
+                    "pipeline_time"
+                ] = episode_execution_time
+
+                result[
+                    "evaluation_seed"
+                ] = evaluation_seed
+
+                result[
+                    "reset_info"
+                ] = reset_info
+
+                evaluation_results.append(
+                    result
+                )
+
+                # --------------------------------------------
+                # Console result
+                # --------------------------------------------
+
+                print(
+                    f"PPO eta        : "
+                    f"{result['eta']}"
+                )
+
+                print(
+                    f"Top-K          : "
+                    f"{result['top_k']}"
+                )
+
+                print(
+                    f"Candidates     : "
+                    f"{result['candidate_count']}"
+                )
+
+                print(
+                    f"Usable         : "
+                    f"{result['usable_candidate_count']}"
+                )
+
+                print(
+                    f"Bucket         : "
+                    f"{result['bucket_size']}"
+                )
+
+                print(
+                    f"Attempts       : "
+                    f"{result['attempt_count']}"
+                )
+
+                print(
+                    f"Partial BT     : "
+                    f"{result['partial_backtrack_count']}"
+                )
+
+                print(
+                    f"Full reroute   : "
+                    f"{result['full_reroute_count']}"
+                )
+
+                print(
+                    f"Payment        : "
+                    f"{'SUCCESS' if result['success'] else 'FAILED'}"
+                )
+
+                if result[
+                    "successful_bucket_rank"
+                ] is not None:
+
+                    print(
+                        f"Successful Bucket candidate: "
+                        f"#{result['successful_bucket_rank']}"
+                    )
+
+                else:
+
+                    if result["success"]:
+
+                        print(
+                            "Successful Bucket candidate: "
+                            "NOT EXPLICITLY REPORTED"
+                        )
+
+                    else:
+
+                        print(
+                            "Successful Bucket candidate: NONE"
+                        )
+
+                print(
+                    f"Reward         : "
+                    f"{result['reward']}"
+                )
+
+                print(
+                    f"PPO predictions for this transaction: 1"
+                )
+
+                print(
+                    f"Pipeline time  : "
+                    f"{episode_execution_time:.4f} seconds"
+                )
+
+            finally:
+
+                try:
+
+                    runtime_env.close()
+
+                except Exception as close_exc:
+
+                    print(
+                        "\nWarning: evaluation environment "
+                        f"{episode_index} could not be closed cleanly: "
+                        f"{close_exc}"
+                    )
+
+                runtime_env = None
+
+            episode_elapsed = (
+                time.time()
+                -
+                episode_start
+            )
+
+            # ----------------------------------------------
+            # Per-transaction report
+            # ----------------------------------------------
+
+            report.section(
+                f"EVALUATION TRANSACTION "
+                f"{episode_index}/10"
+            )
+
+            report.item(
+                "Transaction ID",
+                result["transaction_id"]
+            )
+
+            report.item(
+                "Source",
+                result["source"]
+            )
+
+            report.item(
+                "Destination",
+                result["destination"]
+            )
+
+            report.item(
+                "Payment amount",
+                result["amount"]
+            )
+
+            report.item(
+                "Evaluation seed",
+                evaluation_seed
+            )
+
+            report.item(
+                "PPO predictions",
+                "1"
+            )
+
+            report.item(
+                "PPO eta",
+                result["eta"]
+            )
+
+            report.item(
+                "Requested Top-K",
+                result["top_k"]
+            )
+
+            report.item(
+                "Generated candidates",
+                result["candidate_count"]
+            )
+
+            report.item(
+                "Usable candidates",
+                result["usable_candidate_count"]
+            )
+
+            report.item(
+                "Bucket size",
+                result["bucket_size"]
+            )
+
+            report.item(
+                "Payment status",
+                "SUCCESS"
+                if result["success"]
+                else
+                "FAILED"
+            )
+
+            report.item(
+                "Attempts",
+                result["attempt_count"]
+            )
+
+            report.item(
+                "Backtracks",
+                result["backtrack_count"]
+            )
+
+            report.item(
+                "Partial backtracks",
+                result["partial_backtrack_count"]
+            )
+
+            report.item(
+                "Successful partial backtracks",
+                result["partial_backtrack_success"]
+            )
+
+            report.item(
+                "Full reroutes",
+                result["full_reroute_count"]
+            )
+
+            report.item(
+                "Successful Bucket route",
+                (
+                    f"{result['successful_bucket_rank']} / "
+                    f"{result['bucket_size']}"
+                    if result["successful_bucket_rank"]
+                    is not None
+                    else
+                    (
+                        "UNKNOWN"
+                        if result["success"]
+                        else
+                        "NONE"
+                    )
+                )
+            )
+
+            report.item(
+                "Failure probability",
+                result["failure_probability"]
+            )
+
+            report.item(
+                "Fee",
+                result["fee"]
+            )
+
+            report.item(
+                "Delay",
+                result["delay"]
+            )
+
+            report.item(
+                "Carbon",
+                result["carbon"]
+            )
+
+            report.item(
+                "Reward",
+                result["reward"]
+            )
+
+            report.item(
+                "Reason",
+                result["reason"]
+            )
+
+            report.item(
+                "Hops",
+                result["hops"]
+            )
+
+            report.item(
+                "Prediction time (seconds)",
+                round(
+                    result["prediction_time"],
+                    6
+                )
+            )
+
+            report.item(
+                "Pipeline time (seconds)",
+                round(
+                    result["pipeline_time"],
+                    4
+                )
+            )
+
+            report.item(
+                "Total transaction time (seconds)",
+                round(
+                    episode_elapsed,
+                    4
+                )
+            )
+
+            report.item(
+                "Final path",
+                (
+                    " -> ".join(
+                        str(node)
+                        for node in result["path"]
+                    )
+                    if result["path"]
+                    else
+                    "NONE"
+                )
+            )
+
+        # ====================================================
+        # Aggregate evaluation
+        # ====================================================
+
+        # ----------------------------------------------------
+        # Hard validation:
+        # there MUST be exactly 10 results.
+        # ----------------------------------------------------
+
+        if len(evaluation_results) != 10:
+
+            raise RuntimeError(
+
+                "Evaluation completed with "
+                f"{len(evaluation_results)} results instead of "
+                "the required 10."
+
+            )
+
+        aggregate = aggregate_evaluation_results(
+            evaluation_results
+        )
+
+        print_evaluation_summary(
+            aggregate
         )
 
         # ====================================================
-        # STEP 10
+        # STEP 9 COMPLETION
         # ====================================================
-
-        set_stage(
-            "STEP 10 - FINAL PAYMENT RESULT"
-        )
 
         report.section(
-            "STEP 10 - FINAL PAYMENT RESULT"
-        )
-
-        begin_step(
-            10,
-            "STEP 10 - FINAL PAYMENT RESULT",
-            report,
-            "Processing final payment result..."
+            "MULTI-TRANSACTION EVALUATION SUMMARY"
         )
 
         report.item(
-            "Source",
-            source
+            "Transactions evaluated",
+            aggregate["total_transactions"]
         )
 
         report.item(
-            "Destination",
-            destination
+            "Expected transactions",
+            "10"
         )
 
         report.item(
-            "Payment amount",
-            amount
+            "Successful payments",
+            aggregate["successful_transactions"]
         )
 
         report.item(
-            "Payment status",
-            "SUCCESS" if success else "FAILED"
+            "Failed payments",
+            aggregate["failed_transactions"]
         )
 
         report.item(
-            "Destination reached",
-            "YES" if success else "NO"
+            "Success rate",
+            f"{aggregate['success_rate']:.2f}%"
         )
 
         report.item(
-            "Final path",
-            " -> ".join(
-                str(node)
-                for node in final_path
+            "Failure rate",
+            f"{aggregate['failure_rate']:.2f}%"
+        )
+
+        report.item(
+            "Average attempts",
+            format_metric(
+                aggregate["average_attempts"],
+                4
             )
-            if final_path
-            else "NONE"
         )
 
         report.item(
-            "Number of hops",
-            max(
-                0,
-                path_length - 1
+            "Average hops",
+            format_metric(
+                aggregate["average_hops"],
+                4
+            )
+        )
+
+        report.item(
+            "Average fee",
+            format_metric(
+                aggregate["average_fee"],
+                6
+            )
+        )
+
+        report.item(
+            "Average delay",
+            format_metric(
+                aggregate["average_delay"],
+                4
+            )
+        )
+
+        report.item(
+            "Average carbon",
+            format_metric(
+                aggregate["average_carbon"],
+                6
+            )
+        )
+
+        report.item(
+            "Average reward",
+            format_metric(
+                aggregate["average_reward"],
+                6
+            )
+        )
+
+        report.item(
+            "Average eta",
+            format_metric(
+                aggregate["average_eta"],
+                6
+            )
+        )
+
+        report.item(
+            "Average candidates",
+            format_metric(
+                aggregate["average_candidates"],
+                4
+            )
+        )
+
+        report.item(
+            "Average usable candidates",
+            format_metric(
+                aggregate["average_usable_candidates"],
+                4
+            )
+        )
+
+        report.item(
+            "Average Bucket size",
+            format_metric(
+                aggregate["average_bucket_size"],
+                4
             )
         )
 
         report.item(
             "Total attempts",
-            attempt_count
+            aggregate["total_attempts"]
         )
 
         report.item(
-            "Partial backtracks",
-            partial_backtrack_count
+            "Total partial backtracks",
+            aggregate["total_partial_backtracks"]
         )
 
         report.item(
             "Successful partial backtracks",
-            partial_backtrack_success
+            aggregate["total_partial_backtrack_success"]
         )
 
         report.item(
-            "Full reroutes",
-            full_reroute_count
+            "Total full reroutes",
+            aggregate["total_full_reroutes"]
         )
 
         report.item(
-            "Failure probability",
-            failure_probability
+            "Bucket exhausted",
+            aggregate["bucket_exhausted"]
         )
 
-        report.item(
-            "Fee",
-            fee
+        report.add("")
+
+        report.add(
+            "Successful Bucket candidate distribution:"
         )
 
-        report.item(
-            "Delay",
-            delay
-        )
+        if aggregate[
+            "successful_bucket_rank_counts"
+        ]:
 
-        report.item(
-            "Carbon",
-            carbon
-        )
+            for rank in sorted(
+                aggregate[
+                    "successful_bucket_rank_counts"
+                ]
+            ):
 
-        report.item(
-            "Reward",
-            reward
-        )
+                count = aggregate[
+                    "successful_bucket_rank_counts"
+                ][
+                    rank
+                ]
 
-        report.item(
-            "Reason",
-            reason
-        )
+                percentage = (
 
-        successful_bucket_rank = None
+                    count
+                    /
+                    max(
+                        1,
+                        aggregate[
+                            "successful_transactions"
+                        ]
+                    )
+                    *
+                    100.0
 
-        if success:
-
-            if partial_backtrack_count == 0:
-
-                successful_bucket_rank = 1
-
-            else:
-
-                successful_bucket_rank = (
-                    partial_backtrack_count + 1
                 )
 
-        if successful_bucket_rank is not None:
-
-            report.item(
-                "Successful Bucket route",
-                f"{successful_bucket_rank} / {bucket_size}"
-            )
+                report.item(
+                    f"Candidate #{rank}",
+                    f"{count} "
+                    f"({percentage:.2f}% of successful payments)"
+                )
 
         else:
 
+            report.add(
+                "No explicit successful Bucket candidate "
+                "rank was reported by RoutingEnv."
+            )
+
+        if aggregate[
+            "successful_rank_unknown"
+        ] > 0:
+
             report.item(
-                "Successful Bucket route",
-                "NONE"
+                "Successful candidate rank unknown",
+                aggregate[
+                    "successful_rank_unknown"
+                ]
+            )
+
+        report.add("")
+
+        report.add(
+            "Exactly 10 independent evaluation transactions "
+            "were processed."
+        )
+
+        report.add(
+            "Each transaction received exactly one PPO prediction."
+        )
+
+        report.add(
+            "The PPO action controls eta only."
+        )
+
+        report.add(
+            "Top-K is fixed at 5 inside RoutingEnv."
+        )
+
+        report.add(
+            "The evaluation does not force a particular "
+            "Bucket candidate to succeed."
+        )
+
+        report.add(
+            "Different transactions may succeed at different "
+            "Bucket positions, or all candidates may fail."
+        )
+
+        complete_step(
+            9,
+            "STEP 9 - EXECUTE MULTI-TRANSACTION ROUTING",
+            report,
+            "10-TRANSACTION ROUTING COMPLETED"
+        )
+
+        # ====================================================
+        # STEP 10 - FINAL EVALUATION RESULT
+        # ====================================================
+
+        set_stage(
+            "STEP 10 - FINAL EVALUATION RESULT"
+        )
+
+        report.section(
+            "STEP 10 - FINAL EVALUATION RESULT"
+        )
+
+        begin_step(
+            10,
+            "STEP 10 - FINAL EVALUATION RESULT",
+            report,
+            "Processing aggregate evaluation result..."
+        )
+
+        # ----------------------------------------------------
+        # Overall status
+        # ----------------------------------------------------
+
+        all_success = (
+            aggregate[
+                "successful_transactions"
+            ]
+            ==
+            aggregate[
+                "total_transactions"
+            ]
+        )
+
+        any_success = (
+            aggregate[
+                "successful_transactions"
+            ]
+            >
+            0
+        )
+
+        report.item(
+            "Evaluation status",
+            (
+                "ALL PAYMENTS SUCCESSFUL"
+                if all_success
+                else
+                "MIXED SUCCESS/FAILURE"
+                if any_success
+                else
+                "ALL PAYMENTS FAILED"
+            )
+        )
+
+        report.item(
+            "Transactions evaluated",
+            aggregate[
+                "total_transactions"
+            ]
+        )
+
+        report.item(
+            "Successful payments",
+            aggregate[
+                "successful_transactions"
+            ]
+        )
+
+        report.item(
+            "Failed payments",
+            aggregate[
+                "failed_transactions"
+            ]
+        )
+
+        report.item(
+            "Overall success rate",
+            f"{aggregate['success_rate']:.2f}%"
+        )
+
+        report.item(
+            "Overall failure rate",
+            f"{aggregate['failure_rate']:.2f}%"
+        )
+
+        report.item(
+            "Average attempts",
+            format_metric(
+                aggregate["average_attempts"],
+                4
+            )
+        )
+
+        report.item(
+            "Average hops",
+            format_metric(
+                aggregate["average_hops"],
+                4
+            )
+        )
+
+        report.item(
+            "Average fee",
+            format_metric(
+                aggregate["average_fee"],
+                6
+            )
+        )
+
+        report.item(
+            "Average delay",
+            format_metric(
+                aggregate["average_delay"],
+                4
+            )
+        )
+
+        report.item(
+            "Average carbon",
+            format_metric(
+                aggregate["average_carbon"],
+                6
+            )
+        )
+
+        report.item(
+            "Average reward",
+            format_metric(
+                aggregate["average_reward"],
+                6
+            )
+        )
+
+        report.item(
+            "Average eta",
+            format_metric(
+                aggregate["average_eta"],
+                6
+            )
+        )
+
+        report.item(
+            "Total partial backtracks",
+            aggregate[
+                "total_partial_backtracks"
+            ]
+        )
+
+        report.item(
+            "Successful partial backtracks",
+            aggregate[
+                "total_partial_backtrack_success"
+            ]
+        )
+
+        report.item(
+            "Total full reroutes",
+            aggregate[
+                "total_full_reroutes"
+            ]
+        )
+
+        report.item(
+            "Bucket exhausted",
+            aggregate[
+                "bucket_exhausted"
+            ]
+        )
+
+        report.add("")
+
+        report.add(
+            "Per-transaction result table:"
+        )
+
+        for result in evaluation_results:
+
+            successful_rank = (
+                f"#{result['successful_bucket_rank']}"
+                if result[
+                    "successful_bucket_rank"
+                ] is not None
+                else
+                (
+                    "UNKNOWN"
+                    if result["success"]
+                    else
+                    "NONE"
+                )
+            )
+
+            report.item(
+                (
+                    f"TX #{result['episode_index']} "
+                    f"(id={result['transaction_id']})"
+                ),
+                (
+                    f"{'SUCCESS' if result['success'] else 'FAILED'} | "
+                    f"source={result['source']} | "
+                    f"destination={result['destination']} | "
+                    f"amount={result['amount']} | "
+                    f"eta={result['eta']} | "
+                    f"candidates={result['candidate_count']} | "
+                    f"bucket={result['bucket_size']} | "
+                    f"attempts={result['attempt_count']} | "
+                    f"route={successful_rank} | "
+                    f"reward={result['reward']:.6f}"
+                )
             )
 
         # ====================================================
@@ -2654,50 +4615,74 @@ def main():
             "FINAL STATUS"
         )
 
-        if success:
+        if all_success:
 
             report.add(
-                "PAYMENT SUCCESSFUL"
+                "ALL PAYMENT SCENARIOS SUCCESSFUL"
             )
 
             report.add(
-                f"The payment reached destination "
-                f"{destination} from source {source}."
+                f"All {aggregate['total_transactions']} "
+                "independent payment scenarios reached their "
+                "destinations."
             )
 
-            if successful_bucket_rank == 1:
+        elif any_success:
 
-                report.add(
-                    "The first Bucket route succeeded."
-                )
+            report.add(
+                "MULTI-TRANSACTION EVALUATION COMPLETED"
+            )
 
-            else:
+            report.add(
+                f"{aggregate['successful_transactions']} of "
+                f"{aggregate['total_transactions']} payment "
+                "scenarios succeeded."
+            )
 
-                report.add(
-                    f"The payment succeeded after "
-                    f"{attempt_count} attempts."
-                )
-
-                report.add(
-                    f"Successful route: "
-                    f"Bucket candidate #{successful_bucket_rank}."
-                )
+            report.add(
+                f"{aggregate['failed_transactions']} payment "
+                "scenarios failed."
+            )
 
         else:
 
             report.add(
-                "PAYMENT FAILED"
+                "ALL PAYMENT SCENARIOS FAILED"
             )
 
             report.add(
-                "No usable route successfully delivered "
-                "the payment to the destination."
+                "None of the evaluated payment scenarios "
+                "successfully reached the destination."
             )
 
-            report.add(
-                "Please try again. A valid route is "
-                "currently not available."
-            )
+        report.add("")
+
+        report.add(
+            "Important evaluation property:"
+        )
+
+        report.add(
+            "Exactly 10 independent payment transactions "
+            "were evaluated."
+        )
+
+        report.add(
+            "Each transaction received exactly one PPO prediction."
+        )
+
+        report.add(
+            "Top-K was fixed at 5 for every transaction."
+        )
+
+        report.add(
+            "The evaluation does not assume that Bucket "
+            "candidate #3 must succeed."
+        )
+
+        report.add(
+            "Different transactions may succeed at different "
+            "Bucket positions, or all candidates may fail."
+        )
 
         # ====================================================
         # EXECUTION TIME
@@ -2717,7 +4702,25 @@ def main():
             "Execution mode",
             "FAST VALIDATION"
             if FAST_VALIDATION
-            else "NORMAL TRAINING"
+            else
+            "NORMAL TRAINING"
+        )
+
+        report.item(
+            "Evaluation transactions",
+            "10"
+        )
+
+        report.item(
+            "Expected PPO predictions",
+            "10"
+        )
+
+        report.item(
+            "Actual PPO predictions",
+            len(
+                evaluation_results
+            )
         )
 
         report.item(
@@ -2737,17 +4740,32 @@ def main():
         )
 
         report.item(
-            "PPO prediction time (seconds)",
+            "Total PPO prediction time (seconds)",
             round(
-                prediction_time,
+                prediction_time_total,
                 6
             )
         )
 
         report.item(
-            "Payment pipeline time (seconds)",
+            "Total payment pipeline time (seconds)",
             round(
-                execution_time,
+                execution_time_total,
+                4
+            )
+        )
+
+        report.item(
+            "Average payment pipeline time (seconds)",
+            round(
+                execution_time_total
+                /
+                max(
+                    1,
+                    len(
+                        evaluation_results
+                    )
+                ),
                 4
             )
         )
@@ -2783,6 +4801,21 @@ def main():
         )
 
         report.item(
+            "Evaluation transactions",
+            "10"
+        )
+
+        report.item(
+            "PPO predictions",
+            "10"
+        )
+
+        report.item(
+            "Top-K",
+            "5"
+        )
+
+        report.item(
             "Run completed",
             time.strftime(
                 "%Y-%m-%d %H:%M:%S"
@@ -2792,7 +4825,9 @@ def main():
         report.item(
             "Report file",
             str(
-                Path("report.txt").resolve()
+                Path(
+                    "report.txt"
+                ).resolve()
             )
         )
 
@@ -2802,7 +4837,7 @@ def main():
             progress=100.0,
             step=10,
             step_name="RUN COMPLETED",
-            message="END-TO-END EXECUTION COMPLETED"
+            message="10-TRANSACTION END-TO-END EVALUATION COMPLETED"
         )
 
         print(
@@ -2810,7 +4845,7 @@ def main():
         )
 
         print(
-            "END-TO-END EXECUTION FINISHED"
+            "10-TRANSACTION END-TO-END EVALUATION FINISHED"
         )
 
         print(
@@ -2818,69 +4853,143 @@ def main():
         )
 
         print(
-            f"Execution mode : "
+            f"Execution mode       : "
             f"{'FAST VALIDATION' if FAST_VALIDATION else 'NORMAL TRAINING'}"
         )
 
         print(
-            f"Snapshot       : {snapshot_path.name}"
+            f"Snapshot             : "
+            f"{snapshot_path.name}"
         )
 
         print(
-            f"Source         : {source}"
+            f"Transactions         : "
+            f"{aggregate['total_transactions']} / 10"
         )
 
         print(
-            f"Destination    : {destination}"
+            f"PPO predictions      : "
+            f"{len(evaluation_results)} / 10"
         )
 
         print(
-            f"Amount         : {amount}"
+            f"Top-K                : 5"
         )
 
         print(
-            f"Top-K          : {top_k}"
+            f"Successful payments  : "
+            f"{aggregate['successful_transactions']}"
         )
 
         print(
-            f"Candidates     : {usable_candidate_count}"
+            f"Failed payments      : "
+            f"{aggregate['failed_transactions']}"
         )
 
         print(
-            f"Attempts       : {attempt_count}"
+            f"Success rate         : "
+            f"{aggregate['success_rate']:.2f}%"
         )
 
         print(
-            f"Backtracks     : {partial_backtrack_count}"
+            f"Average attempts     : "
+            f"{format_metric(aggregate['average_attempts'], 4)}"
         )
 
         print(
-            f"Success        : {success}"
+            f"Average hops         : "
+            f"{format_metric(aggregate['average_hops'], 4)}"
         )
 
         print(
-            f"Fee            : {fee}"
+            f"Average fee          : "
+            f"{format_metric(aggregate['average_fee'], 6)}"
         )
 
         print(
-            f"Hops           : {max(0, path_length - 1)}"
+            f"Average delay        : "
+            f"{format_metric(aggregate['average_delay'], 4)}"
         )
 
         print(
-            f"PPO train time : {training_time:.4f} seconds"
+            f"Average carbon       : "
+            f"{format_metric(aggregate['average_carbon'], 6)}"
         )
 
         print(
-            f"PPO load time  : {model_load_time:.4f} seconds"
+            f"Average reward       : "
+            f"{format_metric(aggregate['average_reward'], 6)}"
         )
 
         print(
-            f"Pipeline time  : {execution_time:.4f} seconds"
+            f"Partial backtracks   : "
+            f"{aggregate['total_partial_backtracks']}"
         )
 
         print(
-            f"Total time     : {total_time:.4f} seconds"
+            f"Full reroutes        : "
+            f"{aggregate['total_full_reroutes']}"
         )
+
+        print(
+            f"PPO train time       : "
+            f"{training_time:.4f} seconds"
+        )
+
+        print(
+            f"PPO load time        : "
+            f"{model_load_time:.4f} seconds"
+        )
+
+        print(
+            f"PPO prediction time  : "
+            f"{prediction_time_total:.6f} seconds"
+        )
+
+        print(
+            f"Pipeline time        : "
+            f"{execution_time_total:.4f} seconds"
+        )
+
+        print(
+            f"Total time           : "
+            f"{total_time:.4f} seconds"
+        )
+
+        print(
+            "\nSuccessful Bucket candidate distribution:"
+        )
+
+        if aggregate[
+            "successful_bucket_rank_counts"
+        ]:
+
+            for rank in sorted(
+                aggregate[
+                    "successful_bucket_rank_counts"
+                ]
+            ):
+
+                print(
+                    f"  Candidate #{rank}: "
+                    f"{aggregate['successful_bucket_rank_counts'][rank]}"
+                )
+
+        else:
+
+            print(
+                "  Candidate rank was not explicitly "
+                "reported by RoutingEnv."
+            )
+
+        if aggregate[
+            "successful_rank_unknown"
+        ] > 0:
+
+            print(
+                f"  Unknown successful candidate rank: "
+                f"{aggregate['successful_rank_unknown']}"
+            )
 
         print(
             "\nFull report saved to:"
@@ -2893,58 +5002,101 @@ def main():
         return {
 
             "success":
-                success,
+                all_success,
 
-            "source":
-                source,
+            "all_success":
+                all_success,
 
-            "destination":
-                destination,
+            "any_success":
+                any_success,
 
-            "amount":
-                amount,
+            "total_transactions":
+                aggregate[
+                    "total_transactions"
+                ],
 
-            "eta":
-                eta,
+            "successful_transactions":
+                aggregate[
+                    "successful_transactions"
+                ],
 
-            "top_k":
-                top_k,
+            "failed_transactions":
+                aggregate[
+                    "failed_transactions"
+                ],
 
-            "candidate_count":
-                candidate_count,
+            "success_rate":
+                aggregate[
+                    "success_rate"
+                ],
 
-            "usable_candidate_count":
-                usable_candidate_count,
+            "failure_rate":
+                aggregate[
+                    "failure_rate"
+                ],
 
-            "bucket_size":
-                bucket_size,
+            "average_attempts":
+                aggregate[
+                    "average_attempts"
+                ],
 
-            "attempt_count":
-                attempt_count,
+            "average_hops":
+                aggregate[
+                    "average_hops"
+                ],
 
-            "partial_backtrack_count":
-                partial_backtrack_count,
+            "average_fee":
+                aggregate[
+                    "average_fee"
+                ],
 
-            "successful_bucket_rank":
-                successful_bucket_rank,
+            "average_delay":
+                aggregate[
+                    "average_delay"
+                ],
 
-            "fee":
-                fee,
+            "average_carbon":
+                aggregate[
+                    "average_carbon"
+                ],
 
-            "delay":
-                delay,
+            "average_reward":
+                aggregate[
+                    "average_reward"
+                ],
 
-            "carbon":
-                carbon,
+            "average_eta":
+                aggregate[
+                    "average_eta"
+                ],
 
-            "path":
-                final_path,
+            "total_partial_backtracks":
+                aggregate[
+                    "total_partial_backtracks"
+                ],
 
-            "hops":
-                max(
-                    0,
-                    path_length - 1
-                ),
+            "total_partial_backtrack_success":
+                aggregate[
+                    "total_partial_backtrack_success"
+                ],
+
+            "total_full_reroutes":
+                aggregate[
+                    "total_full_reroutes"
+                ],
+
+            "bucket_exhausted":
+                aggregate[
+                    "bucket_exhausted"
+                ],
+
+            "successful_bucket_rank_counts":
+                aggregate[
+                    "successful_bucket_rank_counts"
+                ],
+
+            "evaluation_results":
+                evaluation_results,
 
             "training_time":
                 training_time,
@@ -2953,10 +5105,10 @@ def main():
                 model_load_time,
 
             "prediction_time":
-                prediction_time,
+                prediction_time_total,
 
             "pipeline_time":
-                execution_time,
+                execution_time_total,
 
             "total_time":
                 total_time,
@@ -2965,7 +5117,8 @@ def main():
                 (
                     "FAST VALIDATION"
                     if FAST_VALIDATION
-                    else "NORMAL TRAINING"
+                    else
+                    "NORMAL TRAINING"
                 ),
 
         }
@@ -2990,19 +5143,23 @@ def main():
         )
 
         print(
-            f"Step     : {CURRENT_STEP}/{TOTAL_STEPS}"
+            f"Step     : "
+            f"{CURRENT_STEP}/{TOTAL_STEPS}"
         )
 
         print(
-            f"Progress : {CURRENT_PROGRESS:.2f}%"
+            f"Progress : "
+            f"{CURRENT_PROGRESS:.2f}%"
         )
 
         print(
-            f"Stage    : {CURRENT_STAGE}"
+            f"Stage    : "
+            f"{CURRENT_STAGE}"
         )
 
         print(
-            f"Error    : {type(exc).__name__}: {exc}"
+            f"Error    : "
+            f"{type(exc).__name__}: {exc}"
         )
 
         print(

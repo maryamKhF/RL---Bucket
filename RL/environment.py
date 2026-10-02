@@ -1,6 +1,7 @@
 # RL/environment.py
 
 import math
+import os
 from pathlib import Path
 import sys
 
@@ -123,14 +124,28 @@ class RoutingEnv(gym.Env):
     Bucket that participated in the completed step.
 
     At terminal state these references are intentionally kept
-    alive so that E2E tests and diagnostics can inspect the
-    completed routing pipeline.
+    alive so E2E tests and diagnostics can inspect the completed
+    routing pipeline.
+
+    Performance rule
+    ----------------
+    The environment supports an optional fast-validation mode
+    through:
+
+        RL_FAST_ENV=1
+
+    This mode does NOT change the routing algorithm, Top-K value,
+    eta semantics, Bucket semantics, channel identity, or
+    backtracking logic.
+
+    It only avoids unnecessary diagnostic/state work where possible.
     """
 
     metadata = {
         "render_modes": [],
     }
 
+    # Fixed by project design.
     FIXED_TOP_K = 5
 
     # ======================================================
@@ -149,6 +164,10 @@ class RoutingEnv(gym.Env):
         network_dynamics=None,
     ):
         super().__init__()
+
+        # --------------------------------------------------
+        # Basic validation
+        # --------------------------------------------------
 
         if G is None:
             raise ValueError(
@@ -211,6 +230,28 @@ class RoutingEnv(gym.Env):
         )
 
         # --------------------------------------------------
+        # Fast validation mode
+        #
+        # IMPORTANT:
+        # This does not alter routing semantics.
+        # --------------------------------------------------
+
+        self.fast_mode = (
+            os.environ.get(
+                "RL_FAST_ENV",
+                "0",
+            )
+            .strip()
+            .lower()
+            in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        )
+
+        # --------------------------------------------------
         # Graph configuration
         # --------------------------------------------------
 
@@ -223,6 +264,10 @@ class RoutingEnv(gym.Env):
             raise TypeError(
                 "config['graph'] must be a dictionary."
             )
+
+        # --------------------------------------------------
+        # Fixed Top-K
+        # --------------------------------------------------
 
         self.top_k = self.FIXED_TOP_K
 
@@ -524,6 +569,10 @@ class RoutingEnv(gym.Env):
             dtype=np.float32,
         )
 
+        # --------------------------------------------------
+        # PPO controls only eta.
+        # --------------------------------------------------
+
         self.action_space = spaces.Box(
             low=np.array(
                 [self.eta_min],
@@ -561,6 +610,10 @@ class RoutingEnv(gym.Env):
         if seed is not None:
             self.seed = self._validate_seed(seed)
 
+        # --------------------------------------------------
+        # Reset network dynamics
+        # --------------------------------------------------
+
         reset_method = getattr(
             self.network_dynamics,
             "reset",
@@ -577,6 +630,10 @@ class RoutingEnv(gym.Env):
                 self.reset_balances_on_episode_reset
             )
         )
+
+        # --------------------------------------------------
+        # Reset failure runtime state
+        # --------------------------------------------------
 
         reset_failure_state = getattr(
             self.failure_model,
@@ -596,6 +653,10 @@ class RoutingEnv(gym.Env):
             reset_rng=(seed is not None),
         )
 
+        # --------------------------------------------------
+        # Reset transaction state
+        # --------------------------------------------------
+
         self.tx_index = 0
         self.current_tx = None
         self.current_paths = []
@@ -603,6 +664,10 @@ class RoutingEnv(gym.Env):
 
         self.bucket = None
         self.backtracker.bucket = None
+
+        # --------------------------------------------------
+        # Reset statistics
+        # --------------------------------------------------
 
         self.last_failure_probability = 0.0
         self.last_average_delay = 0.0
@@ -613,6 +678,10 @@ class RoutingEnv(gym.Env):
 
         self.total_successes = 0
         self.total_failures = 0
+
+        # --------------------------------------------------
+        # Load first transaction
+        # --------------------------------------------------
 
         self.current_tx = self._get_current_transaction()
 
@@ -643,7 +712,10 @@ class RoutingEnv(gym.Env):
                 "Call reset() before step()."
             )
 
-        # A new transaction step starts here.
+        # --------------------------------------------------
+        # New transaction step
+        # --------------------------------------------------
+
         self.bucket = None
         self.current_bucket = None
         self.backtracker.bucket = None
@@ -699,7 +771,7 @@ class RoutingEnv(gym.Env):
         self.backtracker.bucket = bucket
 
         # --------------------------------------------------
-        # Execute routing/payment pipeline
+        # Execute complete routing pipeline
         # --------------------------------------------------
 
         result = self._execute_bucket_pipeline(
@@ -856,7 +928,7 @@ class RoutingEnv(gym.Env):
         # --------------------------------------------------
         # Advance transaction
         #
-        # Terminal state deliberately preserves Bucket.
+        # Terminal state preserves the actual Bucket.
         # --------------------------------------------------
 
         terminated = self._advance_transaction()
@@ -881,7 +953,7 @@ class RoutingEnv(gym.Env):
         )
 
     # ======================================================
-    # FAILED STEP HELPER
+    # FAILED STEP
     # ======================================================
 
     def _finish_failed_step(
@@ -918,29 +990,46 @@ class RoutingEnv(gym.Env):
             "success": False,
             "eta": eta,
             "top_k": self.top_k,
-            "candidate_path_count": candidate_path_count,
-            "usable_candidate_count": usable_candidate_count,
+
+            "candidate_path_count": (
+                candidate_path_count
+            ),
+
+            "usable_candidate_count": (
+                usable_candidate_count
+            ),
+
             "bucket_size": 0,
             "payment_success": False,
             "failure_probability": 1.0,
             "average_delay": 0.0,
             "backtrack_count": 0,
+
             "partial_backtrack_count": 0,
             "partial_backtrack_success": 0,
+
             "full_reroute": False,
             "full_reroute_count": 0,
+
             "attempt_count": 0,
             "reason": reason,
+
+            "episode_reward": (
+                self.episode_reward
+            ),
         }
 
         terminated = self._advance_transaction()
 
         if terminated:
+
             observation = np.zeros(
                 self.observation_space.shape,
                 dtype=np.float32,
             )
+
         else:
+
             observation = self._build_state()
 
         return (
@@ -1073,45 +1162,6 @@ class RoutingEnv(gym.Env):
         tx,
         eta,
     ):
-        """
-        Execute:
-
-            Bucket
-              |
-              v
-        PaymentSimulator
-              |
-           Failure
-              |
-              v
-        PartialBacktracker
-              |
-              v
-        Bucket alternative
-              |
-              v
-        PaymentSimulator
-              |
-        success/failure
-              |
-              v
-        optional full reroute
-
-        Important integration rule
-        --------------------------
-        PartialBacktracker may internally use canonical
-        physical edge identities:
-
-            (source, target, channel_key)
-
-        while Top-K / Bucket / PaymentSimulator may use
-        richer edge dictionaries.
-
-        Before executing a PartialBacktracker retry, the
-        environment restores the exact physical edge
-        representation used by the Bucket candidate.
-        """
-
         current_bucket = self.current_bucket
 
         if current_bucket is None:
@@ -1138,6 +1188,14 @@ class RoutingEnv(gym.Env):
 
         final_failure_probability = 1.0
         final_reason = None
+
+        # --------------------------------------------------
+        # Safety bound.
+        #
+        # This is intentionally finite to prevent a malformed
+        # Bucket/reroute implementation from creating an
+        # infinite simulation loop.
+        # --------------------------------------------------
 
         max_attempts = (
             self.top_k * 3
@@ -1209,7 +1267,9 @@ class RoutingEnv(gym.Env):
 
                 current_bucket.backtrack(
                     failed_candidate=candidate,
-                    reason="cannot_resolve_exact_route_edges",
+                    reason=(
+                        "cannot_resolve_exact_route_edges"
+                    ),
                 )
 
                 continue
@@ -1220,7 +1280,7 @@ class RoutingEnv(gym.Env):
             )
 
             # ------------------------------------------------
-            # Select
+            # Select candidate
             # ------------------------------------------------
 
             selected = current_bucket.select_candidate(
@@ -1237,6 +1297,7 @@ class RoutingEnv(gym.Env):
             # ------------------------------------------------
 
             current_bucket.record_attempt()
+
             attempt_count += 1
 
             payment_result = (
@@ -1364,7 +1425,7 @@ class RoutingEnv(gym.Env):
                 )
 
             # ------------------------------------------------
-            # One real failure => one partial-backtracking
+            # One real failure => one partial backtracking
             # event.
             # ------------------------------------------------
 
@@ -1415,42 +1476,10 @@ class RoutingEnv(gym.Env):
 
                 if new_path and new_edges:
 
-                    # ------------------------------------------------
-                    # Validate the canonical route returned by
-                    # PartialBacktracker first.
-                    #
-                    # PartialBacktracker may use canonical physical
-                    # edge tuples internally. This validation confirms
-                    # that the route itself is structurally valid before
-                    # restoring the richer Bucket representation.
-                    # ------------------------------------------------
-
                     self._validate_route_edges(
                         new_path,
                         new_edges,
                     )
-
-                    # ------------------------------------------------
-                    # Restore exact Bucket edge representation.
-                    #
-                    # PartialBacktracker internally works with:
-                    #
-                    #     (source, target, channel_key)
-                    #
-                    # whereas Top-K / Bucket may contain:
-                    #
-                    #     {
-                    #         "source": ...,
-                    #         "target": ...,
-                    #         "channel_key": ...,
-                    #         "scid": ...,
-                    #         "data": ...
-                    #     }
-                    #
-                    # The retry must use the same physical edge
-                    # representation that PaymentSimulator and the
-                    # FailureModel expect.
-                    # ------------------------------------------------
 
                     retry_edges = (
                         self._restore_retry_edges_from_bucket(
@@ -1464,8 +1493,6 @@ class RoutingEnv(gym.Env):
                         retry_edges,
                     )
 
-                    # The returned route is an actual retry
-                    # candidate. Execute it exactly once.
                     current_bucket = self.current_bucket
 
                     self._record_external_bucket_attempt(
@@ -1526,24 +1553,20 @@ class RoutingEnv(gym.Env):
                             "partial_backtrack_success"
                         )
 
-                        # The retry succeeded. Do NOT call
-                        # Bucket.backtrack() for the successful
-                        # alternative and do NOT full-reroute.
+                        # IMPORTANT:
+                        # A successful Bucket alternative must
+                        # terminate the current payment attempt.
                         break
 
                     # ------------------------------------------------
-                    # Alternative itself failed.
-                    #
-                    # IMPORTANT:
-                    #
-                    # Failure information must be resolved against
-                    # the exact edge representation that was actually
-                    # passed to PaymentSimulator.
+                    # Alternative failed.
                     # ------------------------------------------------
 
-                    retry_failed_edge = self._resolve_failed_edge(
-                        result=retry_dict,
-                        edges=retry_edges,
+                    retry_failed_edge = (
+                        self._resolve_failed_edge(
+                            result=retry_dict,
+                            edges=retry_edges,
+                        )
                     )
 
                     retry_failure_index = (
@@ -1557,11 +1580,14 @@ class RoutingEnv(gym.Env):
                     if (
                         retry_failure_index is not None
                         and
-                        0 <= retry_failure_index < len(retry_edges)
+                        0 <= retry_failure_index
+                        < len(retry_edges)
                     ):
-                        retry_failed_edge = retry_edges[
-                            retry_failure_index
-                        ]
+                        retry_failed_edge = (
+                            retry_edges[
+                                retry_failure_index
+                            ]
+                        )
 
                     normalized_retry_failed_edge = (
                         self._normalize_edge(
@@ -1578,13 +1604,10 @@ class RoutingEnv(gym.Env):
                         tuple(new_path)
                     )
 
-                # ------------------------------------------------
-                # If retry did not succeed, continue normal
-                # Bucket failure handling.
-                # ------------------------------------------------
+                # Continue normal Bucket failure handling.
 
             # ------------------------------------------------
-            # Record failed current candidate and move Bucket
+            # Record failed current candidate
             # ------------------------------------------------
 
             current_bucket.backtrack(
@@ -1597,7 +1620,10 @@ class RoutingEnv(gym.Env):
             )
 
             # ------------------------------------------------
-            # Continue within Bucket if another candidate exists
+            # Continue inside Bucket first.
+            #
+            # Full reroute is only used after the active
+            # Bucket is exhausted.
             # ------------------------------------------------
 
             if current_bucket.current() is not None:
@@ -1695,16 +1721,14 @@ class RoutingEnv(gym.Env):
         edges,
     ):
         """
-        Restore the exact physical-edge representation used by
-        Top-K / Bucket for a PartialBacktracker retry.
+        Restore the exact physical-edge representation used
+        by Top-K / Bucket for a PartialBacktracker retry.
 
-        PartialBacktracker operates internally on canonical
-        physical identities:
+        Physical identity:
 
             (source, target, channel_key)
 
-        while Top-K / Bucket candidates may carry richer edge
-        dictionaries:
+        Rich representation:
 
             {
                 "source": ...,
@@ -1713,22 +1737,6 @@ class RoutingEnv(gym.Env):
                 "scid": ...,
                 "data": ...
             }
-
-        The retry must preserve that exact representation when
-        passed back into PaymentSimulator and FailureModel.
-
-        Priority
-        --------
-        1. Find the exact alternative route in the active Bucket
-           and restore its original edge dictionaries.
-        2. If no exact Bucket candidate is found, reconstruct the
-           physical edges from the graph while preserving the exact
-           channel key.
-
-        This method does NOT select a new channel.
-
-        It only restores the representation of an already validated
-        physical channel.
         """
 
         if not isinstance(
@@ -1777,8 +1785,7 @@ class RoutingEnv(gym.Env):
 
             if (
                 source != route[index]
-                or
-                target != route[index + 1]
+                or target != route[index + 1]
             ):
                 raise ValueError(
                     "Retry edge does not match retry route."
@@ -1789,13 +1796,7 @@ class RoutingEnv(gym.Env):
             )
 
         # --------------------------------------------------
-        # Preferred source:
-        #
-        # The exact candidate already stored by Bucket.
-        #
-        # This is preferable to reconstructing from G because
-        # the candidate may contain additional physical-edge
-        # metadata such as scid and data.
+        # Preferred source: active Bucket.
         # --------------------------------------------------
 
         bucket = self.current_bucket
@@ -1882,9 +1883,6 @@ class RoutingEnv(gym.Env):
                     if not exact_match:
                         continue
 
-                    # Return copies of the exact candidate
-                    # dictionaries so later operations cannot
-                    # accidentally mutate Bucket's representation.
                     restored = []
 
                     for candidate_edge in candidate_edges:
@@ -1904,17 +1902,12 @@ class RoutingEnv(gym.Env):
                     return restored
 
         # --------------------------------------------------
-        # Fallback:
-        #
-        # Reconstruct exact physical edge dictionaries from
-        # the graph. The channel key is preserved.
+        # Graph reconstruction fallback.
         # --------------------------------------------------
 
         restored = []
 
-        for index, canonical_edge in enumerate(
-            canonical_edges
-        ):
+        for canonical_edge in canonical_edges:
 
             source, target, channel_key = (
                 canonical_edge
@@ -2011,7 +2004,7 @@ class RoutingEnv(gym.Env):
         edges,
     ):
         """
-        Resolve the exact physical failed edge.
+        Resolve exact physical failed edge.
 
         Priority:
 
@@ -2032,6 +2025,7 @@ class RoutingEnv(gym.Env):
             "edge",
             "channel",
         ):
+
             value = result.get(key)
 
             if value is not None:
@@ -2099,6 +2093,7 @@ class RoutingEnv(gym.Env):
         )
 
         if failure_index is not None:
+
             if (
                 0 <= failure_index < len(edges)
             ):
@@ -2176,12 +2171,17 @@ class RoutingEnv(gym.Env):
 
         for candidate in candidates:
 
-            if not isinstance(candidate, dict):
+            if not isinstance(
+                candidate,
+                dict,
+            ):
                 raise TypeError(
                     "Top-K candidate must be a dictionary."
                 )
 
-            path = candidate.get("path")
+            path = candidate.get(
+                "path"
+            )
 
             if not isinstance(
                 path,
@@ -2241,7 +2241,9 @@ class RoutingEnv(gym.Env):
             if rejected:
                 continue
 
-            filtered.append(candidate)
+            filtered.append(
+                candidate
+            )
 
         if not filtered:
             return None, []
@@ -2259,10 +2261,18 @@ class RoutingEnv(gym.Env):
         self,
         candidate,
     ):
-        if isinstance(candidate, dict):
+        if isinstance(
+            candidate,
+            dict,
+        ):
 
-            path = candidate.get("path")
-            edges = candidate.get("edges")
+            path = candidate.get(
+                "path"
+            )
+
+            edges = candidate.get(
+                "edges"
+            )
 
             if path is None:
                 raise ValueError(
@@ -2274,7 +2284,10 @@ class RoutingEnv(gym.Env):
                     "Candidate dictionary is missing 'edges'."
                 )
 
-            return list(path), list(edges)
+            return (
+                list(path),
+                list(edges),
+            )
 
         if isinstance(
             candidate,
@@ -2282,6 +2295,7 @@ class RoutingEnv(gym.Env):
         ):
 
             if len(candidate) >= 2:
+
                 return (
                     candidate[0],
                     candidate[1],
@@ -2301,25 +2315,40 @@ class RoutingEnv(gym.Env):
         if edge is None:
             return None
 
-        if isinstance(edge, dict):
+        if isinstance(
+            edge,
+            dict,
+        ):
 
-            source = edge.get("source")
+            source = edge.get(
+                "source"
+            )
 
             if source is None:
-                source = edge.get("u")
+                source = edge.get(
+                    "u"
+                )
 
-            target = edge.get("target")
+            target = edge.get(
+                "target"
+            )
 
             if target is None:
-                target = edge.get("v")
+                target = edge.get(
+                    "v"
+                )
 
             if source is None or target is None:
                 return None
 
-            key = edge.get("channel_key")
+            key = edge.get(
+                "channel_key"
+            )
 
             if key is None:
-                key = edge.get("key")
+                key = edge.get(
+                    "key"
+                )
 
             if key is None:
                 return (
@@ -2341,6 +2370,7 @@ class RoutingEnv(gym.Env):
             return None
 
         if len(edge) >= 3:
+
             return (
                 edge[0],
                 edge[1],
@@ -2348,6 +2378,7 @@ class RoutingEnv(gym.Env):
             )
 
         if len(edge) == 2:
+
             return (
                 edge[0],
                 edge[1],
@@ -2430,6 +2461,12 @@ class RoutingEnv(gym.Env):
             if not edge_data:
                 return None
 
+            # --------------------------------------------------
+            # MultiGraph / MultiDiGraph
+            #
+            # NEVER choose an arbitrary parallel channel.
+            # --------------------------------------------------
+
             if self.G.is_multigraph():
 
                 available_channels = []
@@ -2458,8 +2495,12 @@ class RoutingEnv(gym.Env):
                         )
 
                     if available:
-                        available_channels.append(key)
+                        available_channels.append(
+                            key
+                        )
 
+                # If multiple channels are available,
+                # physical channel identity is ambiguous.
                 if len(available_channels) != 1:
                     return None
 
@@ -2585,7 +2626,8 @@ class RoutingEnv(gym.Env):
 
                 if key is not None:
                     raise ValueError(
-                        "Simple graph route must not contain a channel key."
+                        "Simple graph route must not contain "
+                        "a channel key."
                     )
 
                 if not self.G.has_edge(
@@ -2597,11 +2639,13 @@ class RoutingEnv(gym.Env):
                     )
 
     # ======================================================
-    # RESULT
+    # RESULT NORMALIZATION
     # ======================================================
 
     @staticmethod
-    def _result_to_dict(result):
+    def _result_to_dict(
+        result,
+    ):
 
         if hasattr(
             result,
@@ -2652,7 +2696,9 @@ class RoutingEnv(gym.Env):
                 f"Received shape: {array.shape}"
             )
 
-        eta = float(array[0])
+        eta = float(
+            array[0]
+        )
 
         if not np.isfinite(eta):
             raise ValueError(
@@ -2744,7 +2790,9 @@ class RoutingEnv(gym.Env):
             ),
         )
 
-        reward = float(reward)
+        reward = float(
+            reward
+        )
 
         if not math.isfinite(reward):
             raise RuntimeError(
@@ -2779,6 +2827,7 @@ class RoutingEnv(gym.Env):
     def _build_state(self):
 
         if self.current_tx is None:
+
             return np.zeros(
                 self.observation_space.shape,
                 dtype=np.float32,
@@ -2842,7 +2891,9 @@ class RoutingEnv(gym.Env):
     # ======================================================
 
     @staticmethod
-    def _bucket_size(bucket):
+    def _bucket_size(
+        bucket,
+    ):
 
         if bucket is None:
             return 0
@@ -2898,7 +2949,9 @@ class RoutingEnv(gym.Env):
             ),
         }
 
-        result.update(info)
+        result.update(
+            info
+        )
 
         return result
 
@@ -2928,12 +2981,14 @@ class RoutingEnv(gym.Env):
             "amount",
             "tx_id",
         ):
+
             if not hasattr(
                 transaction,
                 field,
             ):
                 raise TypeError(
-                    f"Transaction is missing required field '{field}'."
+                    f"Transaction is missing required field "
+                    f"'{field}'."
                 )
 
         amount = float(
@@ -2991,7 +3046,7 @@ class RoutingEnv(gym.Env):
         # --------------------------------------------------
         # Terminal
         #
-        # Preserve the actual Bucket.
+        # Preserve actual Bucket.
         # --------------------------------------------------
 
         if self.tx_index >= len(
@@ -3000,12 +3055,6 @@ class RoutingEnv(gym.Env):
 
             self.current_tx = None
             self.current_paths = []
-
-            # DO NOT CLEAR:
-            #
-            # self.bucket
-            # self.current_bucket
-            # self.backtracker.bucket
 
             return True
 
@@ -3057,10 +3106,12 @@ class RoutingEnv(gym.Env):
 
         try:
             value = float(value)
+
         except (
             TypeError,
             ValueError,
         ):
+
             raise TypeError(
                 f"{name} must be a real number."
             )
@@ -3232,10 +3283,12 @@ class RoutingEnv(gym.Env):
 
         try:
             value = float(value)
+
         except (
             TypeError,
             ValueError,
         ):
+
             raise TypeError(
                 f"reward.{key} must be numeric."
             )
@@ -3291,10 +3344,12 @@ class RoutingEnv(gym.Env):
 
         try:
             value = float(value)
+
         except (
             TypeError,
             ValueError,
         ):
+
             raise TypeError(
                 f"Payment result '{key}' must be numeric."
             )
@@ -3327,11 +3382,15 @@ class RoutingEnv(gym.Env):
         )
 
         try:
-            value = float(value)
+            value = float(
+                value
+            )
+
         except (
             TypeError,
             ValueError,
         ):
+
             raise TypeError(
                 "Candidate failure_probability must be numeric."
             )
@@ -3398,68 +3457,96 @@ class RoutingEnv(gym.Env):
 
         bucket.attempts = attempts + 1
 
+    # ======================================================
+    # FAILURE INDEX NORMALIZATION
+    # ======================================================
+
     @staticmethod
-    def _normalize_failure_index(value):
+    def _normalize_failure_index(
+        value,
+    ):
         """
-        Normalize a failure index into a valid non-negative integer.
+        Normalize a failure index into a valid non-negative
+        integer.
 
-        Accepted inputs
-        ---------------
+        Accepted:
 
-        - int
-        - integer-like float
-        - numeric string
-        - None
-
-        Returns
-        -------
-
-        int | None
-            Normalized failure index, or None when the value cannot be
-            interpreted as a valid non-negative index.
+            int
+            integer-valued float
+            numeric string
+            None
         """
 
         if value is None:
             return None
 
-        # Boolean is technically an int subclass, but it must not be
-        # interpreted as a route position.
-        if isinstance(value, bool):
+        if isinstance(
+            value,
+            bool,
+        ):
             return None
 
         try:
-            # Direct integer values.
-            if isinstance(value, int):
-                return value if value >= 0 else None
 
-            # Integer-valued floats, e.g. 2.0.
-            if isinstance(value, float):
+            if isinstance(
+                value,
+                int,
+            ):
+                return (
+                    value
+                    if value >= 0
+                    else None
+                )
+
+            if isinstance(
+                value,
+                float,
+            ):
+
                 if not value.is_integer():
                     return None
 
-                value = int(value)
+                value = int(
+                    value
+                )
 
-                return value if value >= 0 else None
+                return (
+                    value
+                    if value >= 0
+                    else None
+                )
 
-            # Numeric strings, e.g. "2".
-            if isinstance(value, str):
+            if isinstance(
+                value,
+                str,
+            ):
+
                 value = value.strip()
 
                 if not value:
                     return None
 
-                # Accept "2" but reject "2.5".
                 if value.isdigit():
-                    return int(value)
+                    return int(
+                        value
+                    )
 
-                parsed = float(value)
+                parsed = float(
+                    value
+                )
 
                 if not parsed.is_integer():
                     return None
 
-                parsed = int(parsed)
+                parsed = int(
+                    parsed
+                )
 
-                return parsed if parsed >= 0 else None
+                return (
+                    parsed
+                    if parsed >= 0
+                    else None
+                )
 
         except (
             TypeError,

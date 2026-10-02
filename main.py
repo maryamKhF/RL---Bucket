@@ -1,6 +1,7 @@
 # main.py
 
 import copy
+import os
 import random
 import time
 import yaml
@@ -12,6 +13,8 @@ import sys
 import threading
 
 from pathlib import Path
+
+from stable_baselines3 import PPO
 
 
 # ============================================================
@@ -35,6 +38,70 @@ PROGRESS_LOCK = threading.Lock()
 HEARTBEAT_THREAD = None
 
 HEARTBEAT_STOP_EVENT = threading.Event()
+
+
+# ============================================================
+# Runtime Mode
+# ============================================================
+
+# Fast validation:
+#
+#     GML snapshot
+#          |
+#          v
+#     Graph construction
+#          |
+#          v
+#     Existing PPO model
+#          |
+#          v
+#     PPO -> eta
+#          |
+#          v
+#     Adaptive Routing
+#          |
+#          v
+#     Top-K (k=5)
+#          |
+#          v
+#     Bucket
+#          |
+#          v
+#     Payment Simulation
+#          |
+#          v
+#     Failure Model
+#          |
+#          v
+#     Partial Backtracking
+#
+# Only repeated PPO training is skipped.
+#
+# Default:
+#     FAST_VALIDATION = True
+#
+# Normal training:
+#     set RL_FAST_VALIDATION=0
+#     py main.py
+#
+# Fast validation:
+#     set RL_FAST_VALIDATION=1
+#     py main.py
+
+FAST_VALIDATION = (
+    os.environ.get(
+        "RL_FAST_VALIDATION",
+        "1"
+    ).strip().lower()
+    in {
+        "1",
+        "true",
+        "yes",
+        "on"
+    }
+)
+
+MODEL_NAME = "end_to_end"
 
 
 # ============================================================
@@ -722,15 +789,50 @@ def write_runtime_error(
 
 def load_cfg():
 
-    config_path = Path(
-        "configs/config.yaml"
-    )
+    # Support both:
+    #
+    #     Configs/config.yaml
+    #
+    # and:
+    #
+    #     configs/config.yaml
+    #
+    # Windows is case-insensitive, but this also keeps the
+    # project portable to case-sensitive systems.
 
-    if not config_path.exists():
+    possible_paths = [
+
+        Path("Configs/config.yaml"),
+
+        Path("configs/config.yaml"),
+
+    ]
+
+    config_path = None
+
+    for candidate in possible_paths:
+
+        if candidate.exists():
+
+            config_path = candidate
+
+            break
+
+    if config_path is None:
+
+        expected = "\n".join(
+            str(
+                path.resolve()
+            )
+            for path in possible_paths
+        )
 
         raise FileNotFoundError(
-            f"Configuration file not found: "
-            f"{config_path.resolve()}"
+
+            "Configuration file not found.\n"
+            "Expected one of:\n"
+            f"{expected}"
+
         )
 
     with open(
@@ -739,7 +841,15 @@ def load_cfg():
         encoding="utf-8"
     ) as f:
 
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+
+    if cfg is None:
+
+        raise ValueError(
+            "Configuration file is empty."
+        )
+
+    return cfg
 
 
 # ============================================================
@@ -885,8 +995,11 @@ class ReportWriter:
     def section(self, title):
 
         self.add("")
+
         self.add("=" * 64)
+
         self.add(title)
+
         self.add("=" * 64)
 
     def item(self, key, value):
@@ -917,6 +1030,116 @@ def safe_value(value, default=None):
         return default
 
     return value
+
+
+# ============================================================
+# PPO Model Loading
+# ============================================================
+
+def load_existing_ppo_model(
+    model_path,
+    env=None
+):
+    """
+    Load an existing PPO model for fast validation.
+
+    The loaded PPO model is still used for the routing
+    decision:
+
+        observation -> PPO -> eta
+
+    The runtime environment continues with:
+
+        eta
+          |
+          v
+        Adaptive Routing
+          |
+          v
+        Top-K (k=5)
+          |
+          v
+        Bucket
+          |
+          v
+        Payment Simulation
+          |
+          v
+        Failure Model
+          |
+          v
+        Partial Backtracking
+    """
+
+    model_path = Path(
+        model_path
+    )
+
+    if model_path.suffix.lower() != ".zip":
+
+        zip_path = Path(
+            str(model_path) + ".zip"
+        )
+
+    else:
+
+        zip_path = model_path
+
+    if not zip_path.exists():
+
+        raise FileNotFoundError(
+
+            "Existing PPO model was not found.\n\n"
+
+            f"Expected model:\n"
+            f"{zip_path.resolve()}\n\n"
+
+            "To create the model, run normal training once:\n\n"
+
+            "    set RL_FAST_VALIDATION=0\n"
+            "    py main.py\n\n"
+
+            "After the model is created, use fast validation:\n\n"
+
+            "    set RL_FAST_VALIDATION=1\n"
+            "    py main.py"
+
+        )
+
+    print(
+        "\n============================================================"
+    )
+
+    print(
+        "LOADING EXISTING PPO MODEL"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Model : {zip_path.resolve()}"
+    )
+
+    load_start = time.time()
+
+    model = PPO.load(
+        str(zip_path),
+        env=env
+    )
+
+    load_time = (
+        time.time()
+        -
+        load_start
+    )
+
+    print(
+        f"PPO model loaded in {load_time:.4f} seconds."
+    )
+
+    return model, load_time
 
 
 # ============================================================
@@ -980,6 +1203,13 @@ def main():
     )
 
     report.item(
+        "Execution mode",
+        "FAST VALIDATION"
+        if FAST_VALIDATION
+        else "NORMAL TRAINING"
+    )
+
+    report.item(
         "Initial stage",
         CURRENT_STAGE
     )
@@ -997,6 +1227,16 @@ def main():
     report.save()
 
     runtime_env = None
+
+    training_time = 0.0
+
+    model_load_time = 0.0
+
+    prediction_time = 0.0
+
+    execution_time = 0.0
+
+    model = None
 
     try:
 
@@ -1037,6 +1277,13 @@ def main():
         report.item(
             "Random seed",
             seed
+        )
+
+        report.item(
+            "Execution mode",
+            "FAST VALIDATION"
+            if FAST_VALIDATION
+            else "NORMAL TRAINING"
         )
 
         complete_step(
@@ -1273,9 +1520,30 @@ def main():
             "Generating training transactions..."
         )
 
-        training_transaction_count = int(
+        configured_transaction_count = int(
             cfg["n_transactions"]
         )
+
+        # ----------------------------------------------------
+        # Fast validation optimization
+        # ----------------------------------------------------
+        #
+        # The final end-to-end validation uses exactly one
+        # payment transaction.
+        #
+        # Therefore generating thousands of training
+        # transactions is unnecessary when PPO training is
+        # skipped.
+
+        if FAST_VALIDATION:
+
+            training_transaction_count = 1
+
+        else:
+
+            training_transaction_count = (
+                configured_transaction_count
+            )
 
         training_transactions = generate_transactions(
 
@@ -1295,18 +1563,33 @@ def main():
             cfg["train_ratio"]
         )
 
-        train_count = max(
-            1,
-            int(
+        if FAST_VALIDATION:
+
+            train_count = min(
+                1,
                 len(training_transactions)
-                * train_ratio
             )
-        )
+
+        else:
+
+            train_count = max(
+                1,
+                int(
+                    len(training_transactions)
+                    *
+                    train_ratio
+                )
+            )
 
         train_tx = (
             training_transactions[
                 :train_count
             ]
+        )
+
+        report.item(
+            "Configured transactions",
+            configured_transaction_count
         )
 
         report.item(
@@ -1324,8 +1607,32 @@ def main():
             len(train_tx)
         )
 
+        if FAST_VALIDATION:
+
+            report.item(
+                "Transaction generation mode",
+                "FAST VALIDATION - MINIMAL"
+            )
+
+        else:
+
+            report.item(
+                "Transaction generation mode",
+                "NORMAL TRAINING"
+            )
+
         print(
-            f"Training transactions : "
+            f"Configured transactions : "
+            f"{configured_transaction_count}"
+        )
+
+        print(
+            f"Generated transactions  : "
+            f"{len(training_transactions)}"
+        )
+
+        print(
+            f"Transactions for PPO    : "
             f"{len(train_tx)}"
         )
 
@@ -1337,7 +1644,7 @@ def main():
         )
 
         # ====================================================
-        # STEP 4 - TRAIN PPO
+        # STEP 4 - PPO
         # ====================================================
 
         set_stage(
@@ -1352,7 +1659,7 @@ def main():
             4,
             "STEP 4 - PPO TRAINING",
             report,
-            "PPO TRAINING STARTED"
+            "Preparing PPO model..."
         )
 
         print(
@@ -1360,117 +1667,216 @@ def main():
         )
 
         print(
-            "STEP 4 - TRAINING PPO AGENT"
+            "STEP 4 - PPO"
         )
 
         print(
             "============================================================"
         )
 
-        print(
-            "\nPPO TRAINING IS RUNNING..."
-        )
-
-        print(
-            "Progress shown here is stage-level."
-        )
-
-        print(
-            "A real PPO timestep percentage requires "
-            "a callback inside RL/train.py."
-        )
-
-        report.add(
-            "Training started."
-        )
-
-        report.item(
-            "Algorithm",
-            "PPO"
-        )
-
-        report.item(
-            "Training snapshot",
-            snapshot_path.name
-        )
-
-        report.item(
-            "Training nodes",
-            G_train.number_of_nodes()
-        )
-
-        report.item(
-            "Training channels",
-            G_train.number_of_edges()
-        )
-
-        training_start = time.time()
-
-        model = train_agent(
-
-            G_train,
-
-            train_tx,
-
-            lnd_cost,
-
-            cfg,
-
-            "end_to_end",
-
-            seed
-
-        )
-
-        training_time = (
-            time.time()
-            -
-            training_start
-        )
-
-        model_path = Path(
+        model_dir = Path(
             cfg["rl"].get(
                 "model_dir",
                 "models"
             )
-        ) / "end_to_end"
-
-        report.item(
-            "Training status",
-            "SUCCESS"
         )
 
-        report.item(
-            "Training time (seconds)",
-            round(
-                training_time,
-                4
+        model_path = (
+            model_dir /
+            MODEL_NAME
+        )
+
+        model_zip_path = Path(
+            str(model_path) + ".zip"
+        )
+
+        # ----------------------------------------------------
+        # FAST VALIDATION
+        # ----------------------------------------------------
+
+        if FAST_VALIDATION:
+
+            print(
+                "\nFAST VALIDATION MODE IS ENABLED."
             )
-        )
 
-        report.item(
-            "Model",
-            str(model_path)
-        )
+            print(
+                "PPO training will NOT be repeated."
+            )
 
-        report.add("")
+            print(
+                "The existing PPO model will be loaded."
+            )
 
-        report.add(
-            "The PPO agent was trained on the same "
-            "snapshot that will be used for the payment scenario."
-        )
+            report.item(
+                "Execution mode",
+                "FAST VALIDATION"
+            )
 
-        print(
-            f"PPO training completed "
-            f"in {training_time:.2f} seconds."
-        )
+            report.item(
+                "PPO training",
+                "SKIPPED"
+            )
 
-        complete_step(
-            4,
-            "STEP 4 - PPO TRAINING",
-            report,
-            "PPO TRAINING COMPLETED"
-        )
+            report.item(
+                "Expected model",
+                str(
+                    model_zip_path.resolve()
+                )
+            )
+
+            model, model_load_time = (
+                load_existing_ppo_model(
+                    model_path,
+                    env=None
+                )
+            )
+
+            report.item(
+                "Model load status",
+                "SUCCESS"
+            )
+
+            report.item(
+                "Model load time (seconds)",
+                round(
+                    model_load_time,
+                    4
+                )
+            )
+
+            report.item(
+                "Training time (seconds)",
+                0.0
+            )
+
+            report.item(
+                "Model",
+                str(
+                    model_zip_path
+                )
+            )
+
+            report.add("")
+
+            report.add(
+                "Fast validation skipped PPO training and "
+                "reused the existing trained PPO model."
+            )
+
+            complete_step(
+                4,
+                "STEP 4 - PPO TRAINING",
+                report,
+                "EXISTING PPO MODEL LOADED"
+            )
+
+        # ----------------------------------------------------
+        # NORMAL TRAINING
+        # ----------------------------------------------------
+
+        else:
+
+            print(
+                "\nPPO TRAINING IS RUNNING..."
+            )
+
+            print(
+                "Progress shown here is stage-level."
+            )
+
+            print(
+                "A real PPO timestep percentage requires "
+                "a callback inside RL/train.py."
+            )
+
+            report.item(
+                "Execution mode",
+                "NORMAL TRAINING"
+            )
+
+            report.item(
+                "Algorithm",
+                "PPO"
+            )
+
+            report.item(
+                "Training snapshot",
+                snapshot_path.name
+            )
+
+            report.item(
+                "Training nodes",
+                G_train.number_of_nodes()
+            )
+
+            report.item(
+                "Training channels",
+                G_train.number_of_edges()
+            )
+
+            training_start = time.time()
+
+            model = train_agent(
+
+                G_train,
+
+                train_tx,
+
+                lnd_cost,
+
+                cfg,
+
+                MODEL_NAME,
+
+                seed
+
+            )
+
+            training_time = (
+                time.time()
+                -
+                training_start
+            )
+
+            report.item(
+                "Training status",
+                "SUCCESS"
+            )
+
+            report.item(
+                "Training time (seconds)",
+                round(
+                    training_time,
+                    4
+                )
+            )
+
+            report.item(
+                "Model",
+                str(
+                    model_path
+                )
+            )
+
+            report.add("")
+
+            report.add(
+                "The PPO agent was trained on the same "
+                "snapshot that will be used for the payment scenario."
+            )
+
+            print(
+                f"PPO training completed "
+                f"in {training_time:.2f} seconds."
+            )
+
+            complete_step(
+                4,
+                "STEP 4 - PPO TRAINING",
+                report,
+                "PPO TRAINING COMPLETED"
+            )
 
         # ====================================================
         # STEP 5
@@ -1711,6 +2117,36 @@ def main():
             mode="eval"
 
         )
+
+        # ----------------------------------------------------
+        # Attach evaluation environment to loaded/trained PPO
+        # ----------------------------------------------------
+
+        if model is None:
+
+            raise RuntimeError(
+                "PPO model is not available before evaluation."
+            )
+
+        try:
+
+            model.set_env(
+                runtime_env
+            )
+
+            report.item(
+                "PPO runtime environment",
+                "ATTACHED"
+            )
+
+        except Exception as env_attach_exc:
+
+            report.item(
+                "PPO runtime environment",
+                f"ATTACHMENT FAILED: {env_attach_exc}"
+            )
+
+            raise
 
         observation, reset_info = runtime_env.reset(
             seed=seed + 1
@@ -2063,6 +2499,13 @@ def main():
             "or the Bucket is exhausted."
         )
 
+        complete_step(
+            9,
+            "STEP 9 - EXECUTE BUCKET PAYMENT FAILURE BACKTRACKING",
+            report,
+            "ROUTING PIPELINE EXECUTED"
+        )
+
         # ====================================================
         # STEP 10
         # ====================================================
@@ -2271,9 +2714,24 @@ def main():
         )
 
         report.item(
+            "Execution mode",
+            "FAST VALIDATION"
+            if FAST_VALIDATION
+            else "NORMAL TRAINING"
+        )
+
+        report.item(
             "PPO training time (seconds)",
             round(
                 training_time,
+                4
+            )
+        )
+
+        report.item(
+            "PPO model load time (seconds)",
+            round(
+                model_load_time,
                 4
             )
         )
@@ -2360,6 +2818,11 @@ def main():
         )
 
         print(
+            f"Execution mode : "
+            f"{'FAST VALIDATION' if FAST_VALIDATION else 'NORMAL TRAINING'}"
+        )
+
+        print(
             f"Snapshot       : {snapshot_path.name}"
         )
 
@@ -2404,6 +2867,18 @@ def main():
         )
 
         print(
+            f"PPO train time : {training_time:.4f} seconds"
+        )
+
+        print(
+            f"PPO load time  : {model_load_time:.4f} seconds"
+        )
+
+        print(
+            f"Pipeline time  : {execution_time:.4f} seconds"
+        )
+
+        print(
             f"Total time     : {total_time:.4f} seconds"
         )
 
@@ -2416,27 +2891,83 @@ def main():
         )
 
         return {
-            "success": success,
-            "source": source,
-            "destination": destination,
-            "amount": amount,
-            "eta": eta,
-            "top_k": top_k,
-            "candidate_count": candidate_count,
-            "usable_candidate_count": usable_candidate_count,
-            "bucket_size": bucket_size,
-            "attempt_count": attempt_count,
-            "partial_backtrack_count": partial_backtrack_count,
-            "successful_bucket_rank": successful_bucket_rank,
-            "fee": fee,
-            "delay": delay,
-            "carbon": carbon,
-            "path": final_path,
-            "hops": max(
-                0,
-                path_length - 1
-            ),
-            "total_time": total_time,
+
+            "success":
+                success,
+
+            "source":
+                source,
+
+            "destination":
+                destination,
+
+            "amount":
+                amount,
+
+            "eta":
+                eta,
+
+            "top_k":
+                top_k,
+
+            "candidate_count":
+                candidate_count,
+
+            "usable_candidate_count":
+                usable_candidate_count,
+
+            "bucket_size":
+                bucket_size,
+
+            "attempt_count":
+                attempt_count,
+
+            "partial_backtrack_count":
+                partial_backtrack_count,
+
+            "successful_bucket_rank":
+                successful_bucket_rank,
+
+            "fee":
+                fee,
+
+            "delay":
+                delay,
+
+            "carbon":
+                carbon,
+
+            "path":
+                final_path,
+
+            "hops":
+                max(
+                    0,
+                    path_length - 1
+                ),
+
+            "training_time":
+                training_time,
+
+            "model_load_time":
+                model_load_time,
+
+            "prediction_time":
+                prediction_time,
+
+            "pipeline_time":
+                execution_time,
+
+            "total_time":
+                total_time,
+
+            "execution_mode":
+                (
+                    "FAST VALIDATION"
+                    if FAST_VALIDATION
+                    else "NORMAL TRAINING"
+                ),
+
         }
 
     except Exception as exc:

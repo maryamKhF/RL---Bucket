@@ -2,7 +2,224 @@
 ================================================================
 RL + BUCKET END-TO-END EXECUTION REPORT
 ================================================================
-Run started                 : 2026-10-01 22:30:52
+Run started                 : 2026-10-01 23:40:13
+Execution mode              : NORMAL TRAINING
 Initial stage               : Importing Pathfinding modules
 Overall progress            : 0.00%
 Current step                : 0/10
+
+================================================================
+STEP 0 - CONFIGURATION
+================================================================
+Step                        : 0/10
+Progress                    : 0.00%
+Stage                       : STEP 0 - LOAD CONFIGURATION
+Configuration               : SUCCESS
+Random seed                 : 42
+Execution mode              : NORMAL TRAINING
+Step completed              : 0/10
+Progress                    : 0.00%
+Status                      : COMPLETED
+
+================================================================
+RUN INFORMATION
+================================================================
+Snapshot                    : 20190501.gml.geo
+Snapshot path               : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\20190501.gml.geo
+Random seed                 : 42
+Run started                 : 2026-10-01 23:40:13
+
+================================================================
+STEP 1 - SNAPSHOT
+================================================================
+Step                        : 1/10
+Progress                    : 10.00%
+Stage                       : STEP 1 - LOAD SNAPSHOT
+Snapshot name               : 20190501.gml.geo
+Graph type                  : MultiDiGraph
+Number of nodes             : 4143
+Number of channels          : 66390
+Directed                    : True
+Multigraph                  : True
+Step completed              : 1/10
+Progress                    : 10.00%
+Status                      : SNAPSHOT LOADED
+
+================================================================
+STEP 2 - PREPARE TRAINING GRAPH
+================================================================
+Step                        : 2/10
+Progress                    : 20.00%
+Stage                       : STEP 2 - PREPARE TRAINING GRAPH
+Training failure rate       : 0.03
+Training nodes              : 4143
+Training channels           : 66390
+Step completed              : 2/10
+Progress                    : 20.00%
+Status                      : TRAINING GRAPH READY
+
+================================================================
+STEP 3 - TRAINING TRANSACTIONS
+================================================================
+Step                        : 3/10
+Progress                    : 30.00%
+Stage                       : STEP 3 - GENERATE TRAINING TRANSACTIONS
+Configured transactions     : 10000
+Generated transactions      : 10000
+Train ratio                 : 0.7
+Transactions used for PPO   : 7000
+Transaction generation mode : NORMAL TRAINING
+Step completed              : 3/10
+Progress                    : 30.00%
+Status                      : TRAINING TRANSACTIONS READY
+
+================================================================
+STEP 4 - PPO TRAINING
+================================================================
+Step                        : 4/10
+Progress                    : 40.00%
+Stage                       : STEP 4 - PPO TRAINING
+Execution mode              : NORMAL TRAINING
+Algorithm                   : PPO
+Training snapshot           : 20190501.gml.geo
+Training nodes              : 4143
+Training channels           : 66390
+Training status             : SUCCESS
+Training time (seconds)     : 115.9057
+Model                       : models\end_to_end
+
+The PPO agent was trained on the same snapshot that will be used for the payment scenario.
+Step completed              : 4/10
+Progress                    : 40.00%
+Status                      : PPO TRAINING COMPLETED
+
+================================================================
+STEP 5 - PAYMENT SCENARIO
+================================================================
+Step                        : 5/10
+Progress                    : 50.00%
+Stage                       : STEP 5 - PAYMENT SCENARIO
+Source                      : 2956
+Destination                 : 4033
+Payment amount              : 1000.0
+Transaction ID              : 0
+Step completed              : 5/10
+Progress                    : 50.00%
+Status                      : PAYMENT SCENARIO READY
+
+================================================================
+STEP 6 - PAYMENT GRAPH
+================================================================
+Step                        : 6/10
+Progress                    : 60.00%
+Stage                       : STEP 6 - CREATE PAYMENT GRAPH
+Payment failure rate        : 0.03
+Evaluation nodes            : 4143
+Evaluation channels         : 66390
+Step completed              : 6/10
+Progress                    : 60.00%
+Status                      : PAYMENT GRAPH READY
+
+================================================================
+STEP 7 - END-TO-END ROUTING
+================================================================
+Step                        : 7/10
+Progress                    : 70.00%
+Stage                       : STEP 7 - CREATE RUNTIME ENVIRONMENT
+Network dynamics            : NetworkDynamics
+Failure model               : FailureModel
+Payment simulator           : PaymentSimulator
+PPO runtime environment     : ATTACHED
+Environment reset           : SUCCESS
+Reset info                  : {'transaction_id': 0, 'eta': None, 'top_k': 5}
+Step completed              : 7/10
+Progress                    : 70.00%
+Status                      : RUNTIME ENVIRONMENT READY
+
+================================================================
+STEP 8 - PPO ROUTING DECISION
+================================================================
+Step                        : 8/10
+Progress                    : 80.00%
+Stage                       : STEP 8 - PPO ROUTING DECISION
+PPO prediction              : SUCCESS
+Raw action                  : [0.0]
+Prediction time (seconds)   : 0.0
+Step completed              : 8/10
+Progress                    : 80.00%
+Status                      : PPO ROUTING DECISION READY
+
+================================================================
+STEP 9 - BUCKET / PAYMENT / FAILURE / BACKTRACKING
+================================================================
+Step                        : 9/10
+Progress                    : 90.00%
+Stage                       : STEP 9 - EXECUTE BUCKET PAYMENT FAILURE BACKTRACKING
+Terminated                  : True
+Truncated                   : False
+Execution info keys         : ['transaction_id', 'eta', 'top_k', 'candidate_path_count', 'usable_candidate_count', 'bucket_size', 'success', 'payment_success', 'path', 'path_length', 'fee', 'delay', 'carbon', 'failure_probability', 'average_delay', 'backtrack_count', 'partial_backtrack_count', 'partial_backtrack_success', 'full_reroute', 'full_reroute_count', 'attempt_count', 'reason', 'episode_reward']
+Adaptive eta                : 0.0
+Requested Top-K             : 5
+Generated candidates        : 5
+Usable candidates           : 5
+Bucket size                 : 5
+
+The routing pipeline generated the candidate routes and placed the usable candidates into the Bucket.
+
+Bucket routing policy:
+Route #1 is tested first.
+If Route #1 fails, partial/onion backtracking moves to the next available candidate.
+The process continues until the payment succeeds or the Bucket is exhausted.
+Step completed              : 9/10
+Progress                    : 90.00%
+Status                      : ROUTING PIPELINE EXECUTED
+
+================================================================
+STEP 10 - FINAL PAYMENT RESULT
+================================================================
+Step                        : 10/10
+Progress                    : 100.00%
+Stage                       : STEP 10 - FINAL PAYMENT RESULT
+Source                      : 2956
+Destination                 : 4033
+Payment amount              : 1000.0
+Payment status              : FAILED
+Destination reached         : NO
+Final path                  : NONE
+Number of hops              : 0
+Total attempts              : 5
+Partial backtracks          : 5
+Successful partial backtracks: 0
+Full reroutes               : 0
+Failure probability         : 1.0
+Fee                         : 0.0
+Delay                       : 0.0
+Carbon                      : 0.0
+Reward                      : -0.935409070603099
+Reason                      : full_reroute_failed
+Successful Bucket route     : NONE
+
+================================================================
+FINAL STATUS
+================================================================
+PAYMENT FAILED
+No usable route successfully delivered the payment to the destination.
+Please try again. A valid route is currently not available.
+
+================================================================
+EXECUTION TIME
+================================================================
+Execution mode              : NORMAL TRAINING
+PPO training time (seconds) : 115.9057
+PPO model load time (seconds): 0.0
+PPO prediction time (seconds): 0.0
+Payment pipeline time (seconds): 7.9343
+Total execution time (seconds): 139.0183
+
+================================================================
+END OF REPORT
+================================================================
+Run status                  : COMPLETED
+Overall progress            : 100.00%
+Run completed               : 2026-10-01 23:42:32
+Report file                 : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\report.txt

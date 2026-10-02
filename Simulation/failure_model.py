@@ -861,6 +861,8 @@ class FailureModel:
     invalid_edge
     invalid_route_edges
     edge_path_mismatch
+    missing_channel_key
+    unexpected_channel_key
 
     This class does not:
 
@@ -1473,9 +1475,18 @@ class FailureModel:
                 ),
             }
 
+        # ----------------------------------------------------
+        # Successful edge evaluation
+        #
+        # IMPORTANT:
+        # PaymentSimulator requires reason to always be a
+        # string. Therefore successful evaluations explicitly
+        # return "success" rather than None.
+        # ----------------------------------------------------
+
         return {
             "success": True,
-            "reason": None,
+            "reason": "success",
             "failed_node": None,
             "failed_edge": None,
         }
@@ -1499,6 +1510,25 @@ class FailureModel:
 
         The node cache is active only during this method and is
         cleared in the finally block.
+
+        route_edges may contain:
+
+            (u, v)
+
+            (u, v, key)
+
+        or dictionary edge records such as:
+
+            {
+                "source": u,
+                "target": v,
+                "channel_key": key,
+                "scid": ...,
+                "data": ...
+            }
+
+        The original route-edge representation is preserved in
+        visited_edges.
         """
 
         if network is None:
@@ -1703,6 +1733,29 @@ class FailureModel:
                         "evaluate_edge() success must be bool."
                     )
 
+                # ------------------------------------------------
+                # Validate result reason contract.
+                #
+                # PaymentSimulator also requires reason to be
+                # a string, including on success.
+                # ------------------------------------------------
+
+                if "reason" not in result:
+
+                    raise ValueError(
+                        "evaluate_edge() result must contain "
+                        "'reason'."
+                    )
+
+                if not isinstance(
+                    result["reason"],
+                    str,
+                ):
+
+                    raise TypeError(
+                        "evaluate_edge() reason must be a string."
+                    )
+
                 if not result["success"]:
 
                     return self._failure_result(
@@ -1717,17 +1770,36 @@ class FailureModel:
                         visited_edges=visited_edges,
                     )
 
+                # ------------------------------------------------
+                # Preserve the original edge representation.
+                #
+                # This is important for Top-K / Bucket edges
+                # represented as dictionaries containing:
+                #
+                # source
+                # target
+                # channel_key
+                # scid
+                # data
+                #
+                # Do not collapse these to (u, v, key).
+                # ------------------------------------------------
+
                 visited_edges.append(
-                    (
-                        u,
-                        v,
-                        key,
-                    )
+                    edge_info
                 )
+
+            # ------------------------------------------------
+            # Successful payment evaluation.
+            #
+            # IMPORTANT:
+            # reason must be a string because PaymentSimulator
+            # validates the FailureModel result contract.
+            # ------------------------------------------------
 
             return {
                 "success": True,
-                "reason": None,
+                "reason": "success",
                 "failed_node": None,
                 "failed_edge": None,
                 "failure_index": None,
@@ -1888,36 +1960,135 @@ class FailureModel:
         edge_info,
     ):
         """
-        Normalize:
+        Normalize an edge representation.
 
+        Accepted representations
+        -------------------------
+        Dictionary:
+            {
+                "source": u,
+                "target": v,
+                "channel_key": key,
+                ...
+            }
+
+        Compatible dictionary aliases:
+            {
+                "u": u,
+                "v": v,
+                "key": key,
+                ...
+            }
+
+        Tuple:
             (u, v)
 
-        or:
-
+        Keyed tuple:
             (u, v, key)
+
+        Returns
+        -------
+        tuple or None
+            Canonical form:
+
+                (u, v, key)
         """
 
-        if not isinstance(
+        if edge_info is None:
+            return None
+
+        # ----------------------------------------------------
+        # Dictionary edge representation
+        # ----------------------------------------------------
+
+        if isinstance(
+            edge_info,
+            dict,
+        ):
+
+            if "source" in edge_info:
+
+                u = edge_info.get(
+                    "source"
+                )
+
+            elif "u" in edge_info:
+
+                u = edge_info.get(
+                    "u"
+                )
+
+            else:
+
+                return None
+
+            if "target" in edge_info:
+
+                v = edge_info.get(
+                    "target"
+                )
+
+            elif "v" in edge_info:
+
+                v = edge_info.get(
+                    "v"
+                )
+
+            else:
+
+                return None
+
+            if "channel_key" in edge_info:
+
+                key = edge_info.get(
+                    "channel_key"
+                )
+
+            elif "key" in edge_info:
+
+                key = edge_info.get(
+                    "key"
+                )
+
+            else:
+
+                key = None
+
+            if u is None or v is None:
+                return None
+
+            return (
+                u,
+                v,
+                key,
+            )
+
+        # ----------------------------------------------------
+        # Tuple / list edge representation
+        # ----------------------------------------------------
+
+        if isinstance(
             edge_info,
             (list, tuple),
         ):
+
+            if len(edge_info) == 2:
+
+                return (
+                    edge_info[0],
+                    edge_info[1],
+                    None,
+                )
+
+            if len(edge_info) == 3:
+
+                return (
+                    edge_info[0],
+                    edge_info[1],
+                    edge_info[2],
+                )
+
             return None
-
-        if len(edge_info) == 2:
-
-            return (
-                edge_info[0],
-                edge_info[1],
-                None,
-            )
-
-        if len(edge_info) == 3:
-
-            return (
-                edge_info[0],
-                edge_info[1],
-                edge_info[2],
-            )
 
         return None
 
@@ -2305,6 +2476,75 @@ def _run_standalone_test():
 
     print(
         "[10] invalid probability rejected               PASS"
+    )
+
+    # --------------------------------------------------------
+    # 11. Dictionary edge representation
+    # --------------------------------------------------------
+
+    model.reset_runtime_state(
+        G,
+        reset_counters=True,
+        reset_rng=True,
+    )
+
+    dictionary_edge = {
+        "source": "A",
+        "target": "B",
+        "channel_key": 1,
+        "scid": "A-B-1",
+        "data": {
+            "capacity": 10000,
+        },
+    }
+
+    result = model.evaluate_payment_failure(
+        route=["A", "B"],
+        amount=600,
+        network=G,
+        route_edges=[
+            dictionary_edge
+        ],
+    )
+
+    assert result["success"] is True
+
+    assert result["visited_edges"] == [
+        dictionary_edge
+    ]
+
+    print(
+        "[11] dictionary edge + exact key preserved    PASS"
+    )
+
+    # --------------------------------------------------------
+    # 12. Dictionary edge aliases
+    # --------------------------------------------------------
+
+    alias_edge = {
+        "u": "A",
+        "v": "B",
+        "key": 1,
+        "scid": "A-B-1",
+    }
+
+    result = model.evaluate_payment_failure(
+        route=["A", "B"],
+        amount=600,
+        network=G,
+        route_edges=[
+            alias_edge
+        ],
+    )
+
+    assert result["success"] is True
+
+    assert result["visited_edges"] == [
+        alias_edge
+    ]
+
+    print(
+        "[12] dictionary aliases supported                PASS"
     )
 
     # --------------------------------------------------------

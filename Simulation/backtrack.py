@@ -481,6 +481,12 @@ class PartialBacktracker:
                 if key is not None:
                     return False
 
+        else:
+            # Exact channel identity is mandatory in MultiDiGraph.
+            for _, _, key in normalized:
+                if key is None:
+                    return False
+
         return normalized
 
     # ==========================================================
@@ -866,6 +872,18 @@ class PartialBacktracker:
         candidate_a,
         candidate_b,
     ):
+        """
+        Compare two Bucket candidates without losing channel identity.
+
+        Rules
+        -----
+        1. Exact edge sequences are authoritative.
+        2. In MultiDiGraph, candidates with the same node path but
+           missing exact channel identity are NOT assumed identical.
+        3. In MultiDiGraph, exact channel keys must match.
+        4. In simple Graph/DiGraph, node-path equality is sufficient.
+        """
+
         if candidate_a is candidate_b:
             return True
 
@@ -876,6 +894,10 @@ class PartialBacktracker:
         edges_b = self._extract_candidate_edges(
             candidate_b
         )
+
+        # ------------------------------------------------------
+        # Exact channel-aware comparison
+        # ------------------------------------------------------
 
         if (
             edges_a is not None
@@ -891,13 +913,37 @@ class PartialBacktracker:
             )
 
             if (
-                normalized_a is not None
-                and
-                normalized_b is not None
-                and
-                normalized_a == normalized_b
+                normalized_a is None
+                or
+                normalized_b is None
             ):
-                return True
+                return False
+
+            if len(normalized_a) != len(normalized_b):
+                return False
+
+            # In MultiDiGraph exact channel identity is part
+            # of candidate identity.
+            return normalized_a == normalized_b
+
+        # ------------------------------------------------------
+        # If only one candidate has exact channel information,
+        # they cannot safely be considered identical in a
+        # MultiDiGraph.
+        # ------------------------------------------------------
+
+        if self._is_multigraph():
+
+            if (
+                edges_a is None
+                or
+                edges_b is None
+            ):
+                return False
+
+        # ------------------------------------------------------
+        # Node-path comparison
+        # ------------------------------------------------------
 
         path_a = self._extract_candidate_path(
             candidate_a
@@ -908,26 +954,16 @@ class PartialBacktracker:
         )
 
         if (
-            path_a is not None
-            and
-            path_b is not None
-            and
-            path_a == path_b
+            path_a is None
+            or
+            path_b is None
         ):
-            if self._is_multigraph():
+            return False
 
-                if (
-                    edges_a is not None
-                    and
-                    edges_b is not None
-                ):
-                    return False
-
-                return True
-
-            return True
-
-        return False
+        try:
+            return list(path_a) == list(path_b)
+        except Exception:
+            return False
 
     # ==========================================================
     # Candidate Same Route
@@ -959,6 +995,8 @@ class PartialBacktracker:
         if not self._is_multigraph():
             return True
 
+        # A MultiDiGraph route cannot be compared safely without
+        # exact channel identities.
         if candidate_edges is None:
             return True
 
@@ -1171,6 +1209,12 @@ class PartialBacktracker:
 
             normalized.append(parsed)
 
+        if self._is_multigraph():
+
+            for _, _, key in normalized:
+                if key is None:
+                    return None
+
         return normalized
 
     # ==========================================================
@@ -1257,6 +1301,12 @@ class PartialBacktracker:
                     return None
 
                 parsed_edges.append(parsed)
+
+            if self._is_multigraph():
+
+                for _, _, key in parsed_edges:
+                    if key is None:
+                        return None
 
             try:
                 branch_position = candidate_path.index(
@@ -1859,8 +1909,6 @@ class PartialBacktracker:
             if source is None or target is None:
                 return None
 
-            # Some existing candidates may use "key" instead
-            # of "channel_key". Prefer channel_key.
             channel_key = edge.get(
                 "channel_key",
                 None,
@@ -1869,15 +1917,6 @@ class PartialBacktracker:
             if channel_key is None:
                 channel_key = edge.get(
                     "key",
-                )
-
-            # In a MultiDiGraph exact channel identity is
-            # mandatory. Never invent key=0 here.
-            if channel_key is None:
-                return (
-                    source,
-                    target,
-                    None,
                 )
 
             return (
@@ -2254,6 +2293,21 @@ class PartialBacktracker:
         data,
         amount,
     ):
+        """
+        Validate an edge structurally.
+
+        IMPORTANT
+        ---------
+        `capacity` is deliberately ignored as directional
+        liquidity.
+
+        If no explicit directional liquidity field exists,
+        the channel is structurally usable.
+
+        If an explicit directional liquidity field exists,
+        it must be finite, non-negative, and >= amount.
+        """
+
         if not isinstance(
             data,
             dict,
@@ -2325,6 +2379,8 @@ class PartialBacktracker:
             if directional_liquidity < amount_value:
                 return False
 
+        # No explicit directional liquidity:
+        # accept structurally. Do NOT use capacity.
         return True
 
     # ==========================================================

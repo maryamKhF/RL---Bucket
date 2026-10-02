@@ -44,32 +44,9 @@ Therefore this module MUST NOT modify:
 
     bucket.attempts
 
-Example
--------
-Payment attempt #1
-    |
-    +--> Candidate 1 fails
-              |
-              v
-       Backtracker operation #1
-              |
-              v
-       Candidate 2 selected
-              |
-              v
-       Payment attempt #2
-              |
-              v
-       Candidate 2 succeeds
-
-Final state:
-
-    bucket.attempts      = 2
-    backtracker.attempts = 1
-
 Candidate ordering is never changed. Failed candidates
-remain inside Bucket.candidates so their original rank is
-preserved.
+remain inside Bucket.candidates so their original rank
+is preserved.
 """
 
 
@@ -82,13 +59,13 @@ def choose_alternative(
     failed_index
 ):
     """
-    Select the next candidate after failed_index.
+    Select the immediate next candidate after failed_index.
 
-    This function does not modify the candidate list.
+    This standalone helper does not modify the candidate list.
 
     Parameters
     ----------
-    candidates : list
+    candidates : list or tuple
         Ordered candidate list.
 
     failed_index : int
@@ -106,7 +83,6 @@ def choose_alternative(
     ):
         return None
 
-    # bool is an int subclass, but is not a valid index here.
     if isinstance(
         failed_index,
         bool
@@ -141,26 +117,12 @@ class Backtracker:
     The Backtracker moves the Bucket from a failed candidate
     to the next non-failed candidate.
 
-    It preserves the original candidate list and therefore
-    preserves candidate rank.
-
-    Example
-    -------
-    Candidate ranks:
-
-        1 -> failed
-        2 -> failed
-        3 -> selected
-
-    The selected candidate keeps:
-
-        current_index = 2
-        rank          = 3
+    Candidate ordering is never modified.
 
     Counter semantics
     -----------------
     self.attempts
-        Number of backtracking operations.
+        Number of candidate-level backtracking operations.
 
     bucket.attempts
         Number of actual payment attempts.
@@ -201,7 +163,7 @@ class Backtracker:
 
         self.max_attempts = max_attempts
 
-        # Number of candidate-level backtracking operations.
+        # Candidate-level backtracking operations only.
         self.attempts = 0
 
     # ========================================================
@@ -220,34 +182,10 @@ class Backtracker:
         Move Bucket from a failed candidate to the next
         available candidate.
 
-        Parameters
-        ----------
-        bucket : Bucket
-            Bucket containing ordered candidates.
+        This method records exactly one candidate-level
+        backtracking operation when a failure is processed.
 
-        failed_candidate : object, optional
-            Candidate that actually failed.
-
-        failed_channel : tuple, optional
-            Channel responsible for the payment failure.
-
-        failed_index : int, optional
-            Explicit index of the failed candidate.
-
-        reason : str, optional
-            Failure reason for diagnostic bookkeeping.
-
-        Returns
-        -------
-        candidate or None
-            Next valid candidate.
-
-        Important
-        ---------
-        This method does NOT increment bucket.attempts.
-
-        bucket.attempts belongs exclusively to actual payment
-        execution.
+        It does NOT increment bucket.attempts.
         """
 
         # ----------------------------------------------------
@@ -270,21 +208,14 @@ class Backtracker:
             return None
 
         if len(candidates) == 0:
-
-            self._fail_bucket(
-                bucket
-            )
-
+            self._fail_bucket(bucket)
             return None
 
         # ----------------------------------------------------
         # 2. Already terminated
         # ----------------------------------------------------
 
-        if self._bucket_finished(
-            bucket
-        ):
-
+        if self._bucket_finished(bucket):
             return getattr(
                 bucket,
                 "selected_candidate",
@@ -296,11 +227,7 @@ class Backtracker:
         # ----------------------------------------------------
 
         if self.attempts >= self.max_attempts:
-
-            self._fail_bucket(
-                bucket
-            )
-
+            self._fail_bucket(bucket)
             return None
 
         # ----------------------------------------------------
@@ -312,11 +239,7 @@ class Backtracker:
         )
 
         if current_index is None:
-
-            self._fail_bucket(
-                bucket
-            )
-
+            self._fail_bucket(bucket)
             return None
 
         # ----------------------------------------------------
@@ -330,11 +253,9 @@ class Backtracker:
             )
 
             if failed_index is None:
-
                 return None
 
             if failed_index >= len(candidates):
-
                 return None
 
             resolved_failed_candidate = (
@@ -348,7 +269,6 @@ class Backtracker:
             )
 
             if resolved_failed_candidate is None:
-
                 resolved_failed_candidate = (
                     candidates[current_index]
                 )
@@ -361,10 +281,8 @@ class Backtracker:
 
             if failed_index is None:
 
-                # If the supplied failed candidate is not in
-                # the candidate list, fall back to the current
-                # candidate because the Bucket state is
-                # authoritative.
+                # Bucket state is authoritative when the
+                # supplied candidate cannot be located.
                 failed_index = current_index
 
                 resolved_failed_candidate = (
@@ -372,7 +290,7 @@ class Backtracker:
                 )
 
         # ----------------------------------------------------
-        # 6. Record failure
+        # 6. Record candidate failure
         # ----------------------------------------------------
 
         self._record_failed_candidate(
@@ -380,10 +298,18 @@ class Backtracker:
             resolved_failed_candidate
         )
 
+        # ----------------------------------------------------
+        # 7. Record failed channel
+        # ----------------------------------------------------
+
         self._record_failed_channel(
             bucket,
             failed_channel
         )
+
+        # ----------------------------------------------------
+        # 8. Record failure diagnostics
+        # ----------------------------------------------------
 
         self._record_failure_reason(
             bucket=bucket,
@@ -394,21 +320,19 @@ class Backtracker:
         )
 
         # ----------------------------------------------------
-        # 7. Register ONE candidate-level backtracking op
+        # 9. Register ONE candidate-level operation
         # ----------------------------------------------------
 
         self.attempts += 1
 
         # IMPORTANT:
         #
-        # DO NOT DO:
+        # bucket.attempts MUST NOT be modified here.
         #
-        # bucket.attempts += 1
-        #
-        # bucket.attempts belongs to actual payment attempts.
+        # bucket.attempts belongs to actual payment execution.
 
         # ----------------------------------------------------
-        # 8. Find next non-failed candidate
+        # 10. Find next non-failed candidate
         # ----------------------------------------------------
 
         next_index = self._find_next_available_index(
@@ -417,22 +341,25 @@ class Backtracker:
         )
 
         # ----------------------------------------------------
-        # 9. No candidate remains
+        # 11. No candidate remains
         # ----------------------------------------------------
 
         if next_index is None:
-
-            self._fail_bucket(
-                bucket
-            )
-
+            self._fail_bucket(bucket)
             return None
 
         # ----------------------------------------------------
-        # 10. Move Bucket
+        # 12. Move Bucket
         # ----------------------------------------------------
 
         bucket.current_index = next_index
+
+        # Keep selected_candidate synchronized with the
+        # candidate currently selected by Bucket.
+        self._set_selected_candidate(
+            bucket,
+            candidates[next_index]
+        )
 
         return candidates[next_index]
 
@@ -446,8 +373,8 @@ class Backtracker:
         start_index
     ):
         """
-        Find the first candidate at or after start_index that
-        has not already been recorded as failed.
+        Find the first candidate at or after start_index
+        that has not already been recorded as failed.
         """
 
         candidates = getattr(
@@ -483,6 +410,9 @@ class Backtracker:
             []
         )
 
+        if failed_candidates is None:
+            failed_candidates = []
+
         for index in range(
             start_index,
             len(candidates)
@@ -512,7 +442,7 @@ class Backtracker:
         """
         Record a failed candidate exactly once.
 
-        The candidate is NOT removed from Bucket.candidates.
+        The candidate remains inside Bucket.candidates.
         """
 
         if failed_candidate is None:
@@ -542,8 +472,8 @@ class Backtracker:
             failed_candidate
         )
 
-        # Keep compatibility with Bucket implementations that
-        # expose failed_candidates_count.
+        # Compatibility with Bucket implementations exposing
+        # failed_candidates_count.
         if hasattr(
             bucket,
             "failed_candidates_count"
@@ -566,7 +496,7 @@ class Backtracker:
         Determine whether candidate is already registered
         as failed.
 
-        Equality is preferred, with identity fallback.
+        Identity is checked before equality.
         """
 
         if not failed_candidates:
@@ -578,10 +508,8 @@ class Backtracker:
                 return True
 
             try:
-
                 if failed == candidate:
                     return True
-
             except Exception:
                 pass
 
@@ -621,7 +549,6 @@ class Backtracker:
             failed_channel,
             failed_channels
         ):
-
             failed_channels.append(
                 failed_channel
             )
@@ -641,7 +568,7 @@ class Backtracker:
         """
         Record diagnostic information about the failure.
 
-        This is optional and does not affect routing logic.
+        This bookkeeping does not affect routing logic.
         """
 
         if not hasattr(
@@ -660,18 +587,18 @@ class Backtracker:
 
         record = {
             "candidate_index": failed_index,
-            "candidate_rank": failed_index + 1
+            "candidate_rank": (
+                failed_index + 1
                 if failed_index is not None
-                else None,
+                else None
+            ),
             "failed_candidate": failed_candidate,
             "failed_channel": failed_channel,
             "reason": reason
         }
 
         try:
-            history.append(
-                record
-            )
+            history.append(record)
         except Exception:
             pass
 
@@ -686,8 +613,6 @@ class Backtracker:
     ):
         """
         Check whether a channel is already recorded.
-
-        Exact tuple equality is preferred.
         """
 
         if not failed_channels:
@@ -699,10 +624,8 @@ class Backtracker:
                 return True
 
             try:
-
                 if failed == channel:
                     return True
-
             except Exception:
                 pass
 
@@ -721,7 +644,7 @@ class Backtracker:
         Record a failed candidate without physically removing
         it from Bucket.candidates.
 
-        Candidate rank therefore remains stable.
+        Candidate rank remains stable.
         """
 
         if bucket is None:
@@ -768,6 +691,9 @@ class Backtracker:
             []
         )
 
+        if failed_candidates is None:
+            return False
+
         return self._candidate_in_failed_registry(
             candidate,
             failed_candidates
@@ -799,6 +725,9 @@ class Backtracker:
             []
         )
 
+        if failed_channels is None:
+            return False
+
         return self._channel_in_registry(
             channel,
             failed_channels
@@ -816,22 +745,16 @@ class Backtracker:
         Move to the next non-failed candidate without recording
         a failure.
 
-        This method does NOT increment either:
+        This method does NOT increment:
 
             bucket.attempts
             self.attempts
-
-        because no payment failure/backtracking operation is
-        being registered here.
         """
 
         if bucket is None:
             return None
 
-        if self._bucket_finished(
-            bucket
-        ):
-
+        if self._bucket_finished(bucket):
             return getattr(
                 bucket,
                 "selected_candidate",
@@ -843,11 +766,7 @@ class Backtracker:
         )
 
         if current_index is None:
-
-            self._fail_bucket(
-                bucket
-            )
-
+            self._fail_bucket(bucket)
             return None
 
         next_index = self._find_next_available_index(
@@ -856,16 +775,21 @@ class Backtracker:
         )
 
         if next_index is None:
-
-            self._fail_bucket(
-                bucket
-            )
-
+            self._fail_bucket(bucket)
             return None
 
         bucket.current_index = next_index
 
-        return bucket.candidates[next_index]
+        candidate = bucket.candidates[
+            next_index
+        ]
+
+        self._set_selected_candidate(
+            bucket,
+            candidate
+        )
+
+        return candidate
 
     # ========================================================
     # Has Alternative
@@ -883,9 +807,7 @@ class Backtracker:
         if bucket is None:
             return False
 
-        if self._bucket_finished(
-            bucket
-        ):
+        if self._bucket_finished(bucket):
             return False
 
         current_index = self._get_current_index(
@@ -914,14 +836,14 @@ class Backtracker:
         preferred_index=None
     ):
         """
-        Find candidate index while preserving object identity
+        Find candidate index while preserving identity
         when possible.
         """
 
         if not candidates:
             return None
 
-        # First try the preferred position.
+        # Preferred position first.
         if (
             preferred_index is not None
             and
@@ -940,10 +862,8 @@ class Backtracker:
                 return preferred_index
 
             try:
-
                 if preferred == candidate:
                     return preferred_index
-
             except Exception:
                 pass
 
@@ -961,10 +881,8 @@ class Backtracker:
         ):
 
             try:
-
                 if item == candidate:
                     return index
-
             except Exception:
                 pass
 
@@ -1049,6 +967,28 @@ class Backtracker:
         return index
 
     # ========================================================
+    # Synchronize Selected Candidate
+    # ========================================================
+
+    @staticmethod
+    def _set_selected_candidate(
+        bucket,
+        candidate
+    ):
+        """
+        Synchronize Bucket.selected_candidate with the
+        candidate selected by current_index.
+
+        This does not change candidate ordering and does not
+        affect payment-attempt counters.
+        """
+
+        try:
+            bucket.selected_candidate = candidate
+        except Exception:
+            pass
+
+    # ========================================================
     # Bucket Finished
     # ========================================================
 
@@ -1122,9 +1062,9 @@ class Backtracker:
         """
         Reset Backtracker state.
 
-        This resets ONLY candidate-level backtracking count.
+        Only candidate-level backtracking count is reset.
 
-        It does not modify any Bucket state.
+        Bucket state is not modified.
         """
 
         self.attempts = 0
@@ -1237,6 +1177,10 @@ if __name__ == "__main__":
     assert bucket.attempts == 0
     assert backtracker.attempts == 0
     assert bucket.current_index == 0
+    assert (
+        bucket.selected_candidate
+        is bucket.candidates[0]
+    )
 
     # --------------------------------------------------------
     # Simulate actual Payment Attempt #1
@@ -1268,6 +1212,11 @@ if __name__ == "__main__":
 
     assert bucket.current_index == 1
 
+    assert (
+        bucket.selected_candidate
+        is bucket.candidates[1]
+    )
+
     assert bucket.failed_candidates_count == 1
 
     assert bucket.failed_candidates == [
@@ -1280,7 +1229,6 @@ if __name__ == "__main__":
 
     assert backtracker.attempts == 1
 
-    # IMPORTANT:
     # Backtracking must NOT increment payment attempts.
     assert bucket.attempts == 1
 
@@ -1307,6 +1255,11 @@ if __name__ == "__main__":
     assert next_candidate is bucket.candidates[2]
 
     assert bucket.current_index == 2
+
+    assert (
+        bucket.selected_candidate
+        is bucket.candidates[2]
+    )
 
     assert bucket.failed_candidates_count == 2
 

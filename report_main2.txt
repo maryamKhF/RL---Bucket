@@ -1,14 +1,383 @@
 
 ====================================================================
-RL + BUCKET MAIN2 EXPERIMENT
+RL + BUCKET MAIN2 - FAST EXPERIMENT
 ====================================================================
 Project root                          : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket
-Run started                           : 2026-10-02 19:59:32
-Route generation pool                 : 250
-Route pool retained                   : 50
+Run started                           : 2026-10-02 20:47:35
+FAST TRAINING                         : True
+Route generation pool                 : 50
+Route pool retained                   : 30
 Bucket size                           : 5
 Maximum hops                          : 20
-Preferred hop lengths                 : 10 / 20
+Training transactions                 : 10
+Evaluation transactions               : 5
+PPO timesteps                         : 50
+Step                                  : 0/10
+Progress                              : 0.00%
+Stage                                 : STEP 0 - LOAD CONFIGURATION
+
+====================================================================
+STEP 0 - FAST CONFIGURATION
+====================================================================
+Seed                                  : 42
+FAST mode                             : True
+Training transactions                 : 10
+Evaluation transactions               : 5
+Route generation pool                 : 50
+Route pool                            : 30
+Bucket                                : 5
+Maximum hops                          : 20
 Failure rate                          : 0.06
-Training transactions                 : 50
-Evaluation transactions               : 10
+PPO total timesteps                   : 50
+PPO n_steps                           : 50
+PPO batch size                        : 25
+Step completed                        : 0/10
+Progress                              : 0.00%
+Status                                : FAST CONFIGURATION READY
+Step                                  : 1/10
+Progress                              : 10.00%
+Stage                                 : STEP 1 - LOAD SNAPSHOT
+
+====================================================================
+STEP 1 - SNAPSHOT
+====================================================================
+Snapshot                              : 20190501.gml.geo
+Nodes                                 : 4143
+Channels                              : 66390
+Step completed                        : 1/10
+Progress                              : 10.00%
+Status                                : SNAPSHOT LOADED
+Step                                  : 2/10
+Progress                              : 20.00%
+Stage                                 : STEP 2 - INSTALL FAST ROUTING PIPELINE
+
+====================================================================
+STEP 2 - FAST ROUTING
+====================================================================
+Generation pool                       : 50
+Initial route pool                    : 30
+Bucket size                           : 5
+Max hops                              : 20
+
+FAST mode reduces candidate generation from 250 to 50.
+FAST mode retains up to 30 diversified routes.
+Only five ranked routes enter the active Bucket.
+Step completed                        : 2/10
+Progress                              : 20.00%
+Status                                : FAST ROUTING PIPELINE INSTALLED
+Step                                  : 3/10
+Progress                              : 30.00%
+Stage                                 : STEP 3 - PREPARE TRAINING DATA
+
+====================================================================
+STEP 3 - FAST TRAINING DATA
+====================================================================
+Training transactions                 : 10
+Failure rate                          : 0.06
+Training graph nodes                  : 4143
+Training graph channels               : 66390
+Step completed                        : 3/10
+Progress                              : 30.00%
+Status                                : 10 TRAINING TRANSACTIONS READY
+Step                                  : 4/10
+Progress                              : 40.00%
+Stage                                 : STEP 4 - FAST PPO TRAINING
+
+====================================================================
+STEP 4 - FAST PPO TRAINING RESULT
+====================================================================
+Training status                       : COMPLETED
+Training mode                         : FAST
+Training time                         : 6349.6214 seconds
+PPO target timesteps                  : 512
+PPO completed timesteps               : 512
+PPO training progress                 : 100.00%
+PPO training FPS                      : 0.0807
+Training transactions                 : 10
+Route generation pool                 : 50
+Retained route pool                   : 30
+Bucket size during training           : 5
+
+FAST mode is intended for pipeline validation.
+It should not be used as the final experimental configuration for thesis results.
+Step completed                        : 4/10
+Progress                              : 50.00%
+Status                                : FAST PPO TRAINING COMPLETED
+Step                                  : 5/10
+Progress                              : 50.00%
+Stage                                 : STEP 5 - GENERATE EVALUATION TRANSACTIONS
+
+====================================================================
+STEP 5 - EVALUATION TRANSACTIONS
+====================================================================
+Evaluation transactions               : 5
+Policy                                : 5 independent transactions
+Step completed                        : 5/10
+Progress                              : 50.00%
+Status                                : EVALUATION TRANSACTIONS READY
+Step                                  : 6/10
+Progress                              : 60.00%
+Stage                                 : STEP 6 - EVALUATION CONFIGURATION
+
+====================================================================
+STEP 6 - FAST EVALUATION CONFIGURATION
+====================================================================
+Failure rate                          : 0.06
+Route generation pool                 : 50
+Routes retained                       : 30
+Bucket candidates                     : 5
+Max hops                              : 20
+
+Every evaluation transaction gets its own graph, FailureModel and NetworkDynamics.
+Step completed                        : 6/10
+Progress                              : 60.00%
+Status                                : EVALUATION CONFIGURATION READY
+Step                                  : 7/10
+Progress                              : 70.00%
+Stage                                 : STEP 7 - PPO ROUTING
+
+====================================================================
+STEP 7 - FAST PPO ROUTING
+====================================================================
+The trained PPO model is reused for every evaluation transaction.
+For each transaction PPO predicts eta.
+The FAST route generator produces up to 50 candidates.
+Up to 30 diversified routes are retained.
+Only the best 5 candidates enter Bucket.
+Step completed                        : 7/10
+Progress                              : 70.00%
+Status                                : PPO ROUTING READY
+Step                                  : 8/10
+Progress                              : 80.00%
+Stage                                 : STEP 8 - BUCKET EXECUTION
+
+====================================================================
+STEP 8 - BUCKET EXECUTION
+====================================================================
+The five Bucket candidates are not forced to succeed at a predetermined position.
+The first candidate may succeed.
+A later candidate may succeed after failure.
+All candidates may fail.
+Step completed                        : 8/10
+Progress                              : 80.00%
+Status                                : BUCKET EXECUTION READY
+Step                                  : 9/10
+Progress                              : 90.00%
+Stage                                 : STEP 9 - MULTI-TRANSACTION EVALUATION
+
+====================================================================
+TRANSACTION 1/5
+====================================================================
+Transaction ID                        : 100001
+Source                                : 763
+Destination                           : 3023
+Amount                                : 1000.0
+PPO eta                               : 0.0
+Candidate pool                        : 30
+Usable candidates                     : 30
+Bucket size                           : 5
+Attempts                              : 1
+Payment                               : SUCCESS
+Successful Bucket rank                : 1
+Hops                                  : 3
+Partial backtracks                    : 0
+Partial BT successes                  : 0
+Full reroutes                         : 0
+Fee                                   : 1000.0049999999999
+Delay                                 : 204.0
+Carbon                                : 136.57666666666665
+Reward                                : 0.7534582955394652
+Reason                                : success
+Prediction time                       : 0.0157 seconds
+Pipeline time                         : 7.3233 seconds
+Transaction execution time            : 9.6731 seconds
+
+Route path:
+763 -> 1899 -> 3678 -> 3023
+
+====================================================================
+TRANSACTION 2/5
+====================================================================
+Transaction ID                        : 100002
+Source                                : 573
+Destination                           : 1201
+Amount                                : 1000.0
+PPO eta                               : 0.0
+Candidate pool                        : 30
+Usable candidates                     : 30
+Bucket size                           : 5
+Attempts                              : 1
+Payment                               : SUCCESS
+Successful Bucket rank                : 1
+Hops                                  : 4
+Partial backtracks                    : 0
+Partial BT successes                  : 0
+Full reroutes                         : 0
+Fee                                   : 1002.012
+Delay                                 : 182.0
+Carbon                                : 162.48075000000003
+Reward                                : 0.740251174691979
+Reason                                : success
+Prediction time                       : 0.0000 seconds
+Pipeline time                         : 12.3834 seconds
+Transaction execution time            : 14.7186 seconds
+
+Route path:
+573 -> 2127 -> 3403 -> 2107 -> 1201
+
+====================================================================
+TRANSACTION 3/5
+====================================================================
+Transaction ID                        : 100003
+Source                                : 941
+Destination                           : 1798
+Amount                                : 3449.831535783569
+PPO eta                               : 0.0
+Candidate pool                        : 30
+Usable candidates                     : 30
+Bucket size                           : 5
+Attempts                              : 1
+Payment                               : SUCCESS
+Successful Bucket rank                : 1
+Hops                                  : 3
+Partial backtracks                    : 0
+Partial BT successes                  : 0
+Full reroutes                         : 0
+Fee                                   : 6.910012566174488
+Delay                                 : 64.0
+Carbon                                : 116.62
+Reward                                : 0.8331286542113167
+Reason                                : success
+Prediction time                       : 0.0000 seconds
+Pipeline time                         : 12.3265 seconds
+Transaction execution time            : 14.7149 seconds
+
+Route path:
+941 -> 1985 -> 2107 -> 1798
+
+====================================================================
+TRANSACTION 4/5
+====================================================================
+Transaction ID                        : 100004
+Source                                : 3627
+Destination                           : 2247
+Amount                                : 1000.0
+PPO eta                               : 0.0
+Candidate pool                        : 30
+Usable candidates                     : 30
+Bucket size                           : 5
+Attempts                              : 3
+Payment                               : SUCCESS
+Successful Bucket rank                : 2
+Hops                                  : 4
+Partial backtracks                    : 1
+Partial BT successes                  : 0
+Full reroutes                         : 0
+Fee                                   : 400.106
+Delay                                 : 166.0
+Carbon                                : 166.41412499999998
+Reward                                : 0.6860165455894215
+Reason                                : success
+Prediction time                       : 0.0000 seconds
+Pipeline time                         : 13.9768 seconds
+Transaction execution time            : 16.2243 seconds
+
+Route path:
+3627 -> 2119 -> 2962 -> 1010 -> 2247
+
+====================================================================
+TRANSACTION 5/5
+====================================================================
+Transaction ID                        : 100005
+Source                                : 3014
+Destination                           : 1956
+Amount                                : 1000.0
+PPO eta                               : 0.0
+Candidate pool                        : 30
+Usable candidates                     : 30
+Bucket size                           : 5
+Attempts                              : 1
+Payment                               : SUCCESS
+Successful Bucket rank                : 1
+Hops                                  : 2
+Partial backtracks                    : 0
+Partial BT successes                  : 0
+Full reroutes                         : 0
+Fee                                   : 0.003
+Delay                                 : 174.0
+Carbon                                : 149.94824999999997
+Reward                                : 0.8361069853811073
+Reason                                : success
+Prediction time                       : 0.0000 seconds
+Pipeline time                         : 7.7644 seconds
+Transaction execution time            : 10.1518 seconds
+
+Route path:
+3014 -> 2035 -> 1956
+Step completed                        : 9/10
+Progress                              : 90.00%
+Status                                : FAST EVALUATION COMPLETED
+Step                                  : 10/10
+Progress                              : 100.00%
+Stage                                 : STEP 10 - FINAL RESULT
+
+====================================================================
+FINAL AGGREGATE RESULT
+====================================================================
+Evaluation transactions               : 5
+Successful payments                   : 5
+Failed payments                       : 0
+Success rate                          : 100.00%
+Failure rate                          : 0.00%
+Average attempts                      : 1.4000
+Average hops                          : 3.2000
+Average fee                           : 481.807203
+Average delay                         : 158.0000
+Average carbon                        : 146.407958
+Average reward                        : 0.769792
+Average eta                           : 0.000000
+Average candidate pool                : 30.0000
+Average Bucket size                   : 5.0000
+Partial backtracks                    : 1
+Partial BT successes                  : 0
+Full reroutes                         : 0
+
+Successful Bucket candidate distribution:
+Bucket candidate #1                   : 4
+Bucket candidate #2                   : 1
+
+FAST Experiment interpretation:
+1. Up to 50 candidate routes are generated.
+2. Up to 30 diversified routes are retained.
+3. 5 routes are selected for the Bucket.
+4. The Bucket attempts routes sequentially.
+5. A transaction may succeed on any available Bucket candidate.
+6. PPO learns eta from routing reward.
+7. This configuration is intended for fast pipeline validation.
+8. The FAST configuration should not be used as the final thesis experiment.
+
+====================================================================
+EXECUTION TIME
+====================================================================
+FAST mode                             : True
+PPO training time                     : 6349.6214 seconds
+PPO target timesteps                  : 512
+PPO completed timesteps               : 512
+PPO progress                          : 100.00%
+PPO FPS                               : 0.0807
+Total execution time                  : 6422.1786 seconds
+Training transactions                 : 10
+Evaluation transactions               : 5
+Routes generated per evaluation       : 50
+Routes retained before ranking        : 30
+Routes retained in Bucket             : 5
+Maximum hops                          : 20
+Failure rate                          : 0.06
+
+====================================================================
+FINAL STATUS
+====================================================================
+Run status                            : COMPLETED
+Overall progress                      : 100.00%
+Model                                 : fast_end_to_end_30_routes_50_ppo
+Report                                : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\report_main2.txt

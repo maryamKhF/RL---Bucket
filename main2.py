@@ -156,13 +156,13 @@ PPO_TRAINING_FPS = 0.0
 # EVAL_TRANSACTION_COUNT  = 5
 # ROUTE_POOL_SIZE         = 30
 # ROUTE_GENERATION_POOL   = 50
-# PPO                     = 500
+# PPO                     = 50
 #
 # ------------------------------------------------------------
 
 FAST_TRAINING = True
 
-MODEL_NAME = "fast_end_to_end_30_routes"
+MODEL_NAME = "fast_end_to_end_30_routes_50_ppo"
 
 EVAL_TRANSACTION_COUNT = 5
 
@@ -186,11 +186,11 @@ FAILURE_RATE = 0.06
 TOTAL_STEPS = 10
 
 # PPO fast configuration
-FAST_TOTAL_TIMESTEPS = 500
+FAST_TOTAL_TIMESTEPS = 50
 
-FAST_N_STEPS = 64
+FAST_N_STEPS = 50
 
-FAST_BATCH_SIZE = 32
+FAST_BATCH_SIZE = 25
 
 
 # ============================================================
@@ -3248,12 +3248,12 @@ def main():
         )
 
         print(
-            "هدف این مرحله: اجرای سریع کل pipeline.",
+            "Purpose: run the full pipeline in fast mode.",
             flush=True
         )
 
         print(
-            "این تنظیمات برای آزمایش نهایی پایان‌نامه نیست.",
+            "These settings are for a quick test, not final thesis experiments.",
             flush=True
         )
 

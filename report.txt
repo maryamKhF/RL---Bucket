@@ -2,7 +2,7 @@
 ================================================================
 RL + BUCKET END-TO-END EXECUTION REPORT
 ================================================================
-Run started                 : 2026-10-02 11:23:32
+Run started                 : 2026-10-02 11:35:42
 Execution mode              : NORMAL TRAINING
 Initial stage               : Importing Pathfinding modules
 Overall progress            : 0.00%
@@ -27,7 +27,7 @@ RUN INFORMATION
 Snapshot                    : 20190501.gml.geo
 Snapshot path               : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\20190501.gml.geo
 Random seed                 : 42
-Run started                 : 2026-10-02 11:23:32
+Run started                 : 2026-10-02 11:35:42
 
 ================================================================
 STEP 1 - SNAPSHOT
@@ -85,7 +85,7 @@ Training snapshot           : 20190501.gml.geo
 Training nodes              : 4143
 Training channels           : 66390
 Training status             : SUCCESS
-Training time (seconds)     : 71.7409
+Training time (seconds)     : 79.1101
 Model                       : models\end_to_end
 
 The PPO agent was trained on the same snapshot that will be used for the payment scenario.
@@ -99,8 +99,8 @@ STEP 5 - PAYMENT SCENARIO
 Step                        : 5/10
 Progress                    : 50.00%
 Stage                       : STEP 5 - PAYMENT SCENARIO
-Source                      : 1751
-Destination                 : 206
+Source                      : 2992
+Destination                 : 3292
 Payment amount              : 1000.0
 Transaction ID              : 0
 Step completed              : 5/10
@@ -143,8 +143,8 @@ Step                        : 8/10
 Progress                    : 80.00%
 Stage                       : STEP 8 - PPO ROUTING DECISION
 PPO prediction              : SUCCESS
-Raw action                  : [0.31452733278274536]
-Prediction time (seconds)   : 0.0
+Raw action                  : [0.21951627731323242]
+Prediction time (seconds)   : 0.00967
 Step completed              : 8/10
 Progress                    : 80.00%
 Status                      : PPO ROUTING DECISION READY
@@ -158,7 +158,7 @@ Stage                       : STEP 9 - EXECUTE BUCKET PAYMENT FAILURE BACKTRACKI
 Terminated                  : True
 Truncated                   : False
 Execution info keys         : ['transaction_id', 'eta', 'top_k', 'candidate_path_count', 'usable_candidate_count', 'bucket_size', 'success', 'payment_success', 'path', 'path_length', 'fee', 'delay', 'carbon', 'failure_probability', 'average_delay', 'backtrack_count', 'partial_backtrack_count', 'partial_backtrack_success', 'full_reroute', 'full_reroute_count', 'attempt_count', 'reason', 'episode_reward']
-Adaptive eta                : 0.31452733278274536
+Adaptive eta                : 0.21951627731323242
 Requested Top-K             : 5
 Generated candidates        : 5
 Usable candidates           : 5
@@ -180,47 +180,47 @@ STEP 10 - FINAL PAYMENT RESULT
 Step                        : 10/10
 Progress                    : 100.00%
 Stage                       : STEP 10 - FINAL PAYMENT RESULT
-Source                      : 1751
-Destination                 : 206
+Source                      : 2992
+Destination                 : 3292
 Payment amount              : 1000.0
 Payment status              : SUCCESS
 Destination reached         : YES
-Final path                  : 1751 -> 1909 -> 3680 -> 2121 -> 206
+Final path                  : 2992 -> 3683 -> 1697 -> 3679 -> 3292
 Number of hops              : 3
 Total attempts              : 3
-Partial backtracks          : 1
-Successful partial backtracks: 0
+Partial backtracks          : 2
+Successful partial backtracks: 1
 Full reroutes               : 0
-Failure probability         : 0.07617597159855538
-Fee                         : 0.006
-Delay                       : 208.0
-Carbon                      : 106.939625
-Reward                      : 0.7378949393076792
-Reason                      : success
-Successful Bucket route     : 2 / 5
+Failure probability         : 0.0
+Fee                         : 2.004
+Delay                       : 68.0
+Carbon                      : 124.50962499999999
+Reward                      : 0.6833203239483486
+Reason                      : partial_backtrack_success
+Successful Bucket route     : 3 / 5
 
 ================================================================
 FINAL STATUS
 ================================================================
 PAYMENT SUCCESSFUL
-The payment reached destination 206 from source 1751.
+The payment reached destination 3292 from source 2992.
 The payment succeeded after 3 attempts.
-Successful route: Bucket candidate #2.
+Successful route: Bucket candidate #3.
 
 ================================================================
 EXECUTION TIME
 ================================================================
 Execution mode              : NORMAL TRAINING
-PPO training time (seconds) : 71.7409
+PPO training time (seconds) : 79.1101
 PPO model load time (seconds): 0.0
-PPO prediction time (seconds): 0.0
-Payment pipeline time (seconds): 4.0807
-Total execution time (seconds): 91.338
+PPO prediction time (seconds): 0.00967
+Payment pipeline time (seconds): 3.093
+Total execution time (seconds): 97.56
 
 ================================================================
 END OF REPORT
 ================================================================
 Run status                  : COMPLETED
 Overall progress            : 100.00%
-Run completed               : 2026-10-02 11:25:04
+Run completed               : 2026-10-02 11:37:20
 Report file                 : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\report.txt

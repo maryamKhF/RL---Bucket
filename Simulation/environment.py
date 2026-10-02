@@ -64,38 +64,24 @@ Architecture
           PPO
 
 
-Responsibilities
-----------------
-This environment is responsible for:
+Important project contracts
+---------------------------
 
-1. Defining the RL state.
-2. Defining the action eta in [-1, 1].
-3. Applying eta to the routing heuristic.
-4. Requesting route candidates from the routing layer.
-5. Using Bucket-selected routes.
-6. Executing payment simulation.
-7. Invoking Partial Backtracking after failure.
-8. Rebuilding Onion after an alternative route is selected.
-9. Calculating reward.
-10. Returning Gymnasium reset()/step() outputs.
-
-This environment does NOT implement:
-
-- PPO itself
-- Dijkstra/LND itself
-- Bucket storage logic
-- Failure probability logic
-- Payment settlement logic
-- Onion cryptography
-- Partial Backtracking algorithm itself
-
-Those responsibilities belong to their respective modules.
+1. PPO controls eta only.
+2. eta is always in [0, 1].
+3. Top-K is fixed at 5.
+4. MultiDiGraph channel identity must be preserved.
+5. No arbitrary parallel-channel selection is allowed.
+6. capacity is NOT directional liquidity.
+7. Unknown directional liquidity remains unknown.
+8. Bucket.attempts is not modified by this environment directly.
+9. PartialBacktracker is responsible for partial backtracking.
+10. PaymentSimulator is responsible for payment execution and settlement.
 """
-
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import networkx as nx
@@ -121,33 +107,46 @@ class LightningRoutingEnv(gym.Env):
     """
     Gymnasium environment for adaptive Lightning routing.
 
-    MDP:
+    PPO controls only eta.
 
-        M = (S, A, T, R, gamma)
+    Routing itself is delegated to the routing layer:
 
-    State:
-        Local normalized neighborhood representation.
-
-    Action:
-        eta in [-1, 1]
-
-    Transition:
-        Network state + selected routing decision +
-        payment outcome + network evolution.
-
-    Reward:
-        README-compatible success / distance / CO2 formulation.
-
-    The environment is designed to work with an external
-    route provider that performs:
-
-        modified heuristic -> LND / Dijkstra ->
-        candidate routes -> Bucket -> selected route
+        eta
+          |
+          v
+    modified heuristic
+          |
+          v
+      Top-K (5)
+          |
+          v
+        Bucket
+          |
+          v
+    selected route
+          |
+          v
+    PaymentSimulator
+          |
+          v
+    FailureModel
+          |
+          v
+    PartialBacktracker
     """
 
     metadata = {
         "render_modes": []
     }
+
+    # ==========================================================
+    # Project-level constants
+    # ==========================================================
+
+    TOP_K = 5
+
+    ETA_LOW = 0.0
+    ETA_HIGH = 1.0
 
     # ==========================================================
     # Initialization
@@ -169,105 +168,26 @@ class LightningRoutingEnv(gym.Env):
         gamma: float = 0.99,
         max_steps: int = 100,
         seed: int = 42,
-        reward_scale: float = 1000.0
+        reward_scale: float = 1000.0,
     ):
-        """
-        Parameters
-        ----------
-        graph : NetworkX graph
-            Real Lightning Network graph.
-
-        route_provider : callable
-            External routing layer.
-
-            Expected conceptual interface:
-
-                route_provider(
-                    graph=G,
-                    source=u,
-                    destination=v,
-                    amount=amount,
-                    eta=eta,
-                    k_candidates=...,
-                    bucket=...
-                )
-
-            It should return either a selected route or a
-            structured routing result.
-
-        bucket : Bucket object
-            Existing Bucket module.
-
-        failure_model : FailureModel
-            Payment-level failure model.
-
-        network_dynamics : NetworkDynamics
-            Network evolution and settlement model.
-
-        router : Router
-            Onion forwarding layer.
-
-        payment_simulator : PaymentSimulator
-            Payment execution layer.
-
-        backtracker : PartialBacktracker
-            Partial backtracking module.
-
-        transactions : list of dict
-            Transaction/payment dataset.
-
-        k_neighbors : int
-            Maximum local neighborhood size.
-            README reference: k=15.
-
-        feature_dim : int
-            Number of state features.
-            README reference: m=5.
-
-        gamma : float
-            RL discount factor.
-
-        max_steps : int
-            Maximum steps in one episode.
-
-        seed : int
-            Reproducibility seed.
-
-        reward_scale : float
-            Reward scaling factor.
-            README reference: 10^3.
-        """
-
         super().__init__()
 
-        # ------------------------------------------------------
-        # Validate graph
-        # ------------------------------------------------------
-
         if graph is None:
-            raise ValueError(
-                "graph must not be None."
+            raise ValueError("graph must not be None.")
+
+        if not isinstance(graph, nx.Graph):
+            raise TypeError(
+                "graph must be a NetworkX graph."
             )
 
         self.graph = graph
 
-        # ------------------------------------------------------
-        # Configuration
-        # ------------------------------------------------------
-
         self.k_neighbors = int(k_neighbors)
-
         self.feature_dim = int(feature_dim)
-
         self.gamma = float(gamma)
-
         self.max_steps = int(max_steps)
-
         self.seed_value = int(seed)
-
-        self.reward_scale = float(
-            reward_scale
-        )
+        self.reward_scale = float(reward_scale)
 
         if self.k_neighbors < 1:
             raise ValueError(
@@ -284,6 +204,16 @@ class LightningRoutingEnv(gym.Env):
                 "gamma must be in (0, 1]."
             )
 
+        if self.max_steps < 1:
+            raise ValueError(
+                "max_steps must be >= 1."
+            )
+
+        if self.reward_scale <= 0.0:
+            raise ValueError(
+                "reward_scale must be > 0."
+            )
+
         # ------------------------------------------------------
         # Random generator
         # ------------------------------------------------------
@@ -293,15 +223,14 @@ class LightningRoutingEnv(gym.Env):
         )
 
         # ------------------------------------------------------
-        # External routing layer
+        # Routing layer
         # ------------------------------------------------------
 
         self.route_provider = route_provider
-
         self.bucket = bucket
 
         # ------------------------------------------------------
-        # Simulation components
+        # Failure model
         # ------------------------------------------------------
 
         self.failure_model = (
@@ -312,6 +241,10 @@ class LightningRoutingEnv(gym.Env):
             )
         )
 
+        # ------------------------------------------------------
+        # Network dynamics
+        # ------------------------------------------------------
+
         self.network_dynamics = (
             network_dynamics
             if network_dynamics is not None
@@ -321,11 +254,19 @@ class LightningRoutingEnv(gym.Env):
             )
         )
 
+        # ------------------------------------------------------
+        # Onion/router
+        # ------------------------------------------------------
+
         self.router = (
             router
             if router is not None
             else Router()
         )
+
+        # ------------------------------------------------------
+        # Payment simulator
+        # ------------------------------------------------------
 
         self.payment_simulator = (
             payment_simulator
@@ -333,16 +274,20 @@ class LightningRoutingEnv(gym.Env):
             else PaymentSimulator(
                 self.graph,
                 self.failure_model,
-                self.network_dynamics
+                self.network_dynamics,
             )
         )
+
+        # ------------------------------------------------------
+        # Partial backtracker
+        # ------------------------------------------------------
 
         self.backtracker = (
             backtracker
             if backtracker is not None
             else PartialBacktracker(
                 network=self.graph,
-                bucket=self.bucket
+                bucket=self.bucket,
             )
         )
 
@@ -356,33 +301,32 @@ class LightningRoutingEnv(gym.Env):
             else []
         )
 
-        # ------------------------------------------------------
+        # ======================================================
         # Gymnasium spaces
+        # ======================================================
+
+        # ------------------------------------------------------
+        # Action
+        #
+        # PPO controls eta in [0, 1].
         # ------------------------------------------------------
 
-        # Action:
-        # eta in [-1, 1]
         self.action_space = spaces.Box(
             low=np.array(
-                [-1.0],
-                dtype=np.float32
+                [self.ETA_LOW],
+                dtype=np.float32,
             ),
             high=np.array(
-                [1.0],
-                dtype=np.float32
+                [self.ETA_HIGH],
+                dtype=np.float32,
             ),
-            dtype=np.float32
+            dtype=np.float32,
         )
 
-        # State:
-        #
-        # k x feature_dim
-        #
-        # Default:
-        #
-        # 15 x 5
-        #
-        # Flattened for Stable-Baselines3.
+        # ------------------------------------------------------
+        # Observation
+        # ------------------------------------------------------
+
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -390,29 +334,30 @@ class LightningRoutingEnv(gym.Env):
                 self.k_neighbors *
                 self.feature_dim,
             ),
-            dtype=np.float32
+            dtype=np.float32,
         )
 
-        # ------------------------------------------------------
+        # ======================================================
         # Episode state
-        # ------------------------------------------------------
+        # ======================================================
 
         self.current_step = 0
 
         self.current_transaction = None
 
         self.source = None
-
         self.destination = None
-
         self.amount = 0.0
 
         self.current_state = None
 
+        # Node path
         self.current_route = None
 
-        self.current_bucket_id = None
+        # Exact edge representation
+        self.current_route_edges = None
 
+        self.current_bucket_id = None
         self.current_route_id = None
 
         self.attempt_id = 0
@@ -427,7 +372,7 @@ class LightningRoutingEnv(gym.Env):
         self,
         *,
         seed=None,
-        options=None
+        options=None,
     ):
         """
         Reset the environment.
@@ -442,6 +387,7 @@ class LightningRoutingEnv(gym.Env):
         )
 
         if seed is not None:
+
             self.seed_value = int(seed)
 
             self.np_random = np.random.default_rng(
@@ -449,19 +395,18 @@ class LightningRoutingEnv(gym.Env):
             )
 
         self.current_step = 0
-
         self.attempt_id = 0
 
         self.current_route = None
+        self.current_route_edges = None
 
         self.current_bucket_id = None
-
         self.current_route_id = None
 
         self.episode_history = []
 
         # ------------------------------------------------------
-        # Reset network state
+        # Reset network runtime state
         # ------------------------------------------------------
 
         try:
@@ -497,38 +442,27 @@ class LightningRoutingEnv(gym.Env):
         )
 
         # ------------------------------------------------------
-        # Build initial state
+        # Build state
         # ------------------------------------------------------
 
         self.current_state = (
             self._build_state(
                 self.source,
-                self.destination
+                self.destination,
             )
         )
 
         info = {
-
-            "source":
-                self.source,
-
-            "destination":
-                self.destination,
-
-            "amount":
-                self.amount,
-
-            "step":
-                self.current_step,
-
-            "attempt_id":
-                self.attempt_id
-
+            "source": self.source,
+            "destination": self.destination,
+            "amount": self.amount,
+            "step": self.current_step,
+            "attempt_id": self.attempt_id,
         }
 
         return (
             self.current_state,
-            info
+            info,
         )
 
     # ==========================================================
@@ -537,38 +471,47 @@ class LightningRoutingEnv(gym.Env):
 
     def step(
         self,
-        action
+        action,
     ):
         """
-        Execute one RL environment step.
+        Execute one environment step.
 
         Process:
 
             state
-              ↓
+              |
+              v
             eta
-              ↓
-            route provider
-              ↓
-            selected route
-              ↓
-            Onion
-              ↓
-            Payment Simulation
-              ↓
-            failure?
-              ↓
-            Partial Backtracking
-              ↓
-            reward
-              ↓
-            next state
+              |
+              v
+        route provider
+              |
+              v
+        Bucket-selected route
+              |
+              v
+           Onion
+              |
+              v
+        PaymentSimulator
+              |
+              v
+           failure?
+              |
+              v
+        PartialBacktracking
+              |
+              v
+           retry
+              |
+              v
+           reward
         """
 
         self.current_step += 1
 
         # ------------------------------------------------------
-        # Normalize action
+        # Parse eta
         # ------------------------------------------------------
 
         eta = self._parse_action(
@@ -576,7 +519,7 @@ class LightningRoutingEnv(gym.Env):
         )
 
         # ------------------------------------------------------
-        # Obtain route from routing layer
+        # Request route
         # ------------------------------------------------------
 
         routing_result = (
@@ -585,36 +528,40 @@ class LightningRoutingEnv(gym.Env):
             )
         )
 
-        route = (
-            routing_result.get("route")
-            if routing_result is not None
-            else None
+        if routing_result is None:
+            routing_result = {
+                "route": None,
+            }
+
+        route = routing_result.get(
+            "route"
         )
 
-        bucket_id = (
-            routing_result.get(
-                "bucket_id"
-            )
-            if routing_result is not None
-            else None
+        route_edges = routing_result.get(
+            "route_edges"
         )
 
-        route_id = (
-            routing_result.get(
-                "route_id"
-            )
-            if routing_result is not None
-            else None
+        bucket_id = routing_result.get(
+            "bucket_id"
+        )
+
+        route_id = routing_result.get(
+            "route_id"
         )
 
         # ------------------------------------------------------
-        # Route unavailable
+        # No route
         # ------------------------------------------------------
 
         if route is None:
 
             reward = 0.0
 
+            observation = self._build_state(
+                self.source,
+                self.destination,
+            )
+
             terminated = False
 
             truncated = (
@@ -622,28 +569,13 @@ class LightningRoutingEnv(gym.Env):
                 self.max_steps
             )
 
-            observation = self._build_state(
-                self.source,
-                self.destination
-            )
-
             info = {
-
-                "success":
-                    False,
-
-                "reason":
-                    "no_route",
-
-                "eta":
-                    eta,
-
-                "step":
-                    self.current_step,
-
-                "full_reroute_required":
-                    True
-
+                "success": False,
+                "reason": "no_route",
+                "eta": eta,
+                "step": self.current_step,
+                "attempt_id": self.attempt_id,
+                "full_reroute_required": True,
             }
 
             self.episode_history.append(
@@ -655,57 +587,54 @@ class LightningRoutingEnv(gym.Env):
                 reward,
                 terminated,
                 truncated,
-                info
+                info,
             )
 
         # ------------------------------------------------------
-        # Validate route
+        # Normalize route
+        # ------------------------------------------------------
+
+        route = self._normalize_route(
+            route
+        )
+
+        if route is None:
+
+            return self._failure_step(
+                reason="invalid_route",
+                eta=eta,
+                route=None,
+                payment_result={
+                    "success": False,
+                    "reason": "invalid_route",
+                },
+            )
+
+        # ------------------------------------------------------
+        # Normalize supplied edge representation
+        # ------------------------------------------------------
+
+        route_edges = self._normalize_route_edges(
+            route_edges
+        )
+
+        # ------------------------------------------------------
+        # Validate route + exact channel identity
         # ------------------------------------------------------
 
         if not self._validate_route(
-            route
+            route,
+            route_edges=route_edges,
         ):
 
-            reward = 0.0
-
-            observation = self._build_state(
-                self.source,
-                self.destination
-            )
-
-            terminated = False
-
-            truncated = (
-                self.current_step >=
-                self.max_steps
-            )
-
-            info = {
-
-                "success":
-                    False,
-
-                "reason":
-                    "invalid_route",
-
-                "eta":
-                    eta,
-
-                "route":
-                    route
-
-            }
-
-            self.episode_history.append(
-                info
-            )
-
-            return (
-                observation,
-                reward,
-                terminated,
-                truncated,
-                info
+            return self._failure_step(
+                reason="invalid_route",
+                eta=eta,
+                route=route,
+                payment_result={
+                    "success": False,
+                    "reason": "invalid_route",
+                },
             )
 
         # ------------------------------------------------------
@@ -716,13 +645,14 @@ class LightningRoutingEnv(gym.Env):
             route
         )
 
-        self.current_bucket_id = (
-            bucket_id
+        self.current_route_edges = (
+            list(route_edges)
+            if route_edges is not None
+            else None
         )
 
-        self.current_route_id = (
-            route_id
-        )
+        self.current_bucket_id = bucket_id
+        self.current_route_id = route_id
 
         # ------------------------------------------------------
         # Execute payment
@@ -731,18 +661,19 @@ class LightningRoutingEnv(gym.Env):
         payment_result = (
             self._execute_payment(
                 route=route,
+                route_edges=route_edges,
                 bucket_id=bucket_id,
-                route_id=route_id
+                route_id=route_id,
             )
         )
 
         # ------------------------------------------------------
-        # Successful payment
+        # Payment success
         # ------------------------------------------------------
 
         if payment_result.get(
             "success",
-            False
+            False,
         ):
 
             reward = self._calculate_reward(
@@ -751,42 +682,23 @@ class LightningRoutingEnv(gym.Env):
 
             observation = self._build_state(
                 self.source,
-                self.destination
+                self.destination,
             )
 
             terminated = True
-
             truncated = False
 
             info = {
-
-                "success":
-                    True,
-
-                "reason":
-                    "payment_success",
-
-                "eta":
-                    eta,
-
-                "route":
-                    route,
-
-                "bucket_id":
-                    bucket_id,
-
-                "route_id":
-                    route_id,
-
-                "attempt_id":
-                    self.attempt_id,
-
-                "reward":
-                    reward,
-
-                "payment":
-                    payment_result
-
+                "success": True,
+                "reason": "payment_success",
+                "eta": eta,
+                "route": route,
+                "route_edges": route_edges,
+                "bucket_id": bucket_id,
+                "route_id": route_id,
+                "attempt_id": self.attempt_id,
+                "reward": reward,
+                "payment": payment_result,
             }
 
             self.episode_history.append(
@@ -800,153 +712,250 @@ class LightningRoutingEnv(gym.Env):
                 reward,
                 terminated,
                 truncated,
-                info
+                info,
             )
 
-        # ------------------------------------------------------
-        # Payment failed
-        # ------------------------------------------------------
+        # ======================================================
+        # Initial payment failed
+        # ======================================================
 
         backtrack_result = (
             self._attempt_partial_backtracking(
                 route=route,
+                route_edges=route_edges,
                 payment_result=payment_result,
-                bucket_id=bucket_id
+                bucket_id=bucket_id,
             )
         )
 
-        # ------------------------------------------------------
+        # ======================================================
         # Alternative suffix found
-        # ------------------------------------------------------
+        # ======================================================
 
         if backtrack_result.get(
             "success",
-            False
+            False,
         ):
 
             new_route = (
-                backtrack_result[
-                    "new_route"
-                ]
-            )
-
-            self.attempt_id = (
                 backtrack_result.get(
-                    "attempt_id",
-                    self.attempt_id + 1
+                    "new_route"
+                )
+            )
+
+            new_route_edges = (
+                backtrack_result.get(
+                    "new_route_edges"
+                )
+            )
+
+            if new_route is not None:
+
+                new_route = self._normalize_route(
+                    new_route
+                )
+
+            new_route_edges = (
+                self._normalize_route_edges(
+                    new_route_edges
                 )
             )
 
             # --------------------------------------------------
-            # Rebuild Onion
+            # Exact channel identity is mandatory on MultiGraph
             # --------------------------------------------------
 
-            rebuild_result = (
-                self.router.rebuild(
-                    path=new_route,
-                    bucket_id=bucket_id,
-                    tx_id=self._transaction_id(),
-                    amount=self.amount,
-                    metadata=self.current_transaction,
-                    attempt_id=self.attempt_id,
-                    route_id=None
+            if (
+                new_route is None
+                or not self._validate_route(
+                    new_route,
+                    route_edges=new_route_edges,
                 )
-            )
-
-            if rebuild_result.get(
-                "success",
-                False
             ):
 
-                # ----------------------------------------------
-                # Execute alternative route
-                # ----------------------------------------------
+                payment_result = {
+                    "success": False,
+                    "reason": (
+                        "backtrack_route_missing_exact_channel"
+                    ),
+                    "failed_edge": (
+                        payment_result.get(
+                            "failed_edge"
+                        )
+                    ),
+                    "failure_index": (
+                        payment_result.get(
+                            "failure_index"
+                        )
+                    ),
+                }
 
-                retry_result = (
-                    self._execute_payment(
-                        route=new_route,
-                        bucket_id=bucket_id,
-                        route_id=None
+            else:
+
+                # --------------------------------------------------
+                # Backtracking attempt ID
+                # --------------------------------------------------
+
+                self.attempt_id = int(
+                    backtrack_result.get(
+                        "attempt_id",
+                        self.attempt_id + 1,
                     )
                 )
 
-                if retry_result.get(
+                # --------------------------------------------------
+                # Rebuild Onion
+                # --------------------------------------------------
+
+                rebuild_result = (
+                    self._rebuild_onion(
+                        route=new_route,
+                        bucket_id=bucket_id,
+                        route_id=None,
+                    )
+                )
+
+                if rebuild_result.get(
                     "success",
-                    False
+                    False,
                 ):
 
-                    reward = self._calculate_reward(
-                        retry_result
-                    )
+                    # ----------------------------------------------
+                    # Execute alternative route
+                    # ----------------------------------------------
 
-                    observation = (
-                        self._build_state(
-                            self.source,
-                            self.destination
+                    retry_result = (
+                        self._execute_payment(
+                            route=new_route,
+                            route_edges=new_route_edges,
+                            bucket_id=bucket_id,
+                            route_id=None,
                         )
                     )
 
-                    terminated = True
+                    if retry_result.get(
+                        "success",
+                        False,
+                    ):
 
-                    truncated = False
+                        self.current_route = list(
+                            new_route
+                        )
 
-                    info = {
+                        self.current_route_edges = (
+                            list(new_route_edges)
+                            if new_route_edges is not None
+                            else None
+                        )
 
-                        "success":
-                            True,
-
-                        "reason":
-                            "payment_success_after_partial_backtrack",
-
-                        "eta":
-                            eta,
-
-                        "original_route":
-                            route,
-
-                        "route":
-                            new_route,
-
-                        "bucket_id":
-                            bucket_id,
-
-                        "attempt_id":
-                            self.attempt_id,
-
-                        "backtrack":
-                            backtrack_result,
-
-                        "reward":
-                            reward,
-
-                        "payment":
+                        reward = self._calculate_reward(
                             retry_result
+                        )
 
+                        observation = self._build_state(
+                            self.source,
+                            self.destination,
+                        )
+
+                        terminated = True
+                        truncated = False
+
+                        info = {
+                            "success": True,
+                            "reason": (
+                                "payment_success_after_partial_backtrack"
+                            ),
+                            "eta": eta,
+                            "original_route": route,
+                            "original_route_edges": route_edges,
+                            "route": new_route,
+                            "route_edges": new_route_edges,
+                            "bucket_id": bucket_id,
+                            "attempt_id": self.attempt_id,
+                            "backtrack": backtrack_result,
+                            "reward": reward,
+                            "payment": retry_result,
+                        }
+
+                        self.episode_history.append(
+                            info
+                        )
+
+                        self.network_dynamics.update()
+
+                        return (
+                            observation,
+                            reward,
+                            terminated,
+                            truncated,
+                            info,
+                        )
+
+                    # ----------------------------------------------
+                    # Alternative route also failed
+                    # ----------------------------------------------
+
+                    payment_result = retry_result
+
+                else:
+
+                    payment_result = {
+                        "success": False,
+                        "reason": (
+                            "onion_rebuild_failed"
+                        ),
+                        "failed_edge": (
+                            payment_result.get(
+                                "failed_edge"
+                            )
+                        ),
+                        "failure_index": (
+                            payment_result.get(
+                                "failure_index"
+                            )
+                        ),
+                        "onion": rebuild_result,
                     }
 
-                    self.episode_history.append(
-                        info
-                    )
+        # ======================================================
+        # Failure after backtracking
+        # ======================================================
 
-                    self.network_dynamics.update()
+        return self._failure_step(
+            reason="payment_failed",
+            eta=eta,
+            route=route,
+            payment_result=payment_result,
+            bucket_id=bucket_id,
+            route_id=route_id,
+            route_edges=route_edges,
+            backtrack_result=backtrack_result,
+        )
 
-                    return (
-                        observation,
-                        reward,
-                        terminated,
-                        truncated,
-                        info
-                    )
+    # ==========================================================
+    # Failure-step helper
+    # ==========================================================
 
-                # ----------------------------------------------
-                # Alternative route also failed
-                # ----------------------------------------------
+    def _failure_step(
+        self,
+        reason,
+        eta,
+        route,
+        payment_result,
+        bucket_id=None,
+        route_id=None,
+        route_edges=None,
+        backtrack_result=None,
+    ):
+        """
+        Build a consistent failed Gymnasium step.
+        """
 
-                payment_result = retry_result
-
-        # ------------------------------------------------------
-        # Full reroute required
-        # ------------------------------------------------------
+        if backtrack_result is None:
+            backtrack_result = {
+                "success": False,
+                "full_reroute_required": True,
+            }
 
         reward = self._calculate_reward(
             payment_result
@@ -954,7 +963,7 @@ class LightningRoutingEnv(gym.Env):
 
         observation = self._build_state(
             self.source,
-            self.destination
+            self.destination,
         )
 
         terminated = False
@@ -965,46 +974,28 @@ class LightningRoutingEnv(gym.Env):
         )
 
         info = {
-
-            "success":
-                False,
-
-            "reason":
-                "payment_failed",
-
-            "eta":
-                eta,
-
-            "route":
-                route,
-
-            "attempt_id":
-                self.attempt_id,
-
-            "payment":
-                payment_result,
-
-            "backtrack":
-                backtrack_result,
-
-            "full_reroute_required":
+            "success": False,
+            "reason": reason,
+            "eta": eta,
+            "route": route,
+            "route_edges": route_edges,
+            "bucket_id": bucket_id,
+            "route_id": route_id,
+            "attempt_id": self.attempt_id,
+            "payment": payment_result,
+            "backtrack": backtrack_result,
+            "full_reroute_required": (
                 backtrack_result.get(
                     "full_reroute_required",
-                    True
-                ),
-
-            "reward":
-                reward
-
+                    True,
+                )
+            ),
+            "reward": reward,
         }
 
         self.episode_history.append(
             info
         )
-
-        # ------------------------------------------------------
-        # Evolve network
-        # ------------------------------------------------------
 
         self.network_dynamics.update()
 
@@ -1013,7 +1004,7 @@ class LightningRoutingEnv(gym.Env):
             reward,
             terminated,
             truncated,
-            info
+            info,
         )
 
     # ==========================================================
@@ -1022,24 +1013,14 @@ class LightningRoutingEnv(gym.Env):
 
     def _request_route(
         self,
-        eta
+        eta,
     ):
         """
-        Request a route from the external routing layer.
+        Request routing result.
 
-        The environment does not perform Dijkstra itself.
+        Fixed project Top-K = 5.
 
-        The route provider is responsible for:
-
-            eta
-              ↓
-            modified heuristic
-              ↓
-            candidate routes
-              ↓
-            Bucket
-              ↓
-            selected route
+        The environment never changes this to k_neighbors.
         """
 
         if self.route_provider is None:
@@ -1048,8 +1029,14 @@ class LightningRoutingEnv(gym.Env):
                 "route": None,
                 "bucket_id": None,
                 "route_id": None,
-                "reason": "route_provider_not_configured"
+                "reason": (
+                    "route_provider_not_configured"
+                ),
             }
+
+        # ------------------------------------------------------
+        # Preferred interface
+        # ------------------------------------------------------
 
         try:
 
@@ -1060,23 +1047,70 @@ class LightningRoutingEnv(gym.Env):
                 amount=self.amount,
                 eta=eta,
                 bucket=self.bucket,
-                k_candidates=self.k_neighbors
+                k_candidates=self.TOP_K,
             )
 
-        except TypeError:
+        except TypeError as exc:
 
-            # Backward-compatible interface.
+            # --------------------------------------------------
+            # Only fall back for genuine signature mismatch.
+            # We do not silently swallow arbitrary provider
+            # exceptions.
+            # --------------------------------------------------
+
+            message = str(exc)
+
+            signature_markers = (
+                "unexpected keyword",
+                "positional argument",
+                "required positional",
+                "got an unexpected",
+                "missing",
+            )
+
+            if not any(
+                marker in message
+                for marker in signature_markers
+            ):
+                raise
+
             result = self.route_provider(
                 self.graph,
                 self.source,
                 self.destination,
                 self.amount,
-                eta
+                eta,
             )
 
-        # ------------------------------------------------------
-        # Normalize route-provider output
-        # ------------------------------------------------------
+        return self._normalize_routing_result(
+            result
+        )
+
+    # ==========================================================
+    # Routing result normalization
+    # ==========================================================
+
+    def _normalize_routing_result(
+        self,
+        result,
+    ):
+        """
+        Normalize routing-layer output.
+
+        Supported:
+
+            list/tuple:
+                node path
+
+            dict:
+                {
+                    route,
+                    route_edges,
+                    bucket_id,
+                    route_id,
+                    ...
+                }
+        """
 
         if result is None:
 
@@ -1086,262 +1120,352 @@ class LightningRoutingEnv(gym.Env):
 
         if isinstance(
             result,
-            (list, tuple)
+            dict,
         ):
 
-            return {
-                "route": list(result)
-            }
+            normalized = dict(
+                result
+            )
+
+            route = normalized.get(
+                "route"
+            )
+
+            if route is not None:
+
+                route = self._normalize_route(
+                    route
+                )
+
+            normalized["route"] = route
+
+            normalized["route_edges"] = (
+                self._normalize_route_edges(
+                    normalized.get(
+                        "route_edges"
+                    )
+                )
+            )
+
+            return normalized
 
         if isinstance(
             result,
-            dict
+            (list, tuple),
         ):
 
-            return result
+            return {
+                "route": self._normalize_route(
+                    result
+                ),
+                "route_edges": None,
+            }
 
-        return {
-            "route": None,
-            "reason": "unsupported_route_provider_output"
-        }
+        raise TypeError(
+            "Unsupported route_provider output type: "
+            f"{type(result).__name__}"
+        )
 
     # ==========================================================
-    # Execute payment
+    # Payment execution
     # ==========================================================
 
     def _execute_payment(
         self,
         route,
+        route_edges=None,
         bucket_id=None,
-        route_id=None
+        route_id=None,
     ):
         """
-        Execute selected route.
+        Execute payment.
 
-        The Router is used to construct/validate Onion forwarding.
+        Exact route edge identity is preserved.
 
-        PaymentSimulator performs:
-
-            failure evaluation
-            fee
-            delay
-            carbon
-            settlement
+        For MultiGraph/MultiDiGraph, route_edges MUST contain
+        exact channel keys.
         """
 
         # ------------------------------------------------------
-        # Build Onion / forwarding representation
+        # Validate route
+        # ------------------------------------------------------
+
+        if not self._validate_route(
+            route,
+            route_edges=route_edges,
+        ):
+
+            return {
+                "success": False,
+                "reason": "invalid_route",
+                "failed_node": None,
+                "failed_edge": None,
+                "failure_index": None,
+                "visited_edges": [],
+                "fee": 0.0,
+                "delay": 0.0,
+                "carbon": 0.0,
+            }
+
+        # ------------------------------------------------------
+        # Build Onion
         # ------------------------------------------------------
 
         onion_result = self.router.route(
-
             path=route,
-
             bucket_id=(
                 bucket_id
                 if bucket_id is not None
                 else "DEFAULT"
             ),
-
             tx_id=self._transaction_id(),
-
             amount=self.amount,
-
             metadata=self.current_transaction,
-
             attempt_id=self.attempt_id,
-
-            route_id=route_id
-
+            route_id=route_id,
         )
-
-        # ------------------------------------------------------
-        # Onion itself failed
-        # ------------------------------------------------------
 
         if not onion_result.get(
             "success",
-            False
+            False,
         ):
 
             return {
-
-                "success":
-                    False,
-
-                "reason":
-                    onion_result.get(
-                        "reason",
-                        "onion_failure"
-                    ),
-
-                "failed_node":
-                    onion_result.get(
-                        "failed_node"
-                    ),
-
-                "failure_index":
-                    onion_result.get(
-                        "failure_index"
-                    ),
-
-                "visited_edges":
+                "success": False,
+                "reason": onion_result.get(
+                    "reason",
+                    "onion_failure",
+                ),
+                "failed_node": onion_result.get(
+                    "failed_node"
+                ),
+                "failed_edge": onion_result.get(
+                    "failed_edge"
+                ),
+                "failure_index": onion_result.get(
+                    "failure_index"
+                ),
+                "visited_edges": onion_result.get(
+                    "visited_edges",
                     [],
-
-                "fee":
-                    0.0,
-
-                "delay":
-                    0.0,
-
-                "carbon":
-                    0.0,
-
-                "onion":
-                    onion_result
-
+                ),
+                "fee": 0.0,
+                "delay": 0.0,
+                "carbon": 0.0,
+                "onion": onion_result,
             }
 
         # ------------------------------------------------------
-        # Convert node route to graph edges
+        # PaymentSimulator
         # ------------------------------------------------------
 
-        edges = self._route_edges(
-            route
+        result = self.payment_simulator.simulate_payment(
+            path=route,
+            edges=list(route_edges),
+            amount=self.amount,
+            tx_id=self._transaction_id(),
         )
 
         # ------------------------------------------------------
-        # Payment Simulation
-        # ------------------------------------------------------
-
-        result = (
-            self.payment_simulator.simulate_payment(
-                path=route,
-                edges=edges,
-                amount=self.amount,
-                tx_id=self._transaction_id()
-            )
-        )
-
-        # ------------------------------------------------------
-        # Convert PaymentResult if necessary
+        # Normalize PaymentResult
         # ------------------------------------------------------
 
         if hasattr(
             result,
-            "to_dict"
+            "to_dict",
         ):
 
             result = result.to_dict()
 
         elif not isinstance(
             result,
-            dict
+            dict,
         ):
 
             result = {
-                "success":
-                    bool(
-                        getattr(
-                            result,
-                            "success",
-                            False
-                        )
+                "success": bool(
+                    getattr(
+                        result,
+                        "success",
+                        False,
                     )
+                )
             }
 
-        # ------------------------------------------------------
-        # Attach Onion result
-        # ------------------------------------------------------
+        result = dict(
+            result
+        )
 
         result["onion"] = onion_result
+
+        # ------------------------------------------------------
+        # Preserve exact edges in environment-level result.
+        # ------------------------------------------------------
+
+        result.setdefault(
+            "path",
+            list(route),
+        )
+
+        result.setdefault(
+            "route_edges",
+            list(route_edges),
+        )
 
         return result
 
     # ==========================================================
-    # Partial Backtracking
+    # Onion rebuild
+    # ==========================================================
+
+    def _rebuild_onion(
+        self,
+        route,
+        bucket_id,
+        route_id,
+    ):
+        """
+        Rebuild Onion after partial backtracking.
+        """
+
+        return self.router.rebuild(
+            path=route,
+            bucket_id=(
+                bucket_id
+                if bucket_id is not None
+                else "DEFAULT"
+            ),
+            tx_id=self._transaction_id(),
+            amount=self.amount,
+            metadata=self.current_transaction,
+            attempt_id=self.attempt_id,
+            route_id=route_id,
+        )
+
+    # ==========================================================
+    # Partial backtracking
     # ==========================================================
 
     def _attempt_partial_backtracking(
         self,
         route,
+        route_edges,
         payment_result,
-        bucket_id=None
+        bucket_id=None,
     ):
         """
-        Invoke PartialBacktracker after payment failure.
+        Invoke PartialBacktracker.
+
+        This method does NOT modify Bucket.attempts.
+
+        Bucket.attempts must represent actual payment attempts.
         """
 
+        failed_edge = payment_result.get(
+            "failed_edge"
+        )
+
+        failure_index = payment_result.get(
+            "failure_index"
+        )
+
+        # ------------------------------------------------------
+        # Prefer exact route-edge information from payment result
+        # ------------------------------------------------------
+
         failed_edge = (
-            payment_result.get(
-                "failed_edge"
+            failed_edge
+            if failed_edge is not None
+            else None
+        )
+
+        try:
+
+            result = self.backtracker.backtrack(
+                route=route,
+                failed_edge=failed_edge,
+                failure_index=failure_index,
+                amount=self.amount,
+                bucket_id=bucket_id,
+                attempt_id=self.attempt_id,
             )
-        )
 
-        failure_index = (
-            payment_result.get(
-                "failure_index"
+        except TypeError as exc:
+
+            message = str(exc)
+
+            if (
+                "unexpected keyword" not in message
+                and "positional argument" not in message
+                and "required positional" not in message
+            ):
+                raise
+
+            result = self.backtracker.backtrack(
+                route,
+                failed_edge,
+                failure_index,
+                self.amount,
+                bucket_id,
+                self.attempt_id,
             )
-        )
 
-        return self.backtracker.backtrack(
+        if result is None:
 
-            route=route,
+            return {
+                "success": False,
+                "full_reroute_required": True,
+            }
 
-            failed_edge=failed_edge,
+        if not isinstance(
+            result,
+            dict,
+        ):
 
-            failure_index=failure_index,
+            raise TypeError(
+                "PartialBacktracker.backtrack() must "
+                "return a dictionary."
+            )
 
-            amount=self.amount,
-
-            bucket_id=bucket_id,
-
-            attempt_id=self.attempt_id
-
-        )
+        return result
 
     # ==========================================================
-    # State Construction
+    # State construction
     # ==========================================================
 
     def _build_state(
         self,
         source,
-        destination
+        destination,
     ):
         """
-        Build normalized local state matrix.
+        Build normalized local state.
 
-        Default:
+        Default configuration:
 
             k = 15
             m = 5
 
-            state = 15 x 5
+        IMPORTANT:
 
-        Features:
+        capacity and directional liquidity are kept
+        conceptually separate.
 
-            0. normalized capacity
-            1. normalized balance/liquidity
-            2. normalized fee
-            3. normalized delay
-            4. normalized availability
-
-        The matrix is flattened before being returned to
-        Stable-Baselines3.
+        Unknown directional liquidity is encoded as 0 rather
+        than being replaced by capacity.
         """
 
         nodes = self._sample_neighborhood(
             source=source,
-            destination=destination
+            destination=destination,
         )
 
         matrix = np.zeros(
             (
                 self.k_neighbors,
-                self.feature_dim
+                self.feature_dim,
             ),
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         for row, node in enumerate(
@@ -1351,29 +1475,25 @@ class LightningRoutingEnv(gym.Env):
             features = self._node_features(
                 node=node,
                 source=source,
-                destination=destination
+                destination=destination,
             )
 
             length = min(
                 len(features),
-                self.feature_dim
+                self.feature_dim,
             )
 
             matrix[
                 row,
-                :length
+                :length,
             ] = features[
                 :length
             ]
 
-        # ------------------------------------------------------
-        # Clip numerical noise
-        # ------------------------------------------------------
-
         matrix = np.clip(
             matrix,
             -1.0,
-            1.0
+            1.0,
         )
 
         self.current_state = (
@@ -1389,87 +1509,70 @@ class LightningRoutingEnv(gym.Env):
     def _sample_neighborhood(
         self,
         source,
-        destination
+        destination,
     ):
         """
-        Sample local neighborhood around source/destination.
-
-        The README uses a local observation rather than the
-        entire Lightning graph.
-
-        The reference configuration is k=15.
+        Deterministic local neighborhood selection.
         """
 
         selected = []
 
-        # ------------------------------------------------------
-        # Source first
-        # ------------------------------------------------------
-
         if source in self.graph:
-
             selected.append(source)
-
-        # ------------------------------------------------------
-        # Destination
-        # ------------------------------------------------------
 
         if (
             destination in self.graph
-            and
-            destination not in selected
+            and destination not in selected
         ):
-
             selected.append(destination)
-
-        # ------------------------------------------------------
-        # BFS around source
-        # ------------------------------------------------------
 
         try:
 
-            distances = nx.single_source_shortest_path_length(
-                self.graph.to_undirected(),
-                source,
-                cutoff=3
+            undirected = (
+                self.graph.to_undirected()
+                if self.graph.is_directed()
+                else self.graph
+            )
+
+            distances = (
+                nx.single_source_shortest_path_length(
+                    undirected,
+                    source,
+                    cutoff=3,
+                )
             )
 
             candidates = sorted(
                 distances.items(),
-                key=lambda x: (
-                    x[1],
-                    str(x[0])
-                )
+                key=lambda item: (
+                    item[1],
+                    str(item[0]),
+                ),
             )
 
             for node, _ in candidates:
 
                 if node not in selected:
-
                     selected.append(node)
 
                 if len(selected) >= self.k_neighbors:
-
                     break
 
-        except Exception:
+        except (
+            nx.NetworkXError,
+            TypeError,
+        ):
 
             pass
-
-        # ------------------------------------------------------
-        # Fill if necessary
-        # ------------------------------------------------------
 
         if len(selected) < self.k_neighbors:
 
             for node in self.graph.nodes:
 
                 if node not in selected:
-
                     selected.append(node)
 
                 if len(selected) >= self.k_neighbors:
-
                     break
 
         return selected[
@@ -1477,115 +1580,160 @@ class LightningRoutingEnv(gym.Env):
         ]
 
     # ==========================================================
-    # State features
+    # Node features
     # ==========================================================
 
     def _node_features(
         self,
         node,
         source,
-        destination
+        destination,
     ):
         """
-        Extract normalized node-level features.
+        Five normalized features:
 
-        Five reference features:
+            1. capacity
+            2. directional liquidity estimate
+            3. fee
+            4. delay
+            5. availability
 
-            capacity
-            liquidity
-            fee
-            delay
-            availability
+        capacity is NEVER used as liquidity.
         """
 
         capacity_values = []
-
         liquidity_values = []
-
         fee_values = []
-
         delay_values = []
-
         available_values = []
 
         try:
 
             if self.graph.is_directed():
 
-                edges = self.graph.out_edges(
-                    node,
-                    data=True
-                )
+                if self.graph.is_multigraph():
+
+                    edges = self.graph.out_edges(
+                        node,
+                        keys=True,
+                        data=True,
+                    )
+
+                else:
+
+                    edges = self.graph.out_edges(
+                        node,
+                        data=True,
+                    )
 
             else:
 
-                edges = self.graph.edges(
-                    node,
-                    data=True
-                )
+                if self.graph.is_multigraph():
+
+                    edges = self.graph.edges(
+                        node,
+                        keys=True,
+                        data=True,
+                    )
+
+                else:
+
+                    edges = self.graph.edges(
+                        node,
+                        data=True,
+                    )
 
             for edge in edges:
 
                 data = edge[-1]
 
-                capacity_values.append(
-                    self._safe_float(
-                        data.get(
-                            "capacity",
-                            0.0
-                        )
+                # --------------------------------------------------
+                # Capacity
+                # --------------------------------------------------
+
+                capacity = self._read_numeric(
+                    data.get(
+                        "capacity"
                     )
                 )
 
-                liquidity_values.append(
-                    self._safe_float(
-                        data.get(
-                            "balance_uv",
-                            data.get(
-                                "liquidity",
-                                data.get(
-                                    "capacity",
-                                    0.0
-                                )
-                            )
-                        )
+                if capacity is not None:
+                    capacity_values.append(
+                        capacity
+                    )
+
+                # --------------------------------------------------
+                # Directional liquidity
+                #
+                # IMPORTANT:
+                # no capacity fallback.
+                # --------------------------------------------------
+
+                liquidity = (
+                    self._read_directional_liquidity(
+                        data
                     )
                 )
 
-                fee_values.append(
-                    self._safe_float(
+                if liquidity is not None:
+                    liquidity_values.append(
+                        liquidity
+                    )
+
+                # --------------------------------------------------
+                # Fee
+                # --------------------------------------------------
+
+                fee = self._read_numeric(
+                    data.get(
+                        "fee_base_msat",
                         data.get(
-                            "fee_base_msat",
-                            data.get(
-                                "fee_base",
-                                0.0
-                            )
-                        )
+                            "fee_base"
+                        ),
                     )
                 )
 
-                delay_values.append(
-                    self._safe_float(
+                if fee is not None:
+                    fee_values.append(
+                        fee
+                    )
+
+                # --------------------------------------------------
+                # Delay
+                # --------------------------------------------------
+
+                delay = self._read_numeric(
+                    data.get(
+                        "delay",
                         data.get(
-                            "delay",
-                            data.get(
-                                "cltv_expiry_delta",
-                                0.0
-                            )
-                        )
+                            "cltv_expiry_delta"
+                        ),
                     )
                 )
+
+                if delay is not None:
+                    delay_values.append(
+                        delay
+                    )
+
+                # --------------------------------------------------
+                # Availability
+                # --------------------------------------------------
 
                 available_values.append(
                     1.0
                     if data.get(
                         "available",
-                        True
+                        True,
                     )
                     else 0.0
                 )
 
-        except Exception:
+        except (
+            KeyError,
+            TypeError,
+            nx.NetworkXError,
+        ):
 
             pass
 
@@ -1609,113 +1757,132 @@ class LightningRoutingEnv(gym.Env):
             available_values
         )
 
-        # ------------------------------------------------------
-        # Normalize individually
-        # ------------------------------------------------------
-
         capacity = self._normalize_capacity(
             capacity
         )
 
         liquidity = self._normalize_liquidity(
-            liquidity,
-            capacity
+            liquidity
         )
 
         fee = self._normalize_value(
             fee,
-            100000.0
+            100000.0,
         )
 
         delay = self._normalize_value(
             delay,
-            1000.0
+            1000.0,
         )
 
         # ------------------------------------------------------
-        # Encode source/destination relevance
+        # Source/destination indicators remain folded into
+        # existing five-feature representation.
         # ------------------------------------------------------
 
-        source_flag = (
-            1.0
-            if node == source
-            else 0.0
-        )
+        if node == source:
 
-        destination_flag = (
-            1.0
-            if node == destination
-            else 0.0
-        )
-
-        # ------------------------------------------------------
-        # Five core features
-        #
-        # capacity
-        # liquidity
-        # fee
-        # delay
-        # availability
-        #
-        # Source/destination flags are folded into
-        # capacity/liquidity signs to keep m=5.
-        # ------------------------------------------------------
-
-        if source_flag:
             capacity = min(
                 1.0,
-                capacity + 0.1
+                capacity + 0.1,
             )
 
-        if destination_flag:
+        if node == destination:
+
             liquidity = min(
                 1.0,
-                liquidity + 0.1
+                liquidity + 0.1,
             )
 
         return [
-
             float(
                 np.clip(
                     capacity,
                     -1.0,
-                    1.0
+                    1.0,
                 )
             ),
-
             float(
                 np.clip(
                     liquidity,
                     -1.0,
-                    1.0
+                    1.0,
                 )
             ),
-
             float(
                 np.clip(
                     fee,
                     -1.0,
-                    1.0
+                    1.0,
                 )
             ),
-
             float(
                 np.clip(
                     delay,
                     -1.0,
-                    1.0
+                    1.0,
                 )
             ),
-
             float(
                 np.clip(
                     availability,
                     -1.0,
-                    1.0
+                    1.0,
                 )
+            ),
+        ]
+
+    # ==========================================================
+    # Directional liquidity reader
+    # ==========================================================
+
+    @classmethod
+    def _read_directional_liquidity(
+        cls,
+        data,
+    ):
+        """
+        Read explicitly available directional liquidity.
+
+        Priority:
+
+            balance_uv
+            liquidity_uv
+            liquidity
+            estimated_liquidity
+
+        capacity is intentionally excluded.
+
+        None means unknown.
+        """
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            return None
+
+        for key in (
+            "balance_uv",
+            "liquidity_uv",
+            "liquidity",
+            "estimated_liquidity",
+        ):
+
+            if key not in data:
+                continue
+
+            value = cls._read_numeric(
+                data.get(key)
             )
 
-        ]
+            if value is not None:
+                return max(
+                    0.0,
+                    value,
+                )
+
+        return None
 
     # ==========================================================
     # Reward
@@ -1723,32 +1890,28 @@ class LightningRoutingEnv(gym.Env):
 
     def _calculate_reward(
         self,
-        payment_result
+        payment_result,
     ):
         """
-        Calculate README-compatible reward.
+        Success reward:
 
-        Reference formulation:
+            distance * reward_scale / carbon
 
-            Reward =
-                Success × Distance × 10^3
-                /
-                Sum(CO2)
+        Failure:
 
-        For failure:
-
-            Reward = 0
-
-        Distance is represented by the number of forwarding
-        hops in the selected route.
-
-        CO2 is obtained from the payment simulation.
+            0
         """
+
+        if not isinstance(
+            payment_result,
+            dict,
+        ):
+            return 0.0
 
         success = bool(
             payment_result.get(
                 "success",
-                False
+                False,
             )
         )
 
@@ -1757,32 +1920,30 @@ class LightningRoutingEnv(gym.Env):
 
         path = payment_result.get(
             "path",
-            self.current_route
+            self.current_route,
         )
 
         if path is None:
+
             distance = 0.0
+
         else:
+
             distance = float(
                 max(
                     0,
-                    len(path) - 1
+                    len(path) - 1,
                 )
             )
 
         carbon = self._safe_float(
             payment_result.get(
                 "carbon",
-                0.0
+                0.0,
             )
         )
 
-        # ------------------------------------------------------
-        # Avoid division by zero.
-        # ------------------------------------------------------
-
         if carbon <= 0.0:
-
             carbon = 1.0
 
         reward = (
@@ -1791,33 +1952,42 @@ class LightningRoutingEnv(gym.Env):
             carbon
         )
 
-        return float(reward)
+        return float(
+            reward
+        )
 
     # ==========================================================
-    # Action
+    # Action parsing
     # ==========================================================
 
     @staticmethod
     def _parse_action(
-        action
+        action,
     ):
         """
-        Convert Gymnasium action into scalar eta.
+        Convert Gymnasium action into eta in [0, 1].
         """
 
         value = np.asarray(
             action,
-            dtype=np.float32
+            dtype=np.float32,
         ).reshape(-1)
 
-        if len(value) == 0:
+        if value.size == 0:
+            return 0.0
+
+        eta = float(
+            value[0]
+        )
+
+        if not np.isfinite(eta):
             return 0.0
 
         return float(
             np.clip(
-                value[0],
-                -1.0,
-                1.0
+                eta,
+                0.0,
+                1.0,
             )
         )
 
@@ -1827,20 +1997,10 @@ class LightningRoutingEnv(gym.Env):
 
     def _select_transaction(
         self,
-        options
+        options,
     ):
         """
-        Select current transaction.
-
-        If options contains an explicit transaction, use it.
-
-        Otherwise select from the supplied transaction dataset.
-
-        Required transaction fields:
-
-            source
-            destination
-            amount
+        Select transaction.
         """
 
         if options is not None:
@@ -1870,7 +2030,7 @@ class LightningRoutingEnv(gym.Env):
         index = int(
             self.np_random.integers(
                 0,
-                len(self.transactions)
+                len(self.transactions),
             )
         )
 
@@ -1890,15 +2050,21 @@ class LightningRoutingEnv(gym.Env):
 
     @staticmethod
     def _validate_transaction(
-        transaction
+        transaction,
     ):
-        required = (
+        if not isinstance(
+            transaction,
+            dict,
+        ):
+            raise TypeError(
+                "transaction must be a dictionary."
+            )
+
+        for key in (
             "source",
             "destination",
-            "amount"
-        )
-
-        for key in required:
+            "amount",
+        ):
 
             if key not in transaction:
 
@@ -1906,19 +2072,27 @@ class LightningRoutingEnv(gym.Env):
                     f"Transaction missing field: {key}"
                 )
 
-        if transaction["source"] == transaction[
-            "destination"
-        ]:
+        if (
+            transaction["source"]
+            ==
+            transaction["destination"]
+        ):
 
             raise ValueError(
                 "Transaction source and destination "
                 "must be different."
             )
 
-        if float(
+        amount = float(
             transaction["amount"]
-        ) <= 0:
+        )
 
+        if not np.isfinite(amount):
+            raise ValueError(
+                "Transaction amount must be finite."
+            )
+
+        if amount <= 0.0:
             raise ValueError(
                 "Transaction amount must be positive."
             )
@@ -1927,11 +2101,9 @@ class LightningRoutingEnv(gym.Env):
     # Transaction ID
     # ==========================================================
 
-    def _transaction_id(self):
-        """
-        Return transaction identifier.
-        """
-
+    def _transaction_id(
+        self,
+    ):
         if self.current_transaction is None:
 
             return (
@@ -1943,82 +2115,70 @@ class LightningRoutingEnv(gym.Env):
                 "tx_id",
                 self.current_transaction.get(
                     "id",
-                    f"TX-{self.current_step}"
-                )
+                    f"TX-{self.current_step}",
+                ),
             )
         )
 
     # ==========================================================
-    # Route edges
+    # Route normalization
     # ==========================================================
 
-    def _route_edges(
-        self,
-        route
+    @staticmethod
+    def _normalize_route(
+        route,
     ):
         """
-        Convert node path into directed graph edges.
+        Normalize node path.
 
-        For MultiDiGraph the first available key is selected.
-
-        Exact edge keys can later be supplied by the routing
-        layer when the complete integration is implemented.
+        Edge dictionaries are not accepted as the node route.
+        Exact channel information belongs in route_edges.
         """
 
-        edges = []
+        if route is None:
+            return None
 
-        for u, v in zip(
-            route[:-1],
-            route[1:]
+        if not isinstance(
+            route,
+            (list, tuple),
         ):
+            return None
 
-            if not self.graph.has_edge(
-                u,
-                v
-            ):
+        result = list(
+            route
+        )
 
-                raise ValueError(
-                    f"Route contains nonexistent edge: "
-                    f"{u} -> {v}"
-                )
+        if len(result) < 2:
+            return None
 
-            if self.graph.is_multigraph():
+        return result
 
-                edge_data = (
-                    self.graph.get_edge_data(
-                        u,
-                        v
-                    )
-                )
+    # ==========================================================
+    # Route-edge normalization
+    # ==========================================================
 
-                if not edge_data:
+    @staticmethod
+    def _normalize_route_edges(
+        route_edges,
+    ):
+        """
+        Preserve exact routing edge representation.
+        """
 
-                    raise ValueError(
-                        f"No edge data for {u} -> {v}"
-                    )
+        if route_edges is None:
+            return None
 
-                key = next(
-                    iter(edge_data.keys())
-                )
+        if not isinstance(
+            route_edges,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "route_edges must be a list or tuple."
+            )
 
-                edges.append(
-                    (
-                        u,
-                        v,
-                        key
-                    )
-                )
-
-            else:
-
-                edges.append(
-                    (
-                        u,
-                        v
-                    )
-                )
-
-        return edges
+        return list(
+            route_edges
+        )
 
     # ==========================================================
     # Route validation
@@ -2026,24 +2186,38 @@ class LightningRoutingEnv(gym.Env):
 
     def _validate_route(
         self,
-        route
+        route,
+        route_edges=None,
     ):
         """
-        Validate selected route against current graph.
+        Validate route.
+
+        For MultiGraph/MultiDiGraph:
+
+            route_edges is mandatory.
+
+        The environment never chooses an arbitrary parallel
+        channel.
         """
 
         if not isinstance(
             route,
-            (list, tuple)
+            (list, tuple),
         ):
             return False
 
         if len(route) < 2:
             return False
 
-        if len(route) != len(
-            set(route)
-        ):
+        try:
+
+            if len(route) != len(
+                set(route)
+            ):
+                return False
+
+        except TypeError:
+
             return False
 
         if route[0] != self.source:
@@ -2052,119 +2226,269 @@ class LightningRoutingEnv(gym.Env):
         if route[-1] != self.destination:
             return False
 
-        for u, v in zip(
-            route[:-1],
-            route[1:]
+        # ------------------------------------------------------
+        # Simple graph
+        # ------------------------------------------------------
+
+        if not self.graph.is_multigraph():
+
+            for u, v in zip(
+                route[:-1],
+                route[1:],
+            ):
+
+                if not self.graph.has_edge(
+                    u,
+                    v,
+                ):
+                    return False
+
+            return True
+
+        # ------------------------------------------------------
+        # MultiGraph / MultiDiGraph
+        # ------------------------------------------------------
+
+        if route_edges is None:
+            return False
+
+        if len(route_edges) != len(route) - 1:
+            return False
+
+        for index, (
+            u,
+            v,
+        ) in enumerate(
+            zip(
+                route[:-1],
+                route[1:],
+            )
         ):
+
+            parsed = self._parse_edge(
+                route_edges[index]
+            )
+
+            if parsed is None:
+                return False
+
+            edge_u, edge_v, key = parsed
+
+            if edge_u != u or edge_v != v:
+                return False
+
+            if key is None:
+                return False
 
             if not self.graph.has_edge(
                 u,
-                v
+                v,
+                key,
             ):
                 return False
 
         return True
 
     # ==========================================================
+    # Edge parser
+    # ==========================================================
+
+    @staticmethod
+    def _parse_edge(
+        edge,
+    ):
+        """
+        Parse edge representation.
+
+        Supported dictionary forms:
+
+            {
+                source,
+                target,
+                channel_key
+            }
+
+            {
+                source,
+                target,
+                key
+            }
+
+        Supported tuples:
+
+            (u, v)
+            (u, v, key)
+        """
+
+        if isinstance(
+            edge,
+            dict,
+        ):
+
+            u = edge.get(
+                "source"
+            )
+
+            v = edge.get(
+                "target"
+            )
+
+            key = edge.get(
+                "channel_key"
+            )
+
+            if key is None:
+                key = edge.get(
+                    "key"
+                )
+
+            if u is None or v is None:
+                return None
+
+            return (
+                u,
+                v,
+                key,
+            )
+
+        if isinstance(
+            edge,
+            (tuple, list),
+        ):
+
+            if len(edge) == 2:
+
+                return (
+                    edge[0],
+                    edge[1],
+                    None,
+                )
+
+            if len(edge) == 3:
+
+                return (
+                    edge[0],
+                    edge[1],
+                    edge[2],
+                )
+
+        return None
+
+    # ==========================================================
     # Numeric helpers
     # ==========================================================
 
     @staticmethod
-    def _safe_float(
-        value
+    def _read_numeric(
+        value,
     ):
         try:
-            value = float(value)
 
-            if not np.isfinite(value):
-                return 0.0
+            number = float(
+                value
+            )
 
-            return value
+            if not np.isfinite(
+                number
+            ):
+                return None
+
+            return number
 
         except (
             TypeError,
-            ValueError
+            ValueError,
         ):
+
+            return None
+
+    @staticmethod
+    def _safe_float(
+        value,
+    ):
+        number = LightningRoutingEnv._read_numeric(
+            value
+        )
+
+        if number is None:
             return 0.0
+
+        return number
 
     @staticmethod
     def _aggregate(
-        values
+        values,
     ):
         if not values:
             return 0.0
 
         return float(
-            np.mean(values)
+            np.mean(
+                values
+            )
         )
 
     @staticmethod
     def _normalize_value(
         value,
-        scale
+        scale,
     ):
-        if scale <= 0:
+        if scale <= 0.0:
             return 0.0
 
         return float(
             np.clip(
                 value / scale,
                 0.0,
-                1.0
+                1.0,
             )
         )
 
     @staticmethod
     def _normalize_capacity(
-        value
+        value,
     ):
-        """
-        Capacity normalization.
-
-        Lightning capacities can vary substantially,
-        therefore log normalization is used.
-        """
-
         value = max(
             0.0,
-            float(value)
+            float(value),
         )
 
         return float(
             np.clip(
                 np.log1p(value) / 20.0,
                 0.0,
-                1.0
+                1.0,
             )
         )
 
     @staticmethod
     def _normalize_liquidity(
         liquidity,
-        normalized_capacity
     ):
         """
-        Convert liquidity to a relative representation.
+        Normalize known directional liquidity.
 
-        Since normalized_capacity is already bounded,
-        the liquidity value is conservatively clipped.
+        Unknown liquidity has already been represented as 0
+        by the caller. Capacity is never supplied here as a
+        fallback.
         """
 
         liquidity = max(
             0.0,
-            float(liquidity)
+            float(liquidity),
         )
 
-        # Relative scaling for Lightning-like amounts.
-        normalized = np.log1p(
-            liquidity
-        ) / 20.0
+        normalized = (
+            np.log1p(
+                liquidity
+            ) / 20.0
+        )
 
         return float(
             np.clip(
                 normalized,
                 0.0,
-                1.0
+                1.0,
             )
         )
 
@@ -2172,30 +2496,18 @@ class LightningRoutingEnv(gym.Env):
     # Render
     # ==========================================================
 
-    def render(self):
-        """
-        Optional textual rendering.
-        """
-
+    def render(
+        self,
+    ):
         print(
             {
-                "step":
-                    self.current_step,
-
-                "source":
-                    self.source,
-
-                "destination":
-                    self.destination,
-
-                "amount":
-                    self.amount,
-
-                "route":
-                    self.current_route,
-
-                "attempt_id":
-                    self.attempt_id
+                "step": self.current_step,
+                "source": self.source,
+                "destination": self.destination,
+                "amount": self.amount,
+                "route": self.current_route,
+                "route_edges": self.current_route_edges,
+                "attempt_id": self.attempt_id,
             }
         )
 
@@ -2203,11 +2515,9 @@ class LightningRoutingEnv(gym.Env):
     # Close
     # ==========================================================
 
-    def close(self):
-        """
-        Release environment resources.
-        """
-
+    def close(
+        self,
+    ):
         pass
 
 
@@ -2219,59 +2529,42 @@ LightningEnv = LightningRoutingEnv
 
 
 # ==============================================================
-# Simple integration test
+# Standalone integration test
 # ==============================================================
 
 if __name__ == "__main__":
 
     # ----------------------------------------------------------
-    # Create a small directed Lightning-like graph
+    # Small MultiDiGraph
     # ----------------------------------------------------------
 
     G = nx.MultiDiGraph()
 
     edges = [
-
         ("A", "B"),
         ("B", "C"),
         ("C", "D"),
-
-        # Alternative path
         ("B", "E"),
-        ("E", "D")
-
+        ("E", "D"),
     ]
 
-    for u, v in edges:
+    for index, (u, v) in enumerate(edges):
 
         G.add_edge(
-
             u,
             v,
-
+            key=index,
             capacity=10000,
-
             balance_uv=10000,
-
             balance_vu=10000,
-
             fee_base_msat=1000,
-
             fee_proportional_millionths=1,
-
             delay=10,
-
-            available=True
-
+            available=True,
         )
 
     # ----------------------------------------------------------
-    # Simple route provider
-    #
-    # This is only for testing the environment.
-    # Real implementation should be connected to:
-    #
-    # RL -> heuristic -> Pathfinding -> Bucket
+    # Exact route provider
     # ----------------------------------------------------------
 
     def test_route_provider(
@@ -2281,15 +2574,14 @@ if __name__ == "__main__":
         amount,
         eta,
         bucket=None,
-        k_candidates=15
+        k_candidates=5,
     ):
-
         try:
 
             route = nx.shortest_path(
                 graph,
                 source,
-                destination
+                destination,
             )
 
         except nx.NetworkXNoPath:
@@ -2298,17 +2590,45 @@ if __name__ == "__main__":
                 "route": None
             }
 
+        route_edges = []
+
+        for u, v in zip(
+            route[:-1],
+            route[1:],
+        ):
+
+            edge_data = graph.get_edge_data(
+                u,
+                v,
+            )
+
+            if not edge_data:
+                raise RuntimeError(
+                    f"Missing edge data for {u}->{v}"
+                )
+
+            # The test graph has exactly one channel
+            # for every pair, so this is deterministic.
+            key = next(
+                iter(edge_data)
+            )
+
+            route_edges.append(
+                {
+                    "source": u,
+                    "target": v,
+                    "channel_key": key,
+                    "data": dict(
+                        edge_data[key]
+                    ),
+                }
+            )
+
         return {
-
-            "route":
-                route,
-
-            "bucket_id":
-                "TEST_BUCKET",
-
-            "route_id":
-                "TEST_ROUTE"
-
+            "route": route,
+            "route_edges": route_edges,
+            "bucket_id": "TEST_BUCKET",
+            "route_id": "TEST_ROUTE",
         }
 
     # ----------------------------------------------------------
@@ -2316,23 +2636,12 @@ if __name__ == "__main__":
     # ----------------------------------------------------------
 
     transactions = [
-
         {
-
-            "tx_id":
-                "TX001",
-
-            "source":
-                "A",
-
-            "destination":
-                "D",
-
-            "amount":
-                1000
-
+            "tx_id": "TX001",
+            "source": "A",
+            "destination": "D",
+            "amount": 1000,
         }
-
     ]
 
     # ----------------------------------------------------------
@@ -2340,25 +2649,14 @@ if __name__ == "__main__":
     # ----------------------------------------------------------
 
     env = LightningRoutingEnv(
-
         graph=G,
-
-        route_provider=
-            test_route_provider,
-
-        transactions=
-            transactions,
-
+        route_provider=test_route_provider,
+        transactions=transactions,
         k_neighbors=15,
-
         feature_dim=5,
-
         gamma=0.99,
-
         max_steps=10,
-
-        seed=42
-
+        seed=42,
     )
 
     # ----------------------------------------------------------
@@ -2373,12 +2671,12 @@ if __name__ == "__main__":
 
     print(
         "Observation shape:",
-        observation.shape
+        observation.shape,
     )
 
     print(
         "Info:",
-        info
+        info,
     )
 
     # ----------------------------------------------------------
@@ -2386,12 +2684,18 @@ if __name__ == "__main__":
     # ----------------------------------------------------------
 
     action = np.array(
-        [0.0],
-        dtype=np.float32
+        [0.5],
+        dtype=np.float32,
     )
 
-    observation, reward, terminated, truncated, info = (
-        env.step(action)
+    (
+        observation,
+        reward,
+        terminated,
+        truncated,
+        info,
+    ) = env.step(
+        action
     )
 
     print("=" * 70)
@@ -2400,22 +2704,22 @@ if __name__ == "__main__":
 
     print(
         "Reward:",
-        reward
+        reward,
     )
 
     print(
         "Terminated:",
-        terminated
+        terminated,
     )
 
     print(
         "Truncated:",
-        truncated
+        truncated,
     )
 
     print(
         "Info:",
-        info
+        info,
     )
 
     env.close()

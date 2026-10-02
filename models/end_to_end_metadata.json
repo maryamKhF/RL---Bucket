@@ -4,7 +4,7 @@
     "training_mode": "FAST TRAINING",
     "fast_training": true,
     "timesteps": 16,
-    "training_time_seconds": 70.31501841545105,
+    "training_time_seconds": 77.56628680229187,
     "checkpointing_enabled": true,
     "checkpoint_frequency": 8,
     "checkpoint_directory": "C:\\Users\\ASUS\\Desktop\\PythonCodes\\RL + Bucket\\models\\checkpoints",
@@ -40,5 +40,5 @@
     "gae_lambda": 0.95,
     "clip_range": 0.2,
     "ent_coef": 0.01,
-    "timestamp": "2026-10-02 11:24:56"
+    "timestamp": "2026-10-02 11:37:13"
 }

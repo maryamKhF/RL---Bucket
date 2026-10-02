@@ -1,0 +1,14 @@
+
+====================================================================
+RL + BUCKET MAIN2 EXPERIMENT
+====================================================================
+Project root                          : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket
+Run started                           : 2026-10-02 19:59:32
+Route generation pool                 : 250
+Route pool retained                   : 50
+Bucket size                           : 5
+Maximum hops                          : 20
+Preferred hop lengths                 : 10 / 20
+Failure rate                          : 0.06
+Training transactions                 : 50
+Evaluation transactions               : 10

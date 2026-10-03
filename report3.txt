@@ -314,7 +314,7 @@ Evaluation seed                 : 1001080
 Configured edge failure rate    : 0.35
 PPO eta                         : 0.04125247150659561
 Top-K                           : 5
-Generated candidates            : 5
+Generatedش candidates            : 5
 Usable candidates               : 5
 Bucket size                     : 5
 Payment status                  : SUCCESS

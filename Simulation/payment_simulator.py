@@ -490,7 +490,8 @@ class PaymentSimulator:
         path,
         edges,
         amount,
-        tx_id=None
+        tx_id=None,
+        forwarded_prefix_length=0,
     ):
         """
         Execute exactly ONE payment attempt.
@@ -501,6 +502,11 @@ class PaymentSimulator:
             - no route selection
             - no backtracking
             - no rerouting
+
+        ``forwarded_prefix_length`` lets Bucket resume at a
+        locally selected branch point. The prefix remains part
+        of the payment and final settlement, but is not sent
+        through FailureModel a second time.
 
         Component exceptions are intentionally not swallowed.
         """
@@ -615,6 +621,17 @@ class PaymentSimulator:
                 tx_id
             )
 
+        if (
+            isinstance(forwarded_prefix_length, bool)
+            or not isinstance(forwarded_prefix_length, int)
+            or forwarded_prefix_length < 0
+            or forwarded_prefix_length >= len(edges)
+        ):
+            raise ValueError(
+                "forwarded_prefix_length must be an integer "
+                "in [0, len(edges))."
+            )
+
         metrics = self._calculate_metrics(
             edges,
             amount_value
@@ -637,19 +654,45 @@ class PaymentSimulator:
         #     data
         # ----------------------------------------------------
 
+        forwarding_path = path[
+            forwarded_prefix_length:
+        ]
+        forwarding_edges = edges[
+            forwarded_prefix_length:
+        ]
+
         failure = (
             self.failure_model
             .evaluate_payment_failure(
-                route=list(path),
+                route=list(forwarding_path),
                 amount=amount_value,
                 network=self.G,
-                route_edges=list(edges)
+                route_edges=list(forwarding_edges)
             )
         )
 
         self._validate_failure_model_result(
             failure
         )
+
+        if forwarded_prefix_length:
+            failure = dict(failure)
+            suffix_visited = self._validate_visited_edges(
+                failure.get("visited_edges", []),
+                forwarding_edges,
+            )
+            failure["visited_edges"] = (
+                list(edges[:forwarded_prefix_length])
+                + suffix_visited
+            )
+            suffix_failure_index = failure.get(
+                "failure_index"
+            )
+            if suffix_failure_index is not None:
+                failure["failure_index"] = (
+                    suffix_failure_index
+                    + forwarded_prefix_length
+                )
 
         # ----------------------------------------------------
         # Forwarding failed
@@ -787,6 +830,30 @@ class PaymentSimulator:
         return self._finalize_result(
             result,
             tx_id
+        )
+
+    def continue_payment(
+        self,
+        path,
+        edges,
+        amount,
+        forwarded_prefix_length,
+        tx_id=None,
+    ):
+        """Continue a Bucket payment from a previously reached node.
+
+        ``path`` and ``edges`` describe the complete logical payment
+        route. ``forwarded_prefix_length`` is the number of edges
+        already forwarded before the local branch point. That prefix
+        is included in validation, metrics, and settlement, while only
+        the remaining suffix is evaluated for forwarding.
+        """
+        return self.simulate_payment(
+            path=path,
+            edges=edges,
+            amount=amount,
+            tx_id=tx_id,
+            forwarded_prefix_length=forwarded_prefix_length,
         )
 
     # ========================================================

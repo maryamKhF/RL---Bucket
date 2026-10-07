@@ -17,10 +17,10 @@ class LNGraphBuilder:
         2. In-memory JSON-like data
         3. Synthetic Lightning topology
 
-    Carbon intensity is loaded from the geographic energy-mix
-    dataset and assigned to each node by country, then continent,
-    then world average. Snapshot RGB metadata is preserved only as
-    visual metadata and is never used to derive carbon intensity.
+    Carbon intensity is matched to node coordinates against an optional
+    GeoJSON spatial layer. Country, continent and world averages are explicit
+    lower-resolution fallbacks. Snapshot RGB metadata is never used to derive
+    carbon intensity.
 
     - Channel capacity is NOT treated as directional liquidity.
     - If directional balance/liquidity is not provided by the input,
@@ -126,7 +126,7 @@ class LNGraphBuilder:
                 "latitude",
                 n.get(
                     "lat",
-                    geo.get("latitude", 0.0)
+                    geo.get("latitude")
                 )
             )
 
@@ -134,12 +134,12 @@ class LNGraphBuilder:
                 "longitude",
                 n.get(
                     "lon",
-                    geo.get("longitude", 0.0)
+                    geo.get("longitude")
                 )
             )
 
             coordinate_text = geo.get("loc")
-            if coordinate_text and latitude == 0.0 and longitude == 0.0:
+            if coordinate_text and (latitude is None or longitude is None):
                 try:
                     latitude_text, longitude_text = str(coordinate_text).split(",", 1)
                     latitude = float(latitude_text)
@@ -168,8 +168,10 @@ class LNGraphBuilder:
                 None
             )
 
-            carbon_intensity, carbon_source, country_iso3 = (
-                self.carbon_dataset.lookup(
+            carbon_intensity, carbon_source, country_iso3, carbon_resolution, carbon_year = (
+                self.carbon_dataset.lookup_location(
+                    latitude=latitude,
+                    longitude=longitude,
                     country_code=country_code,
                     continent_code=continent_code,
                 )
@@ -202,13 +204,9 @@ class LNGraphBuilder:
                     country
                 ),
 
-                latitude=float(
-                    latitude
-                ),
+                latitude=float(latitude) if latitude is not None else 0.0,
 
-                longitude=float(
-                    longitude
-                ),
+                longitude=float(longitude) if longitude is not None else 0.0,
 
                 carbon_intensity=float(
                     carbon_intensity
@@ -240,6 +238,8 @@ class LNGraphBuilder:
                 "country_code_iso3": country_iso3,
                 "continent_code": continent_code,
                 "carbon_intensity_source": carbon_source,
+                "carbon_intensity_resolution": carbon_resolution,
+                "carbon_intensity_year": carbon_year,
             }
 
             G.add_node(
@@ -748,6 +748,8 @@ class LNGraphBuilder:
                     country_code=country_code,
                 )
             )
+            carbon_resolution = carbon_source
+            carbon_year = self.carbon_dataset.country_years.get(country_iso3)
             continent_code = self.carbon_dataset.continent_for(
                 country_code
             )
@@ -798,6 +800,8 @@ class LNGraphBuilder:
             G.nodes[node_id]["country_code_iso3"] = country_iso3
             G.nodes[node_id]["continent_code"] = continent_code
             G.nodes[node_id]["carbon_intensity_source"] = carbon_source
+            G.nodes[node_id]["carbon_intensity_resolution"] = carbon_resolution
+            G.nodes[node_id]["carbon_intensity_year"] = carbon_year
 
         # ------------------------------------------------------
         # Add Channel Attributes

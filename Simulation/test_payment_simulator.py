@@ -67,6 +67,45 @@ class SuccessFailureModel:
         }
 
 
+class RecordingRouteFailureModel(SuccessFailureModel):
+    def __init__(self):
+        super().__init__()
+        self.routes = []
+
+    def evaluate_payment_failure(
+        self,
+        route,
+        amount,
+        network,
+        route_edges=None,
+    ):
+        self.routes.append((list(route), list(route_edges)))
+        return super().evaluate_payment_failure(
+            route,
+            amount,
+            network,
+            route_edges,
+        )
+
+
+class SuffixFailureModel:
+    def evaluate_payment_failure(
+        self,
+        route,
+        amount,
+        network,
+        route_edges=None,
+    ):
+        return {
+            "success": False,
+            "reason": "channel_failure",
+            "failed_node": None,
+            "failed_edge": route_edges[0],
+            "failure_index": 0,
+            "visited_edges": [],
+        }
+
+
 class FailureModel:
     """FailureModel that returns a deterministic failure."""
 
@@ -1108,6 +1147,56 @@ def test_35_failure_propagation():
     ) == 0
 
 
+def test_36_bucket_continuation_forwards_only_suffix():
+    graph = make_graph()
+    failure_model = RecordingRouteFailureModel()
+    dynamics = RecordingNetworkDynamics()
+    simulator = PaymentSimulator(
+        graph,
+        failure_model,
+        dynamics,
+    )
+
+    result = simulator.continue_payment(
+        path=valid_path(),
+        edges=valid_edges(),
+        amount=1000,
+        tx_id="TX-CONTINUE",
+        forwarded_prefix_length=1,
+    )
+
+    assert result.success is True
+    assert result.path == valid_path()
+    assert result.visited_edges == valid_edges()
+    assert failure_model.routes == [
+        (["B", "C"], [("B", "C", 20)])
+    ]
+    assert dynamics.settlement_calls == [
+        (valid_edges(), 1000.0)
+    ]
+    assert dynamics.record_calls[0][0] == "TX-CONTINUE"
+
+
+def test_37_bucket_continuation_offsets_suffix_failure():
+    simulator = PaymentSimulator(
+        make_graph(),
+        SuffixFailureModel(),
+        RecordingNetworkDynamics(),
+    )
+
+    result = simulator.continue_payment(
+        path=valid_path(),
+        edges=valid_edges(),
+        amount=1000,
+        forwarded_prefix_length=1,
+    )
+
+    assert result.success is False
+    assert result.failure_index == 1
+    assert result.failed_edge == ("B", "C", 20)
+    assert result.visited_edges == [("A", "B", 10)]
+
+
 def test_36_failure_model_invalid_result_type():
 
     simulator = PaymentSimulator(
@@ -1808,6 +1897,14 @@ TESTS = [
     (
         "failure propagation",
         test_35_failure_propagation
+    ),
+    (
+        "Bucket continuation forwards suffix only",
+        test_36_bucket_continuation_forwards_only_suffix
+    ),
+    (
+        "Bucket suffix failure index is global",
+        test_37_bucket_continuation_offsets_suffix_failure
     ),
     (
         "invalid FailureModel result type",

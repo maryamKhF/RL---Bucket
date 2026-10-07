@@ -1513,14 +1513,38 @@ class RoutingEnv(gym.Env):
 
                     attempt_count += 1
 
-                    retry_result = (
-                        self.payment_simulator.simulate_payment(
+                    branch_index = backtrack_result.get(
+                        "branch_index"
+                    )
+
+                    continue_payment = getattr(
+                        self.payment_simulator,
+                        "continue_payment",
+                        None,
+                    )
+
+                    if callable(continue_payment):
+                        retry_result = continue_payment(
                             path=list(new_path),
                             edges=list(retry_edges),
                             amount=tx.amount,
                             tx_id=tx.tx_id,
+                            forwarded_prefix_length=(
+                                branch_index
+                            ),
                         )
-                    )
+                    else:
+                        # Lightweight test doubles and legacy
+                        # simulators may only expose the original
+                        # whole-route API.
+                        retry_result = (
+                            self.payment_simulator.simulate_payment(
+                                path=list(new_path),
+                                edges=list(retry_edges),
+                                amount=tx.amount,
+                                tx_id=tx.tx_id,
+                            )
+                        )
 
                     retry_dict = self._result_to_dict(
                         retry_result

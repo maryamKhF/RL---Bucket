@@ -1,4 +1,9 @@
-"""Country and continent carbon-intensity lookup for LN nodes."""
+"""Location-aware carbon-intensity lookup for Lightning Network nodes.
+
+An optional GeoJSON polygon layer provides location-specific values. The
+project's country energy-mix file remains a coarser fallback, so each result
+also carries its spatial resolution and reference year.
+"""
 
 import json
 import math
@@ -7,6 +12,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATASET_PATH = PROJECT_ROOT / "global_energy_mix.json"
+DEFAULT_SPATIAL_DATASET_PATH = PROJECT_ROOT / "carbon_intensity.geojson"
 
 # ISO-2 codes present in the project's geolocated Lightning snapshots.
 ISO2_TO_ISO3 = {
@@ -45,7 +51,7 @@ ISO2_CONTINENT_FALLBACK = {
 class CarbonIntensityDataset:
     """Resolve a node's intensity by country, continent, then world."""
 
-    def __init__(self, path=DEFAULT_DATASET_PATH):
+    def __init__(self, path=DEFAULT_DATASET_PATH, spatial_path=DEFAULT_SPATIAL_DATASET_PATH):
         self.path = Path(path)
         if not self.path.is_file():
             raise FileNotFoundError(
@@ -64,6 +70,7 @@ class CarbonIntensityDataset:
 
         self.country_intensities = {}
         self.country_continents = {}
+        self.country_years = {}
         for code, record in raw.items():
             if code in {"world_average", "continent_average"}:
                 continue
@@ -75,6 +82,9 @@ class CarbonIntensityDataset:
             )
             if len(normalized) == 3 and intensity is not None:
                 self.country_intensities[normalized] = intensity
+                self.country_years[normalized] = self._valid_year(
+                    record.get("year")
+                )
             continent = record.get("continent")
             if len(normalized) == 3 and isinstance(continent, str) and continent:
                 self.country_continents[normalized] = continent.strip().upper()
@@ -107,6 +117,52 @@ class CarbonIntensityDataset:
                     "Dataset has no valid country carbon-intensity values."
                 )
             self.world_average = sum(values) / len(values)
+
+        self.spatial_path = Path(spatial_path) if spatial_path else None
+        self.spatial_features = self._load_spatial_features(self.spatial_path)
+
+    @staticmethod
+    def _valid_year(value):
+        try:
+            year = int(value)
+        except (TypeError, ValueError):
+            return None
+        return year if 1800 <= year <= 2200 else None
+
+    @classmethod
+    def _load_spatial_features(cls, path):
+        if path is None or not path.is_file():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Could not read spatial carbon dataset: {path}") from exc
+        if not isinstance(raw, dict) or raw.get("type") != "FeatureCollection":
+            raise TypeError("Spatial carbon dataset must be a GeoJSON FeatureCollection.")
+
+        features = []
+        for feature in raw.get("features", []):
+            if not isinstance(feature, dict):
+                continue
+            properties = feature.get("properties") or {}
+            intensity = cls._finite_nonnegative(
+                properties.get("carbon_intensity", properties.get("intensity"))
+            )
+            geometry = feature.get("geometry") or {}
+            geometry_type = geometry.get("type")
+            coordinates = geometry.get("coordinates")
+            if intensity is None or geometry_type not in {"Polygon", "MultiPolygon"}:
+                continue
+            features.append({
+                "geometry_type": geometry_type,
+                "coordinates": coordinates,
+                "intensity": intensity,
+                "year": cls._valid_year(properties.get("year", raw.get("year"))),
+                "resolution": str(
+                    properties.get("spatial_resolution", raw.get("spatial_resolution", "polygon"))
+                ),
+            })
+        return features
 
     @staticmethod
     def _finite_nonnegative(value):
@@ -141,12 +197,95 @@ class CarbonIntensityDataset:
 
     def lookup(self, country_code=None, continent_code=None):
         """Return ``(gCO2/kWh, source, normalized_country_code)``."""
+        value, source, country, _resolution, _year = self.lookup_location(
+            country_code=country_code,
+            continent_code=continent_code,
+        )
+        return value, source, country
+
+    @staticmethod
+    def _point_in_ring(longitude, latitude, ring):
+        """Return whether a lon/lat point lies inside a GeoJSON linear ring."""
+        if not isinstance(ring, list) or len(ring) < 4:
+            return False
+        inside = False
+        previous = ring[-1]
+        for current in ring:
+            try:
+                x1, y1 = float(previous[0]), float(previous[1])
+                x2, y2 = float(current[0]), float(current[1])
+            except (TypeError, ValueError, IndexError):
+                previous = current
+                continue
+            if (y1 > latitude) != (y2 > latitude):
+                crossing = (x2 - x1) * (latitude - y1) / (y2 - y1) + x1
+                if longitude < crossing:
+                    inside = not inside
+            previous = current
+        return inside
+
+    @classmethod
+    def _point_in_polygon(cls, longitude, latitude, polygon):
+        if not isinstance(polygon, list) or not polygon:
+            return False
+        if not cls._point_in_ring(longitude, latitude, polygon[0]):
+            return False
+        return not any(
+            cls._point_in_ring(longitude, latitude, hole)
+            for hole in polygon[1:]
+        )
+
+    @classmethod
+    def _contains(cls, feature, longitude, latitude):
+        coordinates = feature["coordinates"]
+        if feature["geometry_type"] == "Polygon":
+            return cls._point_in_polygon(longitude, latitude, coordinates)
+        return any(
+            cls._point_in_polygon(longitude, latitude, polygon)
+            for polygon in coordinates or []
+        )
+
+    def lookup_location(
+        self,
+        latitude=None,
+        longitude=None,
+        country_code=None,
+        continent_code=None,
+    ):
+        """Return intensity, source, country, resolution and reference year.
+
+        Location polygons take precedence when valid coordinates are available.
+        Country, continent and world estimates are explicitly marked as such.
+        """
+        try:
+            lat = float(latitude)
+            lon = float(longitude)
+        except (TypeError, ValueError):
+            lat = lon = None
+        if (
+            lat is not None
+            and lon is not None
+            and math.isfinite(lat)
+            and math.isfinite(lon)
+            and -90.0 <= lat <= 90.0
+            and -180.0 <= lon <= 180.0
+        ):
+            for feature in self.spatial_features:
+                if self._contains(feature, lon, lat):
+                    return (
+                        feature["intensity"],
+                        "spatial",
+                        self.normalize_country_code(country_code),
+                        feature["resolution"],
+                        feature["year"],
+                    )
+
         country = self.normalize_country_code(country_code)
         if country in self.country_intensities:
             value = self.country_intensities[country]
             # Match the reference implementation's fallback for zero/missing data.
             if value > 0.0:
-                return value, "country", country
+                return value, "country", country, "country", self.country_years.get(country)
 
         continent = (
             str(continent_code).strip().upper()
@@ -156,6 +295,12 @@ class CarbonIntensityDataset:
         if continent is None:
             continent = self.continent_for(country_code)
         if continent in self.continent_averages:
-            return self.continent_averages[continent], "continent", country
+            return (
+                self.continent_averages[continent],
+                "continent",
+                country,
+                "continent",
+                None,
+            )
 
-        return self.world_average, "world", country
+        return self.world_average, "world", country, "world", None

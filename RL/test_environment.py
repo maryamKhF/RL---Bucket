@@ -222,6 +222,39 @@ class FakePaymentSimulator:
         }
 
 
+class FakeContinuingPaymentSimulator(FakePaymentSimulator):
+    def __init__(self, results):
+        super().__init__(results)
+        self.continuations = []
+
+    def continue_payment(
+        self,
+        path,
+        edges,
+        amount,
+        tx_id,
+        forwarded_prefix_length,
+    ):
+        self.continuations.append(
+            {
+                "path": list(path),
+                "edges": list(edges),
+                "amount": amount,
+                "tx_id": tx_id,
+                "forwarded_prefix_length": forwarded_prefix_length,
+            }
+        )
+        if self.results:
+            return self.results.pop(0)
+        return {
+            "success": False,
+            "fee": 0.0,
+            "delay": 0.0,
+            "carbon": 0.0,
+            "reason": "no_fake_result",
+        }
+
+
 class FakeNetworkDynamics:
     """
     Deterministic NetworkDynamics replacement.
@@ -1786,10 +1819,11 @@ class RoutingEnvironmentValidation(unittest.TestCase):
                 "reason": "partial_backtrack",
                 "new_route": alternative_path,
                 "new_edges": alternative_edges,
+                "branch_index": 1,
             },
         )
 
-        env.payment_simulator = FakePaymentSimulator(
+        env.payment_simulator = FakeContinuingPaymentSimulator(
             [
                 {
                     "success": False,
@@ -1835,9 +1869,17 @@ class RoutingEnvironmentValidation(unittest.TestCase):
                 alternative_path,
             )
 
+            self.assertEqual(len(env.payment_simulator.calls), 1)
+            self.assertEqual(len(env.payment_simulator.continuations), 1)
             self.assertEqual(
-                len(env.payment_simulator.calls),
-                2,
+                env.payment_simulator.continuations[0][
+                    "forwarded_prefix_length"
+                ],
+                1,
+            )
+            self.assertEqual(
+                env.payment_simulator.continuations[0]["path"],
+                alternative_path,
             )
 
             self.assertEqual(

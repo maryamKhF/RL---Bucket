@@ -537,6 +537,13 @@ try:
         NetworkDynamics,
     )
 
+    from Simulation.transaction_split import (
+        TRAIN_RATIO,
+        normalize_evaluation_count,
+        split_transaction_pool,
+        training_count_for_evaluation_count,
+    )
+
 except Exception as exc:
 
     write_bootstrap_error(exc)
@@ -1651,24 +1658,18 @@ def generate_evaluation_transactions(
         for transaction in transactions
     ]
 
-    # --------------------------------------------------------
-    # Assign evaluation transaction IDs explicitly.
-    #
-    # This does NOT change source, destination or amount.
-    # --------------------------------------------------------
-
-    for index, transaction in enumerate(
-        transactions,
-        start=1
-    ):
-
-        try:
-
-            transaction.tx_id = index
-
-        except Exception:
-
-            pass
+    # Independently generated evaluation rows get local IDs. When the
+    # evaluation rows came from the shared split pool, preserve their IDs
+    # so the train/test partition remains auditable in the report.
+    if source_transactions is None:
+        for index, transaction in enumerate(
+            transactions,
+            start=1
+        ):
+            try:
+                transaction.tx_id = index
+            except Exception:
+                pass
 
     return transactions
 
@@ -2523,14 +2524,18 @@ def main():
         # Resolve fast-smoke or full held-out evaluation size.
         # ----------------------------------------------------
 
-        evaluation_transaction_count = (
+        requested_evaluation_transaction_count = (
             get_evaluation_transaction_count(
                 cfg
             )
         )
 
-        if evaluation_transaction_count <= 0:
+        if requested_evaluation_transaction_count <= 0:
             raise RuntimeError("Evaluation transaction count must be positive.")
+
+        evaluation_transaction_count = normalize_evaluation_count(
+            requested_evaluation_transaction_count
+        )
 
         report.item(
             "Configuration",
@@ -2551,13 +2556,18 @@ def main():
         )
 
         report.item(
-            "Evaluation transactions",
+            "Requested evaluation transactions",
+            requested_evaluation_transaction_count
+        )
+
+        report.item(
+            "Effective held-out transactions",
             evaluation_transaction_count
         )
 
         report.item(
             "Evaluation transaction policy",
-            "CONFIGURED COUNT; HELD-OUT SPLIT IN NORMAL MODE"
+            "Target is adjusted to nearest count divisible by 3 for an exact 70/30 split"
         )
 
         complete_step(
@@ -2611,7 +2621,12 @@ def main():
         )
 
         report.item(
-            "Evaluation transactions",
+            "Requested evaluation transactions",
+            requested_evaluation_transaction_count
+        )
+
+        report.item(
+            "Effective held-out transactions",
             evaluation_transaction_count
         )
 
@@ -2807,21 +2822,18 @@ def main():
             cfg["n_transactions"]
         )
 
-        if FAST_VALIDATION:
+        train_count = training_count_for_evaluation_count(
+            evaluation_transaction_count
+        )
+        effective_transaction_count = (
+            train_count + evaluation_transaction_count
+        )
 
-            training_transaction_count = 1
-
-        else:
-
-            training_transaction_count = (
-                configured_transaction_count
-            )
-
-        training_transactions = generate_transactions(
+        transaction_pool = generate_transactions(
 
             G_train,
 
-            training_transaction_count,
+            effective_transaction_count,
 
             seed,
 
@@ -2831,81 +2843,109 @@ def main():
 
         )
 
-        train_ratio = float(
-            cfg["train_ratio"]
-        )
-
-        if FAST_VALIDATION:
-
-            train_count = min(
-                1,
-                len(training_transactions)
+        if len(transaction_pool) != effective_transaction_count:
+            raise RuntimeError(
+                f"Transaction generator returned {len(transaction_pool)} rows; "
+                f"the 70/30 split requires {effective_transaction_count}."
             )
 
-        else:
-
-            train_count = max(
-                1,
-                int(
-                    len(training_transactions)
-                    *
-                    train_ratio
-                )
-            )
-
-        train_tx = (
-            training_transactions[
-                :train_count
-            ]
+        train_tx, held_out_transactions = split_transaction_pool(
+            transaction_pool,
+            evaluation_transaction_count,
         )
 
         report.item(
-            "Configured transactions",
+            "Configured base transaction count",
             configured_transaction_count
         )
 
         report.item(
+            "Requested evaluation transactions",
+            requested_evaluation_transaction_count
+        )
+
+        report.item(
+            "Effective held-out transactions",
+            evaluation_transaction_count
+        )
+
+        report.item(
+            "Effective transaction pool",
+            len(transaction_pool)
+        )
+
+        report.item(
             "Generated transactions",
-            len(training_transactions)
+            len(transaction_pool)
         )
 
         report.item(
-            "Train ratio",
-            train_ratio
+            "Required training transactions",
+            train_count
         )
 
         report.item(
-            "Transactions used for PPO",
+            "Training share (integer split)",
+            f"{len(train_tx) / len(transaction_pool) * 100:.2f}%"
+        )
+
+        report.item(
+            "Evaluation share (integer split)",
+            f"{len(held_out_transactions) / len(transaction_pool) * 100:.2f}%"
+        )
+
+        report.item(
+            "Configured train_ratio",
+            cfg.get("train_ratio", "unspecified")
+        )
+
+        report.item(
+            "Applied train/test protocol",
+            f"EXACT {TRAIN_RATIO:.0%}/{1 - TRAIN_RATIO:.0%}; held-out count normalized to a multiple of 3"
+        )
+
+        report.item(
+            "Transactions supplied to PPO",
             len(train_tx)
+        )
+
+        report.item(
+            "Held-out transactions",
+            len(held_out_transactions)
         )
 
         if FAST_VALIDATION:
 
             report.item(
                 "Transaction generation mode",
-                "FAST VALIDATION - MINIMAL PPO TRAINING DATA"
+                "FAST VALIDATION - DISJOINT 70/30 TRAIN/TEST POOL"
             )
 
         else:
 
             report.item(
                 "Transaction generation mode",
-                "NORMAL TRAINING"
+                "NORMAL TRAINING - DISJOINT 70/30 TRAIN/TEST POOL"
             )
 
         print(
-            f"Configured transactions : "
+            f"Configured base pool    : "
             f"{configured_transaction_count}"
         )
 
         print(
-            f"Generated transactions  : "
-            f"{len(training_transactions)}"
+            f"Effective pool          : "
+            f"{len(transaction_pool)}"
         )
 
         print(
-            f"Transactions for PPO    : "
+            f"Train transactions      : "
             f"{len(train_tx)}"
+        )
+
+        print(
+            f"Held-out transactions   : "
+            f"{len(held_out_transactions)}"
         )
 
         complete_step(
@@ -3053,7 +3093,7 @@ def main():
                 )
 
                 fast_model_dir = (
-                    model_dir / "fast_validation"
+                    model_dir / "fast_validation_exact_70_30"
                 )
 
                 fast_cfg = copy.deepcopy(cfg)
@@ -3348,11 +3388,7 @@ def main():
 
                 evaluation_transaction_count,
 
-                source_transactions=(
-                    None
-                    if FAST_VALIDATION
-                    else training_transactions[train_count:]
-                ),
+                source_transactions=held_out_transactions,
 
             )
         )
@@ -3372,7 +3408,12 @@ def main():
             )
 
         report.item(
-            "Configured evaluation transactions",
+            "Requested evaluation transactions",
+            requested_evaluation_transaction_count
+        )
+
+        report.item(
+            "Effective evaluation transactions",
             evaluation_transaction_count
         )
 
@@ -3390,11 +3431,16 @@ def main():
 
         report.item(
             "Evaluation transaction policy",
-            f"{evaluation_transaction_count} configured transactions"
+            "Last rows of the single seeded pool; excluded from PPO training"
         )
 
         print(
-            f"Evaluation transactions requested : "
+            f"Evaluation transaction target     : "
+            f"{requested_evaluation_transaction_count}"
+        )
+
+        print(
+            f"Effective evaluation transactions : "
             f"{evaluation_transaction_count}"
         )
 
@@ -3411,8 +3457,8 @@ def main():
         )
 
         report.add(
-            "Source, destination and amount are generated "
-            "independently for the evaluation set."
+            "Training and evaluation transactions come from one seeded pool "
+            "and are split into disjoint 70/30 partitions."
         )
 
         report.add(

@@ -25,7 +25,9 @@ python main.py
 
 The training run writes the new model to `models/end_to_end_hidden_failure_blind.zip`, which is also the ablation runner's default model path.
 
-When `RL_FAST_VALIDATION=1` (the default), the end-to-end runner first tries that checkpoint. If it is missing or incompatible, it trains a 16-step PPO model under `models/fast_validation/` and continues the smoke run. Set `RL_QUICK_TIMESTEPS`, `RL_QUICK_N_STEPS`, and `RL_QUICK_BATCH_SIZE` to adjust this quick run. The model is kept separate from the research checkpoint, and the report marks the resulting metrics as smoke-validation output rather than scientific evidence.
+For every end-to-end run, training and evaluation are split from one seeded transaction pool with an exact 70/30 ratio. Because transaction counts are integers, the requested held-out count is rounded to the nearest positive multiple of three; for example, a target of 3,000 uses 7,000 training and 3,000 evaluation rows, while a target of 10 uses 21 training and 9 evaluation rows. The report shows both the requested target and effective count. This also applies in fast validation and when `RL_EVAL_TRANSACTIONS` is set. The held-out transactions are never supplied to PPO training.
+
+When `RL_FAST_VALIDATION=1` (the default), the end-to-end runner first tries the research checkpoint. If it is missing or incompatible, it trains a 16-step PPO model under `models/fast_validation_exact_70_30/` using the 70% training partition, then continues the smoke run. Set `RL_QUICK_TIMESTEPS`, `RL_QUICK_N_STEPS`, and `RL_QUICK_BATCH_SIZE` to adjust this quick run. The model is kept separate from the research checkpoint, and the report marks the resulting metrics as smoke-validation output rather than scientific evidence.
 
 Run a small smoke evaluation with:
 

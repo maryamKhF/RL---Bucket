@@ -2,7 +2,7 @@
 ================================================================
 RL + BUCKET END-TO-END EXECUTION REPORT
 ================================================================
-Run started                     : 2026-10-07 21:07:04
+Run started                     : 2026-10-07 22:34:06
 Execution mode                  : FAST VALIDATION
 Initial stage                   : Importing Pathfinding modules
 Overall progress                : 0.00%
@@ -18,8 +18,9 @@ Stage                           : STEP 0 - LOAD CONFIGURATION
 Configuration                   : SUCCESS
 Random seed                     : 42
 Execution mode                  : FAST VALIDATION
-Evaluation transactions         : 10
-Evaluation transaction policy   : CONFIGURED COUNT; HELD-OUT SPLIT IN NORMAL MODE
+Requested evaluation transactions: 10
+Effective held-out transactions : 9
+Evaluation transaction policy   : Target is adjusted to nearest count divisible by 3 for an exact 70/30 split
 Step completed                  : 0/10
 Progress                        : 0.00%
 Status                          : COMPLETED
@@ -30,8 +31,9 @@ RUN INFORMATION
 Snapshot                        : 20190501.gml.geo
 Snapshot path                   : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\20190501.gml.geo
 Random seed                     : 42
-Run started                     : 2026-10-07 21:07:04
-Evaluation transactions         : 10
+Run started                     : 2026-10-07 22:34:06
+Requested evaluation transactions: 10
+Effective held-out transactions : 9
 
 ================================================================
 STEP 1 - SNAPSHOT
@@ -68,11 +70,19 @@ STEP 3 - TRAINING TRANSACTIONS
 Step                            : 3/10
 Progress                        : 30.00%
 Stage                           : STEP 3 - GENERATE TRAINING TRANSACTIONS
-Configured transactions         : 10000
-Generated transactions          : 1
-Train ratio                     : 0.7
-Transactions used for PPO       : 1
-Transaction generation mode     : FAST VALIDATION - MINIMAL PPO TRAINING DATA
+Configured base transaction count: 10000
+Requested evaluation transactions: 10
+Effective held-out transactions : 9
+Effective transaction pool      : 30
+Generated transactions          : 30
+Required training transactions  : 21
+Training share (integer split)  : 70.00%
+Evaluation share (integer split): 30.00%
+Configured train_ratio          : 0.7
+Applied train/test protocol     : EXACT 70%/30%; held-out count normalized to a multiple of 3
+Transactions supplied to PPO    : 21
+Held-out transactions           : 9
+Transaction generation mode     : FAST VALIDATION - DISJOINT 70/30 TRAIN/TEST POOL
 Step completed                  : 3/10
 Progress                        : 30.00%
 Status                          : TRAINING TRANSACTIONS READY
@@ -102,13 +112,31 @@ After the model is created, use fast validation:
 
     set RL_FAST_VALIDATION=1
     py main.py
-Checkpoint status               : COMPATIBLE QUICK VALIDATION MODEL LOADED
-Model provenance                : Previously trained quick-validation model
-Model                           : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\models\fast_validation\end_to_end_hidden_failure_blind.zip
-Training time (seconds)         : 0.0
+Quick checkpoint status         : MISSING OR INCOMPATIBLE; QUICK TRAINING STARTED
+Quick checkpoint load error     : FileNotFoundError: Existing PPO model was not found.
 
-The research checkpoint was unavailable, so a compatible model from the isolated fast-validation directory was reused. Its results remain smoke validation only.
-Model load time (seconds)       : 2.8584
+Expected model:
+C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\models\fast_validation_exact_70_30\end_to_end_hidden_failure_blind.zip
+
+To create the model, run normal training once:
+
+    set RL_FAST_VALIDATION=0
+    py main.py
+
+After the model is created, use fast validation:
+
+    set RL_FAST_VALIDATION=1
+    py main.py
+PPO training                    : QUICK VALIDATION TRAINING
+Training transactions           : 21
+Model output                    : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\models\fast_validation_exact_70_30\end_to_end_hidden_failure_blind.zip
+Training status                 : SUCCESS - QUICK VALIDATION ONLY
+Training time (seconds)         : 99.7061
+Model provenance                : Fresh quick PPO model; isolated from the research checkpoint
+Model                           : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\models\fast_validation_exact_70_30\end_to_end_hidden_failure_blind.zip
+
+This quick model is trained only to validate the end-to-end software path. Its results are not a research evaluation and it does not overwrite the normal-training checkpoint.
+Model load time (seconds)       : 0.0
 PPO checkpoint loader           : PROJECT-LOCAL ZIP/BytesIO COMPATIBILITY
 Step completed                  : 4/10
 Progress                        : 40.00%
@@ -120,30 +148,30 @@ STEP 5 - PAYMENT SCENARIOS
 Step                            : 5/10
 Progress                        : 50.00%
 Stage                           : STEP 5 - GENERATE PAYMENT SCENARIOS
-Configured evaluation transactions: 10
-Generated evaluation transactions: 10
+Requested evaluation transactions: 10
+Effective evaluation transactions: 9
+Generated evaluation transactions: 9
 Evaluation seed                 : 1042
-Evaluation transaction policy   : 10 configured transactions
+Evaluation transaction policy   : Last rows of the single seeded pool; excluded from PPO training
 
 Each evaluation transaction is executed independently.
-Source, destination and amount are generated independently for the evaluation set.
+Training and evaluation transactions come from one seeded pool and are split into disjoint 70/30 partitions.
 The same trained PPO model is reused, but PPO makes exactly one prediction for each transaction.
 Each transaction receives its own evaluation graph, failure model and network dynamics instance.
 
 Evaluation transaction list:
-Transaction #1                  : id=1, source=3590, destination=1175, amount=1000.0
-Transaction #2                  : id=2, source=490, destination=569, amount=1000.0
-Transaction #3                  : id=3, source=2090, destination=889, amount=3449.831535783569
-Transaction #4                  : id=4, source=2933, destination=1713, amount=1000.0
-Transaction #5                  : id=5, source=1655, destination=144, amount=1000.0
-Transaction #6                  : id=6, source=2779, destination=439, amount=1706.365507537219
-Transaction #7                  : id=7, source=1173, destination=1745, amount=1000.0
-Transaction #8                  : id=8, source=3683, destination=2483, amount=1000.0
-Transaction #9                  : id=9, source=1385, destination=3739, amount=2384.2035440714913
-Transaction #10                 : id=10, source=1788, destination=1511, amount=2978.903171972128
+Transaction #1                  : id=21, source=3738, destination=858, amount=1000.0
+Transaction #2                  : id=22, source=15, destination=1467, amount=1000.0
+Transaction #3                  : id=23, source=1250, destination=732, amount=6982.61650934373
+Transaction #4                  : id=24, source=2970, destination=960, amount=1000.0
+Transaction #5                  : id=25, source=3568, destination=1806, amount=1235.6275573680016
+Transaction #6                  : id=26, source=1711, destination=1441, amount=2804.853770144356
+Transaction #7                  : id=27, source=144, destination=752, amount=1000.0
+Transaction #8                  : id=28, source=1168, destination=1006, amount=1000.0
+Transaction #9                  : id=29, source=2559, destination=763, amount=1000.0
 Step completed                  : 5/10
 Progress                        : 50.00%
-Status                          : 10 PAYMENT SCENARIOS READY
+Status                          : 9 PAYMENT SCENARIOS READY
 
 ================================================================
 STEP 6 - EVALUATION GRAPHS
@@ -173,7 +201,7 @@ Failure model                   : One independent instance per transaction
 Payment simulator               : Created internally by RoutingEnv from the transaction-specific failure model and dynamics
 PPO runtime environment         : One independent RoutingEnv per transaction
 PPO model                       : One shared trained/loaded model
-Evaluation count                : 10
+Evaluation count                : 9
 PPO predictions per transaction : 1
 Top-K                           : 5 (fixed by RoutingEnv)
 Bucket candidates               : Up to 5 candidates per transaction
@@ -187,8 +215,8 @@ STEP 8 - PPO ROUTING DECISIONS
 Step                            : 8/10
 Progress                        : 80.00%
 Stage                           : STEP 8 - PPO ROUTING DECISIONS
-Transactions                    : 10
-Expected PPO predictions        : 10
+Transactions                    : 9
+Expected PPO predictions        : 9
 Expected PPO predictions per transaction: 1
 Top-K                           : 5
 PPO action                      : eta only
@@ -217,49 +245,49 @@ No successful Bucket candidate is predetermined.
 The successful candidate may therefore be #1, #2, #3, #4, #5, or no candidate if the Bucket is exhausted.
 
 ================================================================
-EVALUATION TRANSACTION 1/10
+EVALUATION TRANSACTION 1/9
 ================================================================
-Transaction ID                  : 1
-Source                          : 3590
-Destination                     : 1175
+Transaction ID                  : 21
+Source                          : 3738
+Destination                     : 858
 Payment amount                  : 1000.0
 Evaluation seed                 : 1044
 PPO predictions                 : 1
-PPO eta                         : 0.00815781019628048
+PPO eta                         : 0.006432238966226578
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
 Bucket size                     : 5
 Payment status                  : SUCCESS
-Attempts                        : 1
-Backtracks                      : 0
-Partial backtracks              : 0
+Attempts                        : 7
+Backtracks                      : 6
+Partial backtracks              : 6
 Successful partial backtracks   : 0
-Full reroutes                   : 0
-Successful Bucket route         : 1 / 5
+Full reroutes                   : 1
+Successful Bucket route         : 2 / 5
 Successful route source         : bucket_candidate
-Failure probability             : 0.0
-Fee                             : 1002.001
-Delay                           : 174.0
-Carbon                          : 376.28974384236454
-Reward                          : 2.657526590517228
+Failure probability             : 1.0
+Fee                             : 2000.0049999999999
+Delay                           : 322.0
+Carbon                          : 373.0438926108374
+Reward                          : 2.6806497031790535
 Reason                          : success
-Hops                            : 2
-Prediction time (seconds)       : 0.002623
-Pipeline time (seconds)         : 3.3519
-Total transaction time (seconds): 7.4778
-Final path                      : 3590 -> 2107 -> 1175
+Hops                            : 4
+Prediction time (seconds)       : 0.0
+Pipeline time (seconds)         : 9.26
+Total transaction time (seconds): 14.3188
+Final path                      : 3738 -> 1777 -> 3677 -> 1797 -> 858
 
 ================================================================
-EVALUATION TRANSACTION 2/10
+EVALUATION TRANSACTION 2/9
 ================================================================
-Transaction ID                  : 2
-Source                          : 490
-Destination                     : 569
+Transaction ID                  : 22
+Source                          : 15
+Destination                     : 1467
 Payment amount                  : 1000.0
 Evaluation seed                 : 1045
 PPO predictions                 : 1
-PPO eta                         : 0.009034290909767151
+PPO eta                         : 0.010427401401102543
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
@@ -273,61 +301,61 @@ Full reroutes                   : 0
 Successful Bucket route         : 1 / 5
 Successful route source         : bucket_candidate
 Failure probability             : 0.0
-Fee                             : 1002.004
+Fee                             : 1002.0039999999999
 Delay                           : 208.0
-Carbon                          : 379.571
-Reward                          : 2.634553219292306
+Carbon                          : 377.94220000000007
+Reward                          : 2.645907231317381
 Reason                          : success
 Hops                            : 4
-Prediction time (seconds)       : 0.000989
-Pipeline time (seconds)         : 3.9398
-Total transaction time (seconds): 7.9626
-Final path                      : 490 -> 2086 -> 1922 -> 859 -> 569
+Prediction time (seconds)       : 0.001046
+Pipeline time (seconds)         : 5.029
+Total transaction time (seconds): 10.6199
+Final path                      : 15 -> 1626 -> 2088 -> 2086 -> 1467
 
 ================================================================
-EVALUATION TRANSACTION 3/10
+EVALUATION TRANSACTION 3/9
 ================================================================
-Transaction ID                  : 3
-Source                          : 2090
-Destination                     : 889
-Payment amount                  : 3449.831535783569
+Transaction ID                  : 23
+Source                          : 1250
+Destination                     : 732
+Payment amount                  : 6982.61650934373
 Evaluation seed                 : 1046
 PPO predictions                 : 1
-PPO eta                         : 0.012673122808337212
+PPO eta                         : 0.007616774644702673
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
 Bucket size                     : 5
-Payment status                  : FAILED
-Attempts                        : 5
-Backtracks                      : 5
-Partial backtracks              : 5
+Payment status                  : SUCCESS
+Attempts                        : 1
+Backtracks                      : 0
+Partial backtracks              : 0
 Successful partial backtracks   : 0
 Full reroutes                   : 0
-Successful Bucket route         : NONE
-Successful route source         : none
-Failure probability             : 1.0
-Fee                             : 0.0
-Delay                           : 0.0
-Carbon                          : 0.0
-Reward                          : 0.0
-Reason                          : full_reroute_failed
-Hops                            : 0
-Prediction time (seconds)       : 0.000583
-Pipeline time (seconds)         : 6.8403
-Total transaction time (seconds): 11.3664
-Final path                      : NONE
+Successful Bucket route         : 1 / 5
+Successful route source         : bucket_candidate
+Failure probability             : 0.0
+Fee                             : 0.03491308254671865
+Delay                           : 64.0
+Carbon                          : 389.21455788177343
+Reward                          : 2.56927697011723
+Reason                          : success
+Hops                            : 3
+Prediction time (seconds)       : 0.009145
+Pipeline time (seconds)         : 6.8011
+Total transaction time (seconds): 13.0212
+Final path                      : 1250 -> 1697 -> 1349 -> 732
 
 ================================================================
-EVALUATION TRANSACTION 4/10
+EVALUATION TRANSACTION 4/9
 ================================================================
-Transaction ID                  : 4
-Source                          : 2933
-Destination                     : 1713
+Transaction ID                  : 24
+Source                          : 2970
+Destination                     : 960
 Payment amount                  : 1000.0
 Evaluation seed                 : 1047
 PPO predictions                 : 1
-PPO eta                         : 0.005299386568367481
+PPO eta                         : 0.01250382512807846
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
@@ -341,27 +369,27 @@ Full reroutes                   : 0
 Successful Bucket route         : 1 / 5
 Successful route source         : bucket_candidate
 Failure probability             : 0.0
-Fee                             : 0.004
-Delay                           : 60.0
-Carbon                          : 268.7476666666667
-Reward                          : 3.720962538589482
+Fee                             : 1000.0529999999999
+Delay                           : 204.0
+Carbon                          : 389.21455788177343
+Reward                          : 2.56927697011723
 Reason                          : success
-Hops                            : 2
-Prediction time (seconds)       : 0.001334
-Pipeline time (seconds)         : 2.9008
-Total transaction time (seconds): 7.2753
-Final path                      : 2933 -> 2116 -> 1713
+Hops                            : 3
+Prediction time (seconds)       : 0.001047
+Pipeline time (seconds)         : 4.5379
+Total transaction time (seconds): 10.2783
+Final path                      : 2970 -> 2108 -> 3680 -> 960
 
 ================================================================
-EVALUATION TRANSACTION 5/10
+EVALUATION TRANSACTION 5/9
 ================================================================
-Transaction ID                  : 5
-Source                          : 1655
-Destination                     : 144
-Payment amount                  : 1000.0
+Transaction ID                  : 25
+Source                          : 3568
+Destination                     : 1806
+Payment amount                  : 1235.6275573680016
 Evaluation seed                 : 1048
 PPO predictions                 : 1
-PPO eta                         : 0.006435198709368706
+PPO eta                         : 0.014924448914825916
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
@@ -370,32 +398,32 @@ Payment status                  : SUCCESS
 Attempts                        : 2
 Backtracks                      : 1
 Partial backtracks              : 1
-Successful partial backtracks   : 0
+Successful partial backtracks   : 1
 Full reroutes                   : 0
-Successful Bucket route         : 2 / 5
-Successful route source         : bucket_candidate
+Successful Bucket route         : PARTIAL BACKTRACK
+Successful route source         : partial_backtrack
 Failure probability             : 0.0
-Fee                             : 1002.004
-Delay                           : 208.0
-Carbon                          : 324.2982
-Reward                          : 3.0835817158405443
-Reason                          : success
-Hops                            : 4
-Prediction time (seconds)       : 0.001158
-Pipeline time (seconds)         : 4.678
-Total transaction time (seconds): 9.2594
-Final path                      : 1655 -> 1920 -> 2107 -> 2064 -> 144
+Fee                             : 1000.003706882672
+Delay                           : 164.0
+Carbon                          : 388.4195578817734
+Reward                          : 2.57453565277055
+Reason                          : partial_backtrack_success
+Hops                            : 3
+Prediction time (seconds)       : 0.00097
+Pipeline time (seconds)         : 5.5156
+Total transaction time (seconds): 11.39
+Final path                      : 3568 -> 1456 -> 1858 -> 1806
 
 ================================================================
-EVALUATION TRANSACTION 6/10
+EVALUATION TRANSACTION 6/9
 ================================================================
-Transaction ID                  : 6
-Source                          : 2779
-Destination                     : 439
-Payment amount                  : 1706.365507537219
+Transaction ID                  : 26
+Source                          : 1711
+Destination                     : 1441
+Payment amount                  : 2804.853770144356
 Evaluation seed                 : 1049
 PPO predictions                 : 1
-PPO eta                         : 0.00940903089940548
+PPO eta                         : 0.008968349546194077
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
@@ -404,32 +432,32 @@ Payment status                  : SUCCESS
 Attempts                        : 2
 Backtracks                      : 1
 Partial backtracks              : 1
-Successful partial backtracks   : 0
+Successful partial backtracks   : 1
 Full reroutes                   : 0
-Successful Bucket route         : 2 / 5
-Successful route source         : bucket_candidate
+Successful Bucket route         : PARTIAL BACKTRACK
+Successful route source         : partial_backtrack
 Failure probability             : 0.0
-Fee                             : 1669.0409527721808
-Delay                           : 344.0
-Carbon                          : 103.54346164672765
-Reward                          : 9.657780260542445
-Reason                          : success
-Hops                            : 6
-Prediction time (seconds)       : 0.001403
-Pipeline time (seconds)         : 2.4956
-Total transaction time (seconds): 6.9151
-Final path                      : 2779 -> 2082 -> 2792 -> 1911 -> 3057 -> 1866 -> 439
+Fee                             : 5.620926955369289
+Delay                           : 68.0
+Carbon                          : 351.5900463054187
+Reward                          : 2.8442215884897992
+Reason                          : partial_backtrack_success
+Hops                            : 4
+Prediction time (seconds)       : 0.005063
+Pipeline time (seconds)         : 4.6451
+Total transaction time (seconds): 10.323
+Final path                      : 1711 -> 1869 -> 1777 -> 1908 -> 1441
 
 ================================================================
-EVALUATION TRANSACTION 7/10
+EVALUATION TRANSACTION 7/9
 ================================================================
-Transaction ID                  : 7
-Source                          : 1173
-Destination                     : 1745
+Transaction ID                  : 27
+Source                          : 144
+Destination                     : 752
 Payment amount                  : 1000.0
 Evaluation seed                 : 1050
 PPO predictions                 : 1
-PPO eta                         : 0.00786395464092493
+PPO eta                         : 0.006978609133511782
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
@@ -443,27 +471,27 @@ Full reroutes                   : 0
 Successful Bucket route         : 1 / 5
 Successful route source         : bucket_candidate
 Failure probability             : 0.0
-Fee                             : 4.0
-Delay                           : 60.0
-Carbon                          : 392.42907717569784
-Reward                          : 2.548231153504156
+Fee                             : 1002.1039999999999
+Delay                           : 248.0
+Carbon                          : 332.97383333333335
+Reward                          : 3.0032389932542247
 Reason                          : success
-Hops                            : 2
-Prediction time (seconds)       : 0.000511
-Pipeline time (seconds)         : 2.9091
-Total transaction time (seconds): 7.3914
-Final path                      : 1173 -> 1777 -> 1745
+Hops                            : 5
+Prediction time (seconds)       : 0.0
+Pipeline time (seconds)         : 6.5127
+Total transaction time (seconds): 12.9398
+Final path                      : 144 -> 2064 -> 2107 -> 3677 -> 2436 -> 752
 
 ================================================================
-EVALUATION TRANSACTION 8/10
+EVALUATION TRANSACTION 8/9
 ================================================================
-Transaction ID                  : 8
-Source                          : 3683
-Destination                     : 2483
+Transaction ID                  : 28
+Source                          : 1168
+Destination                     : 1006
 Payment amount                  : 1000.0
 Evaluation seed                 : 1051
 PPO predictions                 : 1
-PPO eta                         : 0.0075899395160377026
+PPO eta                         : 0.006408159155398607
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
@@ -477,61 +505,27 @@ Full reroutes                   : 0
 Successful Bucket route         : 1 / 5
 Successful route source         : bucket_candidate
 Failure probability             : 0.0
-Fee                             : 0.002
-Delay                           : 30.0
-Carbon                          : 379.571
-Reward                          : 2.634553219292306
-Reason                          : success
-Hops                            : 1
-Prediction time (seconds)       : 0.0
-Pipeline time (seconds)         : 3.1976
-Total transaction time (seconds): 7.7495
-Final path                      : 3683 -> 2483
-
-================================================================
-EVALUATION TRANSACTION 9/10
-================================================================
-Transaction ID                  : 9
-Source                          : 1385
-Destination                     : 3739
-Payment amount                  : 2384.2035440714913
-Evaluation seed                 : 1052
-PPO predictions                 : 1
-PPO eta                         : 0.006928092800080776
-Requested Top-K                 : 5
-Generated candidates            : 5
-Usable candidates               : 5
-Bucket size                     : 5
-Payment status                  : SUCCESS
-Attempts                        : 1
-Backtracks                      : 0
-Partial backtracks              : 0
-Successful partial backtracks   : 0
-Full reroutes                   : 0
-Successful Bucket route         : 1 / 5
-Successful route source         : bucket_candidate
-Failure probability             : 0.0
-Fee                             : 1000.0119210177204
-Delay                           : 218.0
-Carbon                          : 312.83680000000004
-Reward                          : 3.1965548810114406
+Fee                             : 1003.0509999999999
+Delay                           : 316.0
+Carbon                          : 326.9622463054187
+Reward                          : 3.058457088852668
 Reason                          : success
 Hops                            : 4
-Prediction time (seconds)       : 0.00793
-Pipeline time (seconds)         : 4.3089
-Total transaction time (seconds): 8.8803
-Final path                      : 1385 -> 2121 -> 3677 -> 1908 -> 3739
+Prediction time (seconds)       : 0.001036
+Pipeline time (seconds)         : 4.2216
+Total transaction time (seconds): 10.1577
+Final path                      : 1168 -> 2108 -> 2389 -> 2109 -> 1006
 
 ================================================================
-EVALUATION TRANSACTION 10/10
+EVALUATION TRANSACTION 9/9
 ================================================================
-Transaction ID                  : 10
-Source                          : 1788
-Destination                     : 1511
-Payment amount                  : 2978.903171972128
-Evaluation seed                 : 1053
+Transaction ID                  : 29
+Source                          : 2559
+Destination                     : 763
+Payment amount                  : 1000.0
+Evaluation seed                 : 1052
 PPO predictions                 : 1
-PPO eta                         : 0.011560310609638691
+PPO eta                         : 0.008238216862082481
 Requested Top-K                 : 5
 Generated candidates            : 5
 Usable candidates               : 5
@@ -545,51 +539,52 @@ Full reroutes                   : 0
 Successful Bucket route         : 1 / 5
 Successful route source         : bucket_candidate
 Failure probability             : 0.0
-Fee                             : 0.01191561268788851
-Delay                           : 60.0
-Carbon                          : 371.153
-Reward                          : 2.6943066605954957
+Fee                             : 1006.169
+Delay                           : 272.0
+Carbon                          : 392.54461576354674
+Reward                          : 2.5474811265845005
 Reason                          : success
-Hops                            : 2
+Hops                            : 3
 Prediction time (seconds)       : 0.0
-Pipeline time (seconds)         : 3.3581
-Total transaction time (seconds): 7.6057
-Final path                      : 1788 -> 1868 -> 1511
+Pipeline time (seconds)         : 3.7892
+Total transaction time (seconds): 9.7742
+Final path                      : 2559 -> 2103 -> 1899 -> 763
 
 ================================================================
 MULTI-TRANSACTION EVALUATION SUMMARY
 ================================================================
-Transactions evaluated          : 10
-Expected transactions           : 10
+Transactions evaluated          : 9
+Expected transactions           : 9
 Successful payments             : 9
-Failed payments                 : 1
-Success rate                    : 90.00%
-Failure rate                    : 10.00%
-Average attempts                : 1.6000
-Average hops                    : 3.0000
-Average fee                     : 631.008865
-Average delay                   : 151.3333
-P90 route delay (successful)    : 243.20000000000002
-P95 route delay (successful)    : 293.59999999999997
-P90 route delay (all routed)    : 243.20000000000002
-P95 route delay (all routed)    : 293.59999999999997
-Average carbon                  : 323.159994
-Average reward                  : 3.282805
-Average eta                     : 0.008495
+Failed payments                 : 0
+Success rate                    : 100.00%
+Failure rate                    : 0.00%
+Average attempts                : 1.8889
+Average hops                    : 3.6667
+Average fee                     : 891.005061
+Average delay                   : 207.3333
+P90 route delay (successful)    : 317.2
+P95 route delay (successful)    : 319.6
+P90 route delay (all routed)    : 317.2
+P95 route delay (all routed)    : 319.6
+Average carbon                  : 369.100612
+Average reward                  : 2.721449
+Average eta                     : 0.009166
 Average candidates              : 5.0000
 Average usable candidates       : 5.0000
 Average Bucket size             : 5.0000
-Total attempts                  : 16
-Total partial backtracks        : 7
-Successful partial backtracks   : 0
-Total full reroutes             : 0
-Bucket exhausted                : 1
+Total attempts                  : 17
+Total partial backtracks        : 8
+Successful partial backtracks   : 2
+Total full reroutes             : 1
+Bucket exhausted                : 0
 
 Successful Bucket candidate distribution:
-Candidate #1                    : 7 (77.78% of successful payments)
-Candidate #2                    : 2 (22.22% of successful payments)
+Candidate #1                    : 6 (66.67% of successful payments)
+Candidate #2                    : 1 (11.11% of successful payments)
+Successful candidate rank unknown: 2
 
-10 independent evaluation transactions were processed.
+9 independent evaluation transactions were processed.
 Each transaction received exactly one PPO prediction.
 The PPO action controls eta only.
 Top-K is fixed at 5 inside RoutingEnv.
@@ -597,7 +592,7 @@ The evaluation does not force a particular Bucket candidate to succeed.
 Different transactions may succeed at different Bucket positions, or all candidates may fail.
 Step completed                  : 9/10
 Progress                        : 90.00%
-Status                          : 10-TRANSACTION ROUTING COMPLETED
+Status                          : 9-TRANSACTION ROUTING COMPLETED
 
 ================================================================
 STEP 10 - FINAL EVALUATION RESULT
@@ -605,46 +600,44 @@ STEP 10 - FINAL EVALUATION RESULT
 Step                            : 10/10
 Progress                        : 100.00%
 Stage                           : STEP 10 - FINAL EVALUATION RESULT
-Evaluation status               : MIXED SUCCESS/FAILURE
-Payment outcome                 : MIXED
-Transactions evaluated          : 10
+Evaluation status               : ALL PAYMENTS SUCCESSFUL
+Payment outcome                 : ALL SUCCESSFUL
+Transactions evaluated          : 9
 Successful payments             : 9
-Failed payments                 : 1
-Overall success rate            : 90.00%
-Overall failure rate            : 10.00%
-Average attempts                : 1.6000
-Average hops                    : 3.0000
-Average fee                     : 631.008865
-Average delay                   : 151.3333
-Average carbon                  : 323.159994
-Average reward                  : 3.282805
-Average eta                     : 0.008495
-Total partial backtracks        : 7
-Successful partial backtracks   : 0
-Total full reroutes             : 0
-Bucket exhausted                : 1
+Failed payments                 : 0
+Overall success rate            : 100.00%
+Overall failure rate            : 0.00%
+Average attempts                : 1.8889
+Average hops                    : 3.6667
+Average fee                     : 891.005061
+Average delay                   : 207.3333
+Average carbon                  : 369.100612
+Average reward                  : 2.721449
+Average eta                     : 0.009166
+Total partial backtracks        : 8
+Successful partial backtracks   : 2
+Total full reroutes             : 1
+Bucket exhausted                : 0
 
 Per-transaction result table:
-TX #1 (id=1)                    : SUCCESS | source=3590 | destination=1175 | amount=1000.0 | eta=0.00815781019628048 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.657527
-TX #2 (id=2)                    : SUCCESS | source=490 | destination=569 | amount=1000.0 | eta=0.009034290909767151 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.634553
-TX #3 (id=3)                    : FAILED | source=2090 | destination=889 | amount=3449.831535783569 | eta=0.012673122808337212 | candidates=5 | bucket=5 | attempts=5 | route=NONE | route_source=N/A | reward=0.000000
-TX #4 (id=4)                    : SUCCESS | source=2933 | destination=1713 | amount=1000.0 | eta=0.005299386568367481 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=3.720963
-TX #5 (id=5)                    : SUCCESS | source=1655 | destination=144 | amount=1000.0 | eta=0.006435198709368706 | candidates=5 | bucket=5 | attempts=2 | route=#2 | route_source=bucket_candidate | reward=3.083582
-TX #6 (id=6)                    : SUCCESS | source=2779 | destination=439 | amount=1706.365507537219 | eta=0.00940903089940548 | candidates=5 | bucket=5 | attempts=2 | route=#2 | route_source=bucket_candidate | reward=9.657780
-TX #7 (id=7)                    : SUCCESS | source=1173 | destination=1745 | amount=1000.0 | eta=0.00786395464092493 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.548231
-TX #8 (id=8)                    : SUCCESS | source=3683 | destination=2483 | amount=1000.0 | eta=0.0075899395160377026 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.634553
-TX #9 (id=9)                    : SUCCESS | source=1385 | destination=3739 | amount=2384.2035440714913 | eta=0.006928092800080776 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=3.196555
-TX #10 (id=10)                  : SUCCESS | source=1788 | destination=1511 | amount=2978.903171972128 | eta=0.011560310609638691 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.694307
+TX #1 (id=21)                   : SUCCESS | source=3738 | destination=858 | amount=1000.0 | eta=0.006432238966226578 | candidates=5 | bucket=5 | attempts=7 | route=#2 | route_source=bucket_candidate | reward=2.680650
+TX #2 (id=22)                   : SUCCESS | source=15 | destination=1467 | amount=1000.0 | eta=0.010427401401102543 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.645907
+TX #3 (id=23)                   : SUCCESS | source=1250 | destination=732 | amount=6982.61650934373 | eta=0.007616774644702673 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.569277
+TX #4 (id=24)                   : SUCCESS | source=2970 | destination=960 | amount=1000.0 | eta=0.01250382512807846 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.569277
+TX #5 (id=25)                   : SUCCESS | source=3568 | destination=1806 | amount=1235.6275573680016 | eta=0.014924448914825916 | candidates=5 | bucket=5 | attempts=2 | route=PARTIAL BACKTRACK | route_source=partial_backtrack | reward=2.574536
+TX #6 (id=26)                   : SUCCESS | source=1711 | destination=1441 | amount=2804.853770144356 | eta=0.008968349546194077 | candidates=5 | bucket=5 | attempts=2 | route=PARTIAL BACKTRACK | route_source=partial_backtrack | reward=2.844222
+TX #7 (id=27)                   : SUCCESS | source=144 | destination=752 | amount=1000.0 | eta=0.006978609133511782 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=3.003239
+TX #8 (id=28)                   : SUCCESS | source=1168 | destination=1006 | amount=1000.0 | eta=0.006408159155398607 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=3.058457
+TX #9 (id=29)                   : SUCCESS | source=2559 | destination=763 | amount=1000.0 | eta=0.008238216862082481 | candidates=5 | bucket=5 | attempts=1 | route=#1 | route_source=bucket_candidate | reward=2.547481
 
 ================================================================
 FINAL STATUS
 ================================================================
-MULTI-TRANSACTION EVALUATION COMPLETED
-9 of 10 payment scenarios succeeded.
-1 payment scenario failed.
+ALL PAYMENT SCENARIOS SUCCESSFUL
+All 9 independent payment scenarios reached their destinations.
 
 Important evaluation property:
-Exactly 10 independent payment transactions were evaluated.
+Exactly 9 independent payment transactions were evaluated.
 Each transaction received exactly one PPO prediction.
 Top-K was fixed at 5 for every transaction.
 The evaluation does not assume that Bucket candidate #3 must succeed.
@@ -654,24 +647,24 @@ Different transactions may succeed at different Bucket positions, or all candida
 EXECUTION TIME
 ================================================================
 Execution mode                  : FAST VALIDATION
-Evaluation transactions         : 10
-Expected PPO predictions        : 10
-Actual PPO predictions          : 10
-PPO training time (seconds)     : 0.0
-PPO model load time (seconds)   : 2.8584
-Total PPO prediction time (seconds): 0.01653
-Total payment pipeline time (seconds): 37.98
-Average payment pipeline time (seconds): 3.798
-Total execution time (seconds)  : 94.5141
+Evaluation transactions         : 9
+Expected PPO predictions        : 9
+Actual PPO predictions          : 9
+PPO training time (seconds)     : 99.7061
+PPO model load time (seconds)   : 0.0
+Total PPO prediction time (seconds): 0.018306
+Total payment pipeline time (seconds): 50.3122
+Average payment pipeline time (seconds): 5.5902
+Total execution time (seconds)  : 212.4238
 
 ================================================================
 END OF REPORT
 ================================================================
 Run status                      : COMPLETED
 Overall progress                : 100.00%
-Evaluation transactions         : 10
-PPO predictions                 : 10
+Evaluation transactions         : 9
+PPO predictions                 : 9
 Result interpretation           : Smoke validation only; not a scientific performance estimate
 Top-K                           : 5
-Run completed                   : 2026-10-07 21:08:38
+Run completed                   : 2026-10-07 22:37:38
 Report file                     : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\report.txt

@@ -820,18 +820,19 @@ def test_missing_liquidity():
 
     graph = _make_basic_graph()
 
-    del graph["A"]["B"]["estimated_liquidity"]
+    graph["A"]["B"]["estimated_liquidity"] = None
+    graph["A"]["B"]["balance_uv"] = None
 
     router = Dijkstra(graph)
 
-    _expect_exception(
-        ValueError,
-        router.shortest_path,
+    result = router.shortest_path(
         "A",
         "D",
         amount=1000,
         lambda_h=0.0,
     )
+    _assert(result["success"] is True, "Unknown liquidity must remain routable")
+    _assert(result["min_liquidity"] is None, "Unknown must remain explicitly unknown")
 
 
 # ============================================================================

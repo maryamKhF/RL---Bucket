@@ -85,7 +85,6 @@ def _estimated_liquidity(data):
     --------
         1. estimated_liquidity
         2. liquidity_uv
-        3. balance_uv
 
     Semantics
     ---------
@@ -117,7 +116,6 @@ def _estimated_liquidity(data):
     liquidity_fields = (
         "estimated_liquidity",
         "liquidity_uv",
-        "balance_uv",
     )
 
     for field in liquidity_fields:

@@ -601,7 +601,8 @@ class RoutingEnvironmentValidation(unittest.TestCase):
 
     def test_state_does_not_expose_simulator_failure_probability(self):
         self.assertNotIn("failure_probability", FEATURE_NAMES)
-        self.assertEqual(FEATURE_DIM, 10)
+        self.assertNotIn("estimated_liquidity", FEATURE_NAMES)
+        self.assertEqual(FEATURE_DIM, 11)
 
         tx = self.transactions[0]
         state_before = State(
@@ -622,13 +623,45 @@ class RoutingEnvironmentValidation(unittest.TestCase):
             transaction=tx,
         ).vector()
 
-        self.assertEqual(state_before.shape, (165,))
+        self.assertEqual(state_before.shape, (180,))
         np.testing.assert_array_equal(state_after, state_before)
+
+    def test_state_uses_interval_belief_not_graph_balance(self):
+        tx = self.transactions[0]
+        edge = next(iter(self.G.edges(keys=True)))
+        beliefs = {edge: (200.0, 600.0)}
+        before = State(
+            G=self.G,
+            source=tx.source,
+            destination=tx.destination,
+            liquidity_beliefs=beliefs,
+        ).vector()
+        self.G.edges[edge]["balance_uv"] = 999_999.0
+        after = State(
+            G=self.G,
+            source=tx.source,
+            destination=tx.destination,
+            liquidity_beliefs=beliefs,
+        ).vector()
+        np.testing.assert_array_equal(before, after)
 
     def test_22_reset_sets_sampled_transaction(self):
         self.env.reset()
 
         self.assertIn(self.env.current_tx, self.transactions)
+
+    def test_reset_can_select_requested_transaction_deterministically(self):
+        _observation, info = self.env.reset(
+            seed=123,
+            options={"transaction_index": 1},
+        )
+
+        self.assertIs(self.env.current_tx, self.transactions[1])
+        self.assertEqual(info["transaction_id"], self.transactions[1].tx_id)
+
+    def test_reset_rejects_invalid_transaction_index(self):
+        with self.assertRaises(ValueError):
+            self.env.reset(options={"transaction_index": len(self.transactions)})
 
     def test_23_reset_clears_current_bucket(self):
         self.env.current_bucket = make_bucket()
@@ -1686,6 +1719,16 @@ class RoutingEnvironmentValidation(unittest.TestCase):
             )
 
             self.assertEqual(
+                info["successful_bucket_rank"],
+                1,
+            )
+
+            self.assertEqual(
+                info["successful_route_source"],
+                "bucket_candidate",
+            )
+
+            self.assertEqual(
                 info["attempt_count"],
                 1,
             )
@@ -1867,6 +1910,15 @@ class RoutingEnvironmentValidation(unittest.TestCase):
             self.assertEqual(
                 result["path"],
                 alternative_path,
+            )
+
+            self.assertIsNone(
+                result["successful_bucket_rank"]
+            )
+
+            self.assertEqual(
+                result["successful_route_source"],
+                "partial_backtrack",
             )
 
             self.assertEqual(len(env.payment_simulator.calls), 1)

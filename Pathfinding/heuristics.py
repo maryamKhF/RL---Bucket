@@ -1423,7 +1423,6 @@ def _optional_edge_liquidity(
 
         estimated_liquidity
         liquidity_uv
-        balance_uv
 
     Returns None when the graph does not provide a recognized
     liquidity field.
@@ -1431,29 +1430,20 @@ def _optional_edge_liquidity(
     No artificial liquidity value is created.
     """
 
-    if "estimated_liquidity" in edge_data:
-
+    liquidity = None
+    for field in (
+        "estimated_liquidity",
+        "liquidity_uv",
+    ):
+        if field not in edge_data or edge_data[field] is None:
+            continue
         liquidity = _to_float(
-            edge_data["estimated_liquidity"],
-            f"estimated_liquidity[{edge_description}]",
+            edge_data[field],
+            f"{field}[{edge_description}]",
         )
+        break
 
-    elif "liquidity_uv" in edge_data:
-
-        liquidity = _to_float(
-            edge_data["liquidity_uv"],
-            f"liquidity_uv[{edge_description}]",
-        )
-
-    elif "balance_uv" in edge_data:
-
-        liquidity = _to_float(
-            edge_data["balance_uv"],
-            f"balance_uv[{edge_description}]",
-        )
-
-    else:
-
+    if liquidity is None:
         return None
 
     if liquidity < 0.0:

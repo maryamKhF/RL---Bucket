@@ -480,6 +480,11 @@ class PaymentSimulator:
         self.G = G
         self.failure_model = failure_model
         self.network_dynamics = network_dynamics
+        hidden_liquidity = getattr(
+            network_dynamics, "hidden_liquidity", None
+        )
+        if hidden_liquidity is not None:
+            self.failure_model.hidden_liquidity = hidden_liquidity
 
     # ========================================================
     # Execute Exactly One Payment

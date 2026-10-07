@@ -46,21 +46,21 @@ FAST_TRAINING = (
 QUICK_TOTAL_TIMESTEPS = int(
     os.environ.get(
         "RL_QUICK_TIMESTEPS",
-        "512"
+        "16"
     )
 )
 
 QUICK_N_STEPS = int(
     os.environ.get(
         "RL_QUICK_N_STEPS",
-        "128"
+        "8"
     )
 )
 
 QUICK_BATCH_SIZE = int(
     os.environ.get(
         "RL_QUICK_BATCH_SIZE",
-        "64"
+        "8"
     )
 )
 
@@ -369,7 +369,8 @@ def format_seconds(seconds):
 # ============================================================
 
 def resolve_training_configuration(
-    rl_cfg
+    rl_cfg,
+    fast_training=None,
 ):
     """
     Resolve PPO training parameters.
@@ -402,7 +403,13 @@ def resolve_training_configuration(
         )
     )
 
-    if FAST_TRAINING:
+    use_fast_training = (
+        FAST_TRAINING
+        if fast_training is None
+        else bool(fast_training)
+    )
+
+    if use_fast_training:
 
         total_timesteps = max(
             1,
@@ -586,7 +593,8 @@ def train_agent(
     cfg,
     name,
     seed=42,
-    eval_env=None
+    eval_env=None,
+    fast_training=None,
 ):
     """
     Train the PPO routing agent.
@@ -712,7 +720,8 @@ def train_agent(
     # ========================================================
 
     training_cfg = resolve_training_configuration(
-        rl_cfg
+        rl_cfg,
+        fast_training=fast_training,
     )
 
     total_timesteps = int(

@@ -531,7 +531,6 @@ class CandidateManager:
 
         1. estimated_liquidity
         2. liquidity_uv
-        3. balance_uv
 
         Missing directional liquidity is UNKNOWN and therefore
         returns None.
@@ -547,7 +546,6 @@ class CandidateManager:
         for key in (
             "estimated_liquidity",
             "liquidity_uv",
-            "balance_uv"
         ):
 
             value = channel.get(

@@ -13,7 +13,9 @@ Responsibilities
 
 Architecture
 ------------
-The NetworkX graph G is the single source of truth for network state.
+The public NetworkX graph contains topology and public channel state. Hidden
+directional liquidity is read from the private simulator ledger supplied by
+PaymentSimulator; it is never exposed to the routing policy.
 
 FailureModel is intentionally separated from:
 
@@ -27,10 +29,11 @@ FailureModel is intentionally separated from:
 Important semantic rules
 ------------------------
 - Channel capacity is NOT directional liquidity.
-- Unknown directional liquidity is NOT treated as zero.
-- Known insufficient directional liquidity causes deterministic failure.
-- Known sufficient or unknown liquidity may still experience
-  stochastic forwarding failure.
+- Snapshot capacity is never used as a directional balance.
+- The simulator's private balance causes deterministic failure when an
+  attempted amount exceeds the hidden balance.
+- Sufficient hidden liquidity may still experience stochastic forwarding
+  failure.
 - Exact MultiDiGraph channel keys are mandatory when the graph
   contains parallel channels.
 - FailureModel evaluates exactly ONE payment attempt.
@@ -905,6 +908,10 @@ class FailureModel:
             self.seed
         )
 
+        # Set by PaymentSimulator to the simulator-only ledger. The agent and
+        # public routing graph never receive this mapping.
+        self.hidden_liquidity = None
+
         # Per-payment node evaluation cache.
         self._node_attempt_cache = None
 
@@ -1293,14 +1300,15 @@ class FailureModel:
         capacity:
             ignored
 
-        known liquidity < amount:
+        hidden simulator balance < amount:
             deterministic failure
 
-        unknown liquidity:
-            not automatically a failure
-
-        sufficient known liquidity:
+        sufficient hidden balance:
             stochastic forwarding failure may still occur
+
+        With a simulator ledger, a missing entry means unknown and only the
+        configured stochastic failure applies. Direct legacy calls without a
+        ledger may still use explicit balance fields on the graph.
         """
 
         edge = self._get_edge(
@@ -1320,11 +1328,12 @@ class FailureModel:
         if valid_amount is None:
             return True
 
-        directional_liquidity = (
-            self._get_directional_liquidity(
-                edge
-            )
-        )
+        hidden_ledger = self.hidden_liquidity
+        edge_identity = (u, v, key)
+        if hidden_ledger is not None:
+            directional_liquidity = hidden_ledger.get(edge_identity)
+        else:
+            directional_liquidity = self._get_directional_liquidity(edge)
 
         if directional_liquidity is not None:
 

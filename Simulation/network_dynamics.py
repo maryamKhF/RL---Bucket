@@ -24,17 +24,17 @@ Therefore:
 
 If directional liquidity is explicitly present, it is validated.
 
-If directional liquidity is unknown, the channel is accepted
-structurally as long as:
+If directional liquidity is absent from the public graph, a seeded,
+simulator-only hidden balance is sampled from the configured structural
+capacity prior. The sampled value is not copied into the public graph.
+The router accepts unknown-liquidity channels structurally; forwarding checks
+the private ledger during payment execution.
 
     - the exact channel exists,
     - the channel is available,
     - both endpoint nodes are available,
     - the requested amount is valid,
     - and a valid structural capacity bound exists, if supplied.
-
-Unknown directional liquidity must NOT be converted into an artificial
-balance.
 
 Separation of responsibilities
 -------------------------------
@@ -53,7 +53,8 @@ Bucket / PartialBacktracker:
 OnionRouter:
     Handles the simulated forwarding/privacy layer.
 
-The NetworkX graph G is the single source of truth.
+The public NetworkX graph contains observable network attributes. Hidden
+directional balances live only in this simulator's private ledger.
 """
 
 
@@ -71,6 +72,7 @@ class NetworkDynamics:
         node_failure_rate=0.005,
         recovery_rate=0.05,
         seed=42,
+        default_capacity=None,
     ):
         """
         Parameters
@@ -115,6 +117,12 @@ class NetworkDynamics:
             )
 
         self.G = G
+        if default_capacity is None:
+            self.default_capacity = None
+        else:
+            self.default_capacity = float(default_capacity)
+            if not math.isfinite(self.default_capacity) or self.default_capacity < 0:
+                raise ValueError("default_capacity must be finite and nonnegative")
 
         self.history = defaultdict(list)
 
@@ -133,6 +141,126 @@ class NetworkDynamics:
         self.rng = random.Random(
             seed
         )
+        self.hidden_liquidity_rng = random.Random(int(seed) + 8_021)
+        self.hidden_liquidity = {}
+        self.initial_hidden_liquidity = {}
+        self._initialize_hidden_liquidity()
+
+    def _initialize_hidden_liquidity(self):
+        """Create simulator-only channel balances from a seeded uniform prior.
+
+        A channel's public capacity bounds the total balance. For reciprocal
+        directed edges representing the same physical channel, the sampled
+        directional balances sum to capacity. These values stay in this
+        simulator object and are never copied into the observation graph.
+        """
+        groups = {}
+        edges = (
+            self.G.edges(keys=True, data=True)
+            if self.G.is_multigraph()
+            else ((u, v, None, data) for u, v, data in self.G.edges(data=True))
+        )
+        for u, v, key, data in edges:
+            edge = (u, v, key)
+            channel_id = str(data.get("channel_id", key))
+            base_id = channel_id[:-4] if channel_id.endswith("-rev") else channel_id
+            group_key = (base_id, frozenset((u, v)))
+            groups.setdefault(group_key, []).append((edge, data, channel_id.endswith("-rev")))
+
+        for members in groups.values():
+            if len(members) == 2:
+                first, second = members
+                if first[0][:2] == second[0][:2][::-1]:
+                    self._initialize_reciprocal_pair(first, second)
+                    continue
+            for edge, data, _is_reverse in members:
+                balance = self._initial_directional_balance(data)
+                if balance is not None:
+                    self.hidden_liquidity[edge] = balance
+
+        self.initial_hidden_liquidity = dict(self.hidden_liquidity)
+
+    def _initial_directional_balance(self, data):
+        """Return explicit simulated balance or sample from capacity."""
+        value = data.get("balance_uv")
+        if value is not None:
+            try:
+                value = float(value)
+                if math.isfinite(value) and value >= 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        capacity = self._read_capacity(data)
+        maximum = (
+            capacity["value"]
+            if capacity["present"] and capacity["valid"]
+            else self.default_capacity
+        )
+        if maximum is None:
+            return None
+        return maximum * self.hidden_liquidity_rng.random()
+
+    def _initialize_reciprocal_pair(self, first, second):
+        (edge_a, data_a, reverse_a), (edge_b, data_b, reverse_b) = first, second
+        capacity_state = self._read_capacity(data_a)
+        capacity = (
+            capacity_state["value"]
+            if capacity_state["present"] and capacity_state["valid"]
+            else self.default_capacity
+        )
+        if capacity is None:
+            balance_a = self._explicit_balance(data_a)
+            balance_b = self._explicit_balance(data_b)
+            if balance_a is not None:
+                self.hidden_liquidity[edge_a] = balance_a
+            if balance_b is not None:
+                self.hidden_liquidity[edge_b] = balance_b
+            return
+
+        balance_a = self._explicit_balance(data_a)
+        balance_b = self._explicit_balance(data_b)
+        if balance_a is not None and balance_b is not None:
+            self.hidden_liquidity[edge_a] = balance_a
+            self.hidden_liquidity[edge_b] = balance_b
+        elif balance_a is not None:
+            self.hidden_liquidity[edge_a] = balance_a
+            self.hidden_liquidity[edge_b] = max(0.0, capacity - balance_a)
+        elif balance_b is not None:
+            self.hidden_liquidity[edge_b] = balance_b
+            self.hidden_liquidity[edge_a] = max(0.0, capacity - balance_b)
+        else:
+            balance = capacity * self.hidden_liquidity_rng.random()
+            self.hidden_liquidity[edge_a] = balance
+            self.hidden_liquidity[edge_b] = capacity - balance
+
+    @staticmethod
+    def _explicit_balance(data):
+        value = data.get("balance_uv")
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
+
+    def _reverse_edge(self, edge):
+        u, v, key = edge
+        data = self._get_edge(u, v, key)
+        if data is None:
+            return None
+        channel_id = str(data.get("channel_id", key))
+        base_id = channel_id[:-4] if channel_id.endswith("-rev") else channel_id
+        if self.G.is_multigraph():
+            candidates = self.G.get_edge_data(v, u, default={})
+            for reverse_key, reverse_data in candidates.items():
+                reverse_id = str(reverse_data.get("channel_id", reverse_key))
+                reverse_base = reverse_id[:-4] if reverse_id.endswith("-rev") else reverse_id
+                if reverse_base == base_id:
+                    return (v, u, reverse_key)
+        elif self.G.has_edge(v, u):
+            return (v, u, None)
+        return None
 
     # ============================================================
     # Check Forwarding Possibility
@@ -157,9 +285,8 @@ class NetworkDynamics:
 
         Liquidity semantics
         -------------------
-        Explicit directional liquidity is validated when present.
-
-        Unknown directional liquidity is accepted structurally.
+        Public capacity is checked structurally; hidden directional balance
+        is checked from this simulator's private ledger.
 
         ``capacity`` is NEVER interpreted as directional liquidity.
         """
@@ -217,11 +344,16 @@ class NetworkDynamics:
             if capacity_state["valid"] is False:
                 return False
 
-            if (
-                capacity_state["value"]
-                < amount_value
-            ):
+            if capacity_state["value"] < amount_value:
                 return False
+
+        # Simulator-only balances are hidden from routing and observation.
+        edge_identity = (u, v, key)
+        if edge_identity in self.hidden_liquidity:
+            hidden_balance = self.hidden_liquidity[edge_identity]
+            if hidden_balance is not None and hidden_balance < amount_value:
+                return False
+            return True
 
         # --------------------------------------------------------
         # Explicit directional liquidity
@@ -413,15 +545,10 @@ class NetworkDynamics:
             balance_uv -= amount
             balance_vu += amount
 
-        If directional liquidity is unknown, no artificial
-        balance is created.
-
-        In particular, this method NEVER performs:
-
-            balance_uv = capacity / 2
-
-        and NEVER assumes that capacity represents directional
-        liquidity.
+        If a private hidden balance exists, update it and the reverse
+        direction in the private ledger. Never write that state to the public
+        graph. Capacity bounds the configured simulator prior; it is not
+        itself treated as directional liquidity.
         """
 
         amount_value = self._validate_amount(
@@ -470,6 +597,35 @@ class NetworkDynamics:
                 "channel is unavailable or "
                 "cannot structurally forward the amount."
             )
+
+        edge_identity = (u, v, key)
+        if edge_identity in self.hidden_liquidity:
+            balance = self.hidden_liquidity[edge_identity]
+            if balance is None or balance < amount_value:
+                raise ValueError(
+                    "Cannot settle payment: insufficient hidden directional liquidity."
+                )
+            self.hidden_liquidity[edge_identity] = balance - amount_value
+            reverse = self._reverse_edge(edge_identity)
+            if reverse in self.hidden_liquidity:
+                reverse_balance = self.hidden_liquidity[reverse]
+                if reverse_balance is not None:
+                    capacity_state = self._read_capacity(
+                        self._get_edge(*reverse)
+                    )
+                    capacity = (
+                        capacity_state["value"]
+                        if capacity_state["present"] and capacity_state["valid"]
+                        else (
+                            self.default_capacity
+                            if self.default_capacity is not None
+                            else float("inf")
+                        )
+                    )
+                    self.hidden_liquidity[reverse] = min(
+                        capacity, reverse_balance + amount_value
+                    )
+            return True
 
         # --------------------------------------------------------
         # Explicit directional balance state
@@ -969,8 +1125,8 @@ class NetworkDynamics:
         Parameters
         ----------
         reset_balances : bool
-            If True and initial balances were stored in the graph,
-            restore them.
+            If True, restore the simulator's initial hidden ledger and any
+            explicit initial balances stored on graph edges.
 
         Availability is reset to True.
 
@@ -983,6 +1139,10 @@ class NetworkDynamics:
         """
 
         self.history.clear()
+
+        if reset_balances:
+            self.hidden_liquidity.clear()
+            self.hidden_liquidity.update(self.initial_hidden_liquidity)
 
         # --------------------------------------------------------
         # Reset nodes
@@ -1140,7 +1300,8 @@ class NetworkDynamics:
         This helper is used where exact channel identity is
         required, especially during complete-route settlement.
 
-        The NetworkX graph remains the single source of truth.
+        The NetworkX graph remains authoritative for public topology and
+        channel identity; hidden balances are kept in the private ledger.
         """
 
         try:

@@ -42,15 +42,16 @@ M = 5
 # 2   capacity
 # 3   delay
 # 4   availability
-# 5   liquidity
-# 6   geographic_distance
-# 7   inter_country
-# 8   inter_continent
-# 9   carbon_intensity
+# 5   liquidity lower bound (learned)
+# 6   liquidity upper bound (learned)
+# 7   geographic_distance
+# 8   inter_country
+# 9   inter_continent
+# 10  carbon_intensity
 #
 # Therefore:
 #
-#     D = 10
+#     D = 11
 #
 # State matrix:
 #
@@ -64,7 +65,7 @@ M = 5
 #
 #     K × D + K
 #
-#     15 × 10 + 15 = 165
+#     15 × 11 + 15 = 180
 # ==========================================================
 
 FEATURE_NAMES = (
@@ -73,7 +74,8 @@ FEATURE_NAMES = (
     "capacity",
     "delay",
     "availability",
-    "liquidity",
+    "liquidity_lower_bound",
+    "liquidity_upper_bound",
     "geographic_distance",
     "inter_country",
     "inter_continent",
@@ -105,6 +107,11 @@ LOG_FEATURES = {
     "carbon_intensity"
 }
 
+UNIT_INTERVAL_FEATURES = {
+    "liquidity_lower_bound",
+    "liquidity_upper_bound",
+}
+
 
 # ==========================================================
 # State Class
@@ -123,7 +130,8 @@ class State:
         bucket_info=None,
         k=K,
         radius=M,
-        normalization_stats=None
+        normalization_stats=None,
+        liquidity_beliefs=None,
     ):
 
         self.G = G
@@ -170,6 +178,10 @@ class State:
             normalization_stats
             if normalization_stats is not None
             else {}
+        )
+
+        self.liquidity_beliefs = (
+            liquidity_beliefs if liquidity_beliefs is not None else {}
         )
 
     # ======================================================
@@ -754,48 +766,9 @@ class State:
         # Liquidity
         # --------------------------------------------------
 
-        if (
-            "liquidity_uv"
-            in extracted
-        ):
-
-            liquidity = self._safe_float(
-                extracted.get(
-                    "liquidity_uv"
-                )
-            )
-
-        elif (
-            "liquidity"
-            in data
-        ):
-
-            liquidity = self._safe_float(
-                data.get(
-                    "liquidity"
-                )
-            )
-
-        elif (
-            "balance_uv"
-            in data
-            and
-            capacity > 0
-        ):
-
-            liquidity = (
-                self._safe_float(
-                    data.get(
-                        "balance_uv"
-                    )
-                )
-                /
-                capacity
-            )
-
-        else:
-
-            liquidity = 0.0
+        lower_bound, upper_bound = self._liquidity_interval(
+            (u, v, key), capacity
+        )
 
         # --------------------------------------------------
         # Geographic features
@@ -877,8 +850,11 @@ class State:
             "availability":
                 availability,
 
-            "liquidity":
-                liquidity,
+            "liquidity_lower_bound":
+                lower_bound / capacity if capacity > 0 else 0.0,
+
+            "liquidity_upper_bound":
+                upper_bound / capacity if capacity > 0 else 0.0,
 
             "geographic_distance":
                 distance,
@@ -921,6 +897,18 @@ class State:
             dtype=np.float32
         )
 
+    def _liquidity_interval(self, edge, capacity):
+        interval = self.liquidity_beliefs.get(edge)
+        if interval is None:
+            return 0.0, max(0.0, capacity)
+        try:
+            lower, upper = float(interval[0]), float(interval[1])
+        except (TypeError, ValueError, IndexError):
+            return 0.0, max(0.0, capacity)
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower > upper:
+            return 0.0, max(0.0, capacity)
+        return max(0.0, lower), min(max(0.0, capacity), max(0.0, upper))
+
     # ======================================================
     # Feature Normalization
     # ======================================================
@@ -948,6 +936,9 @@ class State:
                     1.0
                 )
             )
+
+        if name in UNIT_INTERVAL_FEATURES:
+            return float(np.clip(value, 0.0, 1.0))
 
         # --------------------------------------------------
         # Log transformation
@@ -1277,41 +1268,9 @@ def fit_normalization_stats(
                 )
             )
 
-            if "liquidity_uv" in cf:
-
-                liquidity = State._safe_float(
-                    cf.get(
-                        "liquidity_uv"
-                    )
-                )
-
-            elif "liquidity" in data:
-
-                liquidity = State._safe_float(
-                    data.get(
-                        "liquidity"
-                    )
-                )
-
-            elif (
-                "balance_uv" in data
-                and
-                capacity > 0
-            ):
-
-                liquidity = (
-                    State._safe_float(
-                        data.get(
-                            "balance_uv"
-                        )
-                    )
-                    /
-                    capacity
-                )
-
-            else:
-
-                liquidity = 0.0
+            # Dataset-level normalization must not inspect actual balances.
+            liquidity_lower_bound = 0.0
+            liquidity_upper_bound = 1.0 if capacity > 0 else 0.0
 
             distance = State._safe_float(
                 geo.get(
@@ -1345,8 +1304,11 @@ def fit_normalization_stats(
                 "delay":
                     delay,
 
-                "liquidity":
-                    liquidity,
+                "liquidity_lower_bound":
+                    liquidity_lower_bound,
+
+                "liquidity_upper_bound":
+                    liquidity_upper_bound,
 
                 "geographic_distance":
                     distance,

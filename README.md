@@ -8,6 +8,39 @@ The network construction functionality is concentrated in the graph-building lay
 
 The repository also supports real Lightning-style snapshot data. The project has been tested with GML-based snapshots such as `20190501.gml.geo`. The original snapshot contains approximately 4,143 nodes and 33,195 undirected edges. When represented as directed channels in the MultiDiGraph model, this corresponds to approximately 66,390 directed channel records. This conversion is important because subsequent routing operations are directional. The graph builder therefore provides the bridge between the original snapshot representation and the directed graph representation required by the routing pipeline.
 
+## Spatial carbon data and paired evaluation
+
+For the current study, the existing country-level 2021 carbon data is the chosen input and is sufficient. RGB is not used as a carbon proxy. A finer GeoJSON polygon layer remains optional; the current run does not require one.
+
+Directional liquidity is hidden simulator state. When a snapshot supplies reciprocal channel directions and a capacity, the simulator samples one seeded uniform split of that capacity between the two directions. It keeps the sampled balances outside the public graph. If a snapshot has no capacity, the configured `channel.default_capacity` supplies the simulation's structural bound; for `20190501.gml.geo` this is currently 1,000,000. This is an explicit simulation assumption, not a measured channel capacity or a claim about the historical network. Routing does not reject an unknown-liquidity channel. After an observed liquidity failure or successful payment, the environment updates per-direction lower and upper bounds and exposes those bounds to PPO in the next observation. The state vector now has 180 values (previously 165), so PPO models trained with the old observation shape must be retrained.
+
+The paired ablation runner compares four arms on the exact same held-out transaction ordering and scenario seeds: static LND baseline, RL-only, Bucket-only with fixed LND eta, and RL+Bucket. All arms use the same seeded hidden-liquidity split for each scenario. The configured research run uses 3,000 held-out transactions, five repetitions, and each configured failure rate (1–6%). It reports transaction success, mean route delay, p90/p95 delay for successful routes and all routed payments, fees, carbon, and repetition-level 95% Student-t confidence intervals. It also reports paired repetition-level differences against the baseline for success and p95 delay. Route delay here is the sum of the edge delay/CLTV values in the selected path. With the current five repetitions, confidence intervals should be read as estimates, not substitutes for more seeds.
+
+Retrain PPO with the expanded 180-value observation before evaluation:
+
+```powershell
+$env:RL_FAST_VALIDATION = "0"
+python main.py
+```
+
+The training run writes the new model to `models/end_to_end_hidden_failure_blind.zip`, which is also the ablation runner's default model path.
+
+When `RL_FAST_VALIDATION=1` (the default), the end-to-end runner first tries that checkpoint. If it is missing or incompatible, it trains a 16-step PPO model under `models/fast_validation/` and continues the smoke run. Set `RL_QUICK_TIMESTEPS`, `RL_QUICK_N_STEPS`, and `RL_QUICK_BATCH_SIZE` to adjust this quick run. The model is kept separate from the research checkpoint, and the report marks the resulting metrics as smoke-validation output rather than scientific evidence.
+
+Run a small smoke evaluation with:
+
+```powershell
+python -m Evaluations.run_ablation --transactions 10 --repetitions 1 --failure-rates 0.03
+```
+
+Run the configured study with:
+
+```powershell
+python -m Evaluations.run_ablation
+```
+
+The runner expects `20190501.gml.geo` and `models/ppo_lightning_eta.zip` in the project root by default. Use `--snapshot`, `--model`, and `--output-dir` to choose other paths. It writes paired transaction rows to CSV and summary metadata/results to JSON under `Evaluations/results/paired_ablation` by default. The four-arm runner requires a trained PPO model even for arms that do not use its policy, because that model is used by the RL-only and RL+Bucket arms.
+
 An important modeling decision in the graph-building layer is the distinction between advertised channel capacity and directional liquidity. The implementation does not treat a channel's static capacity as if it were a known directional balance. This distinction is essential because a public Lightning Network snapshot generally does not reveal the exact current directional balance of every channel. The graph representation can therefore retain static channel capacity while leaving `balance_uv` and `balance_vu` unknown when directional information is unavailable. Optional estimated liquidity fields can subsequently be populated by another component or learning process. This prevents the routing system from making the incorrect assumption that the entire advertised capacity is simultaneously spendable in either direction.
 
 The graph-building layer preserves geographic and visual metadata when available. RGB remains visual metadata and is never converted into carbon intensity. Carbon intensity is resolved from node coordinates against an optional root-level `carbon_intensity.geojson` GeoJSON `FeatureCollection` containing Polygon or MultiPolygon features with a `carbon_intensity` property (gCO2/kWh). A matched feature may include `year` and `spatial_resolution` properties. When no spatial feature covers a node, the builder uses the country value in `global_energy_mix.json`, then continent and world averages. Every node records `carbon_intensity_source`, `carbon_intensity_resolution`, and `carbon_intensity_year`, so a country average is not presented as a point-level observation. The current root dataset contains country-level values for 2021; without a supplied spatial GeoJSON layer, the project still has country-level spatial resolution.
@@ -28,11 +61,11 @@ The reinforcement-learning layer is implemented in the `RL` package. Its major c
 
 The `RL/state.py` module is responsible for constructing the state representation supplied to the agent. The state is not simply a single scalar describing the current transaction. Instead, it incorporates network and neighborhood information derived from the routing context. The current configuration uses a neighborhood size of 15, an additional neighborhood parameter of 5, and an ego radius of 2. These parameters determine how much local network information is incorporated into the observation. The state representation is therefore intended to provide the policy with contextual information about the routing situation while keeping the observation dimension fixed.
 
-The PPO state vector has a dimension of 165: 15 observed channels, each represented by 10 public features, plus a 15-element padding mask. The simulator's latent channel failure probabilities are excluded from the observation. The Gymnasium observation space is represented as a continuous vector, while the action space is a one-dimensional continuous interval from zero to one. This means that the agent does not output a discrete route index. It outputs a continuous routing-control value.
+The PPO state vector has a dimension of 180: 15 observed channels, each represented by 11 features, plus a 15-element padding mask. Its liquidity features are the agent's learned lower and upper bounds; the simulator's hidden balances and failure probabilities are excluded. The action space is a one-dimensional continuous interval configured by `rl.eta_min` and `rl.eta_max` (currently -1 to 1). The agent outputs this routing-control value rather than a discrete route index.
 
 The `RL/ppo_agent.py` module implements the PPO-based agent and its interaction with Stable-Baselines3. The PPO configuration in the repository uses a learning rate of `0.0003`, a discount factor of `0.99`, a GAE parameter of `0.95`, a clipping range of `0.20`, an entropy coefficient of `0.01`, and two hidden layers of 128 units. The configured training horizon is 20,000 timesteps, with 256 steps per rollout and a batch size of 64. The device is configured as `auto`, allowing the implementation to use an available computational device.
 
-The most important conceptual point in the RL design is that PPO controls `eta` rather than constructing the complete route. The agent receives the routing state and produces an action in the interval `[0,1]`. That action is interpreted as the adaptive routing parameter. The resulting `eta` modifies the routing heuristic, which then affects Dijkstra and Top-K candidate generation. In this architecture, the neural policy therefore controls the routing preference rather than replacing the graph-search algorithm.
+The most important conceptual point in the RL design is that PPO controls `eta` rather than constructing the complete route. The agent receives the routing state and produces an action in the configured `eta` interval. That action modifies the routing heuristic, which then affects Dijkstra and Top-K candidate generation. The policy controls the routing preference while the graph-search algorithm constructs candidate paths.
 
 This approach also provides a useful division between learned and deterministic components. PPO is responsible for adapting the routing parameter according to the observed state and reward history, while Dijkstra and Top-K provide the graph-theoretic mechanism for generating valid paths. Bucket and backtracking then handle route alternatives and failures. The resulting architecture is therefore neither a pure shortest-path algorithm nor a pure end-to-end neural routing model. It is an integrated routing framework in which reinforcement learning modifies a conventional pathfinding process.
 

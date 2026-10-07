@@ -511,7 +511,6 @@ def _get_known_liquidity(channel):
 
         1. estimated_liquidity
         2. liquidity_uv
-        3. balance_uv
         4. liquidity
 
     Missing all fields:
@@ -528,7 +527,6 @@ def _get_known_liquidity(channel):
     liquidity_keys = (
         "estimated_liquidity",
         "liquidity_uv",
-        "balance_uv",
         "liquidity",
     )
 

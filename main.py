@@ -72,20 +72,9 @@ MODEL_NAME = "end_to_end_hidden_failure_blind"
 # Evaluation Configuration
 # ============================================================
 
-# IMPORTANT:
-#
-# Every execution evaluates EXACTLY 10 independent payment
-# transactions.
-#
-# This is intentionally fixed at 10 so that:
-#
-#     py main.py
-#
-# always produces 10 evaluation results.
-#
-# PPO is loaded/trained only once, then one PPO inference is
-# performed independently for each of the 10 transactions.
-EVAL_TRANSACTION_COUNT = 10
+# Normal runs use the held-out transaction count from config;
+# fast validation can use a smaller smoke-run count.
+EVAL_TRANSACTION_COUNT = 3000
 
 EVAL_TRANSACTION_ENV = "RL_EVAL_TRANSACTIONS"
 
@@ -93,54 +82,35 @@ EVAL_TRANSACTION_ENV = "RL_EVAL_TRANSACTIONS"
 def get_evaluation_transaction_count(cfg):
 
     """
-    Return the exact number of evaluation transactions.
-
-    Project evaluation policy:
-        EXACTLY 10 transactions per execution.
-
-    The environment variable RL_EVAL_TRANSACTIONS is retained
-    for compatibility with previous runs, but the project-level
-    experimental requirement is fixed at 10.
+    Resolve the evaluation size from config and runtime mode.
     """
-
+    evaluation_cfg = cfg.get("evaluation", {})
+    if not isinstance(evaluation_cfg, dict):
+        raise TypeError("evaluation configuration must be a dictionary.")
+    config_key = (
+        "fast_validation_transactions"
+        if FAST_VALIDATION
+        else "transaction_count"
+    )
+    count = int(
+        evaluation_cfg.get(
+            config_key,
+            10 if FAST_VALIDATION else EVAL_TRANSACTION_COUNT,
+        )
+    )
     configured_env_value = os.environ.get(
         EVAL_TRANSACTION_ENV
     )
-
     if configured_env_value is not None:
-
         try:
-
-            requested_count = int(
-                configured_env_value
+            count = int(configured_env_value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{EVAL_TRANSACTION_ENV} must be a positive integer."
             )
-
-            if requested_count != EVAL_TRANSACTION_COUNT:
-
-                print(
-                    "\nWarning: "
-                    f"{EVAL_TRANSACTION_ENV}={requested_count} "
-                    "was requested, but this experiment requires "
-                    "exactly 10 evaluation transactions."
-                )
-
-                print(
-                    "The evaluation count will remain fixed at 10."
-                )
-
-        except Exception:
-
-            print(
-                f"\nWarning: invalid "
-                f"{EVAL_TRANSACTION_ENV}="
-                f"{configured_env_value!r}."
-            )
-
-            print(
-                "The evaluation count will remain fixed at 10."
-            )
-
-    return EVAL_TRANSACTION_COUNT
+    if count <= 0:
+        raise ValueError("Evaluation transaction count must be positive.")
+    return count
 
 
 # ============================================================
@@ -631,7 +601,8 @@ def set_stage(stage):
 
 def write_runtime_error(
     exc,
-    report=None
+    report=None,
+    run_status="FAILED",
 ):
 
     global CURRENT_STAGE
@@ -655,6 +626,8 @@ def write_runtime_error(
             "============================================================",
 
             f"Current stage : {CURRENT_STAGE}",
+
+            f"Run status    : {run_status}",
 
             f"Exception type: {exc_type}",
 
@@ -734,6 +707,11 @@ def write_runtime_error(
             report.item(
                 "Current stage",
                 CURRENT_STAGE
+            )
+
+            report.item(
+                "Run status",
+                run_status
             )
 
             report.item(
@@ -911,10 +889,31 @@ def geo_to_json(input_file):
         f"Reading snapshot: {input_file}"
     )
 
-    graph = nx.read_gml(
-        input_file,
-        label=None
-    )
+    # NetworkX's read_gml defaults to ASCII. These snapshots are UTF-8 and
+    # can contain a stray non-ASCII marker outside a quoted GML value; remove
+    # only such invalid bare characters while preserving quoted text.
+    with open(input_file, "r", encoding="utf-8") as snapshot_file:
+        gml_lines = []
+        for line in snapshot_file:
+            cleaned = []
+            quoted = False
+            escaped = False
+            for character in line:
+                if escaped:
+                    cleaned.append(character)
+                    escaped = False
+                elif character == "\\" and quoted:
+                    cleaned.append(character)
+                    escaped = True
+                elif character == '"':
+                    cleaned.append(character)
+                    quoted = not quoted
+                elif ord(character) > 127 and not quoted:
+                    continue
+                else:
+                    cleaned.append(character)
+            gml_lines.append("".join(cleaned))
+        graph = nx.parse_gml(gml_lines, label=None)
 
     data = {
 
@@ -1596,38 +1595,34 @@ def generate_evaluation_transactions(
     G,
     cfg,
     seed,
-    count
+    count,
+    source_transactions=None,
 ):
-
-    # --------------------------------------------------------
-    # Hard project requirement:
-    # exactly 10 independent evaluation transactions.
-    # --------------------------------------------------------
-
-    if count != EVAL_TRANSACTION_COUNT:
-
-        raise ValueError(
-            "Evaluation transaction count must be exactly "
-            f"{EVAL_TRANSACTION_COUNT}, got {count}."
-        )
+    if count <= 0:
+        raise ValueError("Evaluation transaction count must be positive.")
 
     min_amount = cfg["simulation"]["min_amount"]
 
     max_amount = cfg["simulation"]["max_amount"]
 
-    transactions = generate_transactions(
-
-        G,
-
-        count,
-
-        seed,
-
-        min_amount,
-
-        max_amount
-
-    )
+    if source_transactions is None:
+        transactions = generate_transactions(
+            G,
+            count,
+            seed,
+            min_amount,
+            max_amount,
+        )
+    else:
+        if len(source_transactions) < count:
+            raise ValueError(
+                f"Held-out transaction list contains {len(source_transactions)} rows; "
+                f"{count} are required."
+            )
+        transactions = [
+            copy.deepcopy(transaction)
+            for transaction in source_transactions[:count]
+        ]
 
     if not transactions:
 
@@ -1640,13 +1635,12 @@ def generate_evaluation_transactions(
         raise RuntimeError(
 
             "Evaluation transaction generator returned "
-            f"{len(transactions)} transactions, but exactly "
-            f"{count} are required."
+            f"{len(transactions)} transactions, but {count} are required."
 
         )
 
     # --------------------------------------------------------
-    # Make sure all 10 evaluation transactions are independent
+    # Make sure evaluation transactions are independent
     # objects. This also prevents accidental object reuse.
     # --------------------------------------------------------
 
@@ -1836,6 +1830,10 @@ def extract_episode_result(
         "successful_bucket_rank"
     )
 
+    successful_route_source = info.get(
+        "successful_route_source"
+    )
+
     if successful_bucket_rank is not None:
 
         try:
@@ -1938,6 +1936,9 @@ def extract_episode_result(
         "successful_bucket_rank":
             successful_bucket_rank,
 
+        "successful_route_source":
+            successful_route_source,
+
         "attempt_count":
             attempt_count,
 
@@ -1977,10 +1978,13 @@ def extract_episode_result(
         "path":
             final_path,
 
+        "path_length":
+            path_length,
+
         "hops":
             max(
                 0,
-                path_length - 1
+                path_length
             ),
 
         "info_keys":
@@ -2070,6 +2074,21 @@ def aggregate_evaluation_results(
                 values
             )
         )
+
+    def delay_percentile(percentile, only_success):
+        values = []
+        for result in results:
+            if only_success and not result.get("success", False):
+                continue
+            if int(result.get("path_length", 0) or 0) <= 0:
+                continue
+            try:
+                value = float(result.get("delay"))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                values.append(value)
+        return float(np.percentile(values, percentile)) if values else None
 
     rank_counts = {}
 
@@ -2185,6 +2204,18 @@ def aggregate_evaluation_results(
                 "delay",
                 only_success=True
             ),
+
+        "p90_delay_success":
+            delay_percentile(90, only_success=True),
+
+        "p95_delay_success":
+            delay_percentile(95, only_success=True),
+
+        "p90_delay_routed":
+            delay_percentile(90, only_success=False),
+
+        "p95_delay_routed":
+            delay_percentile(95, only_success=False),
 
         "average_carbon":
             mean(
@@ -2431,12 +2462,12 @@ def main():
 
     report.item(
         "Current step",
-        "0/10"
+        f"0/{TOTAL_STEPS}"
     )
 
     report.item(
         "Evaluation transaction count",
-        "EXACTLY 10"
+        "Resolved from configuration and RL_EVAL_TRANSACTIONS"
     )
 
     report.save()
@@ -2489,9 +2520,7 @@ def main():
         )
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Evaluation is always exactly 10 transactions.
+        # Resolve fast-smoke or full held-out evaluation size.
         # ----------------------------------------------------
 
         evaluation_transaction_count = (
@@ -2500,12 +2529,8 @@ def main():
             )
         )
 
-        if evaluation_transaction_count != 10:
-
-            raise RuntimeError(
-                "Internal configuration error: evaluation "
-                "transaction count is not 10."
-            )
+        if evaluation_transaction_count <= 0:
+            raise RuntimeError("Evaluation transaction count must be positive.")
 
         report.item(
             "Configuration",
@@ -2532,7 +2557,7 @@ def main():
 
         report.item(
             "Evaluation transaction policy",
-            "EXACTLY 10 PER EXECUTION"
+            "CONFIGURED COUNT; HELD-OUT SPLIT IN NORMAL MODE"
         )
 
         complete_step(
@@ -2625,7 +2650,9 @@ def main():
             snapshot_path
         )
 
-        builder = LNGraphBuilder()
+        builder = LNGraphBuilder(
+            default_capacity=cfg.get("channel", {}).get("default_capacity")
+        )
 
         G = builder.from_data(
             data
@@ -2945,29 +2972,19 @@ def main():
                 "\nFAST VALIDATION MODE IS ENABLED."
             )
 
-            print(
-                "PPO training will NOT be repeated."
-            )
-
-            print(
-                "The existing PPO model will be loaded."
-            )
-
             report.item(
                 "Execution mode",
                 "FAST VALIDATION"
             )
 
             report.item(
-                "PPO training",
-                "SKIPPED"
+                "PPO checkpoint candidate",
+                str(model_zip_path.resolve())
             )
 
             report.item(
-                "Expected model",
-                str(
-                    model_zip_path.resolve()
-                )
+                "Fast validation policy",
+                "Load a compatible checkpoint; if unavailable, train an isolated quick model"
             )
 
             report.item(
@@ -2975,55 +2992,212 @@ def main():
                 "PROJECT-LOCAL ZIP/BytesIO COMPATIBILITY"
             )
 
-            model, model_load_time = (
-                load_existing_ppo_model(
-                    model_path,
-                    env=None
-                )
-            )
+            model_load_start = time.time()
 
-            report.item(
-                "Model load status",
-                "SUCCESS"
-            )
+            try:
+
+                model, model_load_time = (
+                    load_existing_ppo_model(
+                        model_path,
+                        env=None
+                    )
+                )
+
+                report.item(
+                    "Checkpoint status",
+                    "COMPATIBLE MODEL LOADED"
+                )
+
+                report.item(
+                    "Model provenance",
+                    "Existing PPO checkpoint"
+                )
+
+                report.item(
+                    "Model",
+                    str(model_zip_path.resolve())
+                )
+
+                report.item(
+                    "Training time (seconds)",
+                    0.0
+                )
+
+                report.add("")
+
+                report.add(
+                    "Fast validation reused an existing checkpoint. "
+                    "Its observation shape and archive were validated "
+                    "before inference."
+                )
+
+            except Exception as checkpoint_error:
+
+                model_load_time = (
+                    time.time() - model_load_start
+                )
+
+                print(
+                    "\nNo usable PPO checkpoint was available; "
+                    "training an isolated quick-validation model."
+                )
+
+                report.item(
+                    "Research checkpoint status",
+                    "MISSING OR INCOMPATIBLE"
+                )
+
+                report.item(
+                    "Research checkpoint load error",
+                    f"{type(checkpoint_error).__name__}: {checkpoint_error}"
+                )
+
+                fast_model_dir = (
+                    model_dir / "fast_validation"
+                )
+
+                fast_cfg = copy.deepcopy(cfg)
+                fast_cfg.setdefault("rl", {})
+                fast_cfg["rl"]["model_dir"] = str(
+                    fast_model_dir
+                )
+                fast_cfg["rl"]["log_dir"] = str(
+                    Path("logs") / "fast_validation"
+                )
+                fast_cfg["rl"]["checkpoint_dir"] = str(
+                    fast_model_dir / "checkpoints"
+                )
+
+                fast_model_path = (
+                    fast_model_dir / MODEL_NAME
+                )
+
+                try:
+
+                    model, quick_model_load_time = (
+                        load_existing_ppo_model(
+                            fast_model_path,
+                            env=None,
+                        )
+                    )
+
+                    model_load_time += quick_model_load_time
+
+                    report.item(
+                        "Checkpoint status",
+                        "COMPATIBLE QUICK VALIDATION MODEL LOADED"
+                    )
+
+                    report.item(
+                        "Model provenance",
+                        "Previously trained quick-validation model"
+                    )
+
+                    report.item(
+                        "Model",
+                        str(Path(str(fast_model_path) + ".zip").resolve())
+                    )
+
+                    report.item(
+                        "Training time (seconds)",
+                        0.0
+                    )
+
+                    report.add("")
+
+                    report.add(
+                        "The research checkpoint was unavailable, so a "
+                        "compatible model from the isolated fast-validation "
+                        "directory was reused. Its results remain smoke "
+                        "validation only."
+                    )
+
+                except Exception as quick_checkpoint_error:
+
+                    report.item(
+                        "Quick checkpoint status",
+                        "MISSING OR INCOMPATIBLE; QUICK TRAINING STARTED"
+                    )
+
+                    report.item(
+                        "Quick checkpoint load error",
+                        f"{type(quick_checkpoint_error).__name__}: "
+                        f"{quick_checkpoint_error}"
+                    )
+
+                    report.item(
+                        "PPO training",
+                        "QUICK VALIDATION TRAINING"
+                    )
+
+                    report.item(
+                        "Training transactions",
+                        len(train_tx)
+                    )
+
+                    report.item(
+                        "Model output",
+                        str(Path(str(fast_model_path) + ".zip").resolve())
+                    )
+
+                    training_start = time.time()
+
+                    model = train_agent(
+                        G_train,
+                        train_tx,
+                        lnd_cost,
+                        fast_cfg,
+                        MODEL_NAME,
+                        seed,
+                        fast_training=True,
+                    )
+
+                    training_time = time.time() - training_start
+
+                    report.item(
+                        "Training status",
+                        "SUCCESS - QUICK VALIDATION ONLY"
+                    )
+
+                    report.item(
+                        "Training time (seconds)",
+                        round(training_time, 4)
+                    )
+
+                    report.item(
+                        "Model provenance",
+                        "Fresh quick PPO model; isolated from the research checkpoint"
+                    )
+
+                    report.item(
+                        "Model",
+                        str(Path(str(fast_model_path) + ".zip").resolve())
+                    )
+
+                    report.add("")
+
+                    report.add(
+                        "This quick model is trained only to validate the "
+                        "end-to-end software path. Its results are not a "
+                        "research evaluation and it does not overwrite the "
+                        "normal-training checkpoint."
+                    )
 
             report.item(
                 "Model load time (seconds)",
-                round(
-                    model_load_time,
-                    4
-                )
+                round(model_load_time, 4)
             )
 
             report.item(
-                "Training time (seconds)",
-                0.0
-            )
-
-            report.item(
-                "Model",
-                str(
-                    model_zip_path
-                )
-            )
-
-            report.add("")
-
-            report.add(
-                "Fast validation skipped PPO training and "
-                "reused the existing trained PPO model."
-            )
-
-            report.add(
-                "The PPO checkpoint was loaded through a "
-                "project-local ZIP-to-BytesIO compatibility loader."
+                "PPO checkpoint loader",
+                "PROJECT-LOCAL ZIP/BytesIO COMPATIBILITY"
             )
 
             complete_step(
                 4,
                 "STEP 4 - PPO TRAINING",
                 report,
-                "EXISTING PPO MODEL LOADED"
+                "PPO MODEL READY FOR VALIDATION"
             )
 
         # ----------------------------------------------------
@@ -3144,7 +3318,7 @@ def main():
             5,
             "STEP 5 - GENERATE PAYMENT SCENARIOS",
             report,
-            "Generating exactly 10 independent evaluation transactions..."
+            f"Generating {evaluation_transaction_count} evaluation transactions..."
         )
 
         print(
@@ -3152,7 +3326,7 @@ def main():
         )
 
         print(
-            "STEP 5 - GENERATING 10 PAYMENT SCENARIOS"
+            f"STEP 5 - GENERATING {evaluation_transaction_count} PAYMENT SCENARIOS"
         )
 
         print(
@@ -3172,7 +3346,13 @@ def main():
 
                 scenario_seed,
 
-                evaluation_transaction_count
+                evaluation_transaction_count,
+
+                source_transactions=(
+                    None
+                    if FAST_VALIDATION
+                    else training_transactions[train_count:]
+                ),
 
             )
         )
@@ -3181,11 +3361,11 @@ def main():
         # Hard validation.
         # ----------------------------------------------------
 
-        if len(evaluation_transactions) != 10:
+        if len(evaluation_transactions) != evaluation_transaction_count:
 
             raise RuntimeError(
 
-                "Exactly 10 evaluation transactions were "
+                f"Exactly {evaluation_transaction_count} evaluation transactions were "
                 "required, but "
                 f"{len(evaluation_transactions)} were generated."
 
@@ -3210,7 +3390,7 @@ def main():
 
         report.item(
             "Evaluation transaction policy",
-            "EXACTLY 10"
+            f"{evaluation_transaction_count} configured transactions"
         )
 
         print(
@@ -3281,7 +3461,7 @@ def main():
             5,
             "STEP 5 - GENERATE PAYMENT SCENARIOS",
             report,
-            "10 PAYMENT SCENARIOS READY"
+            f"{evaluation_transaction_count} PAYMENT SCENARIOS READY"
         )
 
         # ====================================================
@@ -3366,7 +3546,7 @@ def main():
             7,
             "STEP 7 - CREATE RUNTIME ENVIRONMENTS",
             report,
-            "Preparing 10 independent routing environments..."
+            f"Preparing {evaluation_transaction_count} independent routing environments..."
         )
 
         print(
@@ -3538,7 +3718,7 @@ def main():
             9,
             "STEP 9 - EXECUTE MULTI-TRANSACTION ROUTING",
             report,
-            "Executing all 10 independent payment scenarios..."
+            f"Executing all {evaluation_transaction_count} payment scenarios..."
         )
 
         print(
@@ -3565,7 +3745,7 @@ def main():
         report.add("")
 
         report.add(
-            "Each of the 10 transactions is evaluated independently."
+            "Each held-out transaction is evaluated independently."
         )
 
         report.add(
@@ -3628,7 +3808,7 @@ def main():
 
             print(
                 f"EVALUATION TRANSACTION "
-                f"{episode_index}/10"
+                f"{episode_index}/{evaluation_transaction_count}"
             )
 
             print(
@@ -3898,8 +4078,8 @@ def main():
                     if result["success"]:
 
                         print(
-                            "Successful Bucket candidate: "
-                            "NOT EXPLICITLY REPORTED"
+                            "Successful route source: "
+                            f"{result.get('successful_route_source') or 'UNKNOWN'}"
                         )
 
                     else:
@@ -3950,7 +4130,7 @@ def main():
 
             report.section(
                 f"EVALUATION TRANSACTION "
-                f"{episode_index}/10"
+                f"{episode_index}/{evaluation_transaction_count}"
             )
 
             report.item(
@@ -4050,11 +4230,21 @@ def main():
                     is not None
                     else
                     (
+                        "PARTIAL BACKTRACK"
+                        if result.get("successful_route_source")
+                        == "partial_backtrack"
+                        else
                         "UNKNOWN"
                         if result["success"]
-                        else
-                        "NONE"
+                        else "NONE"
                     )
+                )
+            )
+
+            report.item(
+                "Successful route source",
+                result.get("successful_route_source") or (
+                    "unknown" if result["success"] else "none"
                 )
             )
 
@@ -4135,17 +4325,16 @@ def main():
         # ====================================================
 
         # ----------------------------------------------------
-        # Hard validation:
-        # there MUST be exactly 10 results.
+        # The evaluation must retain exactly the configured number of rows.
         # ----------------------------------------------------
 
-        if len(evaluation_results) != 10:
+        if len(evaluation_results) != evaluation_transaction_count:
 
             raise RuntimeError(
 
                 "Evaluation completed with "
                 f"{len(evaluation_results)} results instead of "
-                "the required 10."
+                f"the configured count {evaluation_transaction_count}."
 
             )
 
@@ -4172,7 +4361,7 @@ def main():
 
         report.item(
             "Expected transactions",
-            "10"
+            str(evaluation_transaction_count)
         )
 
         report.item(
@@ -4226,6 +4415,11 @@ def main():
                 4
             )
         )
+
+        report.item("P90 route delay (successful)", aggregate["p90_delay_success"])
+        report.item("P95 route delay (successful)", aggregate["p95_delay_success"])
+        report.item("P90 route delay (all routed)", aggregate["p90_delay_routed"])
+        report.item("P95 route delay (all routed)", aggregate["p95_delay_routed"])
 
         report.item(
             "Average carbon",
@@ -4364,7 +4558,7 @@ def main():
         report.add("")
 
         report.add(
-            "Exactly 10 independent evaluation transactions "
+            f"{evaluation_transaction_count} independent evaluation transactions "
             "were processed."
         )
 
@@ -4394,7 +4588,7 @@ def main():
             9,
             "STEP 9 - EXECUTE MULTI-TRANSACTION ROUTING",
             report,
-            "10-TRANSACTION ROUTING COMPLETED"
+            f"{evaluation_transaction_count}-TRANSACTION ROUTING COMPLETED"
         )
 
         # ====================================================
@@ -4448,6 +4642,17 @@ def main():
                 if any_success
                 else
                 "ALL PAYMENTS FAILED"
+            )
+        )
+
+        report.item(
+            "Payment outcome",
+            (
+                "ALL SUCCESSFUL"
+                if all_success
+                else "MIXED"
+                if any_success
+                else "ALL FAILED"
             )
         )
 
@@ -4581,10 +4786,12 @@ def main():
                 ] is not None
                 else
                 (
-                    "UNKNOWN"
+                    "PARTIAL BACKTRACK"
+                    if result.get("successful_route_source")
+                    == "partial_backtrack"
+                    else "UNKNOWN"
                     if result["success"]
-                    else
-                    "NONE"
+                    else "NONE"
                 )
             )
 
@@ -4603,6 +4810,7 @@ def main():
                     f"bucket={result['bucket_size']} | "
                     f"attempts={result['attempt_count']} | "
                     f"route={successful_rank} | "
+                    f"route_source={result.get('successful_route_source') or 'N/A'} | "
                     f"reward={result['reward']:.6f}"
                 )
             )
@@ -4641,7 +4849,11 @@ def main():
 
             report.add(
                 f"{aggregate['failed_transactions']} payment "
-                "scenarios failed."
+                + (
+                    "scenario failed."
+                    if aggregate["failed_transactions"] == 1
+                    else "scenarios failed."
+                )
             )
 
         else:
@@ -4662,7 +4874,7 @@ def main():
         )
 
         report.add(
-            "Exactly 10 independent payment transactions "
+            f"Exactly {evaluation_transaction_count} independent payment transactions "
             "were evaluated."
         )
 
@@ -4708,12 +4920,12 @@ def main():
 
         report.item(
             "Evaluation transactions",
-            "10"
+            str(evaluation_transaction_count)
         )
 
         report.item(
             "Expected PPO predictions",
-            "10"
+            str(evaluation_transaction_count)
         )
 
         report.item(
@@ -4802,13 +5014,20 @@ def main():
 
         report.item(
             "Evaluation transactions",
-            "10"
+            evaluation_transaction_count
         )
 
         report.item(
             "PPO predictions",
-            "10"
+            len(evaluation_results)
         )
+
+        if FAST_VALIDATION:
+
+            report.item(
+                "Result interpretation",
+                "Smoke validation only; not a scientific performance estimate"
+            )
 
         report.item(
             "Top-K",
@@ -4837,7 +5056,7 @@ def main():
             progress=100.0,
             step=10,
             step_name="RUN COMPLETED",
-            message="10-TRANSACTION END-TO-END EVALUATION COMPLETED"
+            message=f"{evaluation_transaction_count}-TRANSACTION END-TO-END EVALUATION COMPLETED"
         )
 
         print(
@@ -4845,7 +5064,16 @@ def main():
         )
 
         print(
-            "10-TRANSACTION END-TO-END EVALUATION FINISHED"
+            f"{evaluation_transaction_count}-TRANSACTION END-TO-END EVALUATION FINISHED"
+        )
+
+        print(
+            "Run status           : COMPLETED"
+        )
+
+        print(
+            "Payment outcome      : "
+            f"{'ALL SUCCESSFUL' if all_success else 'MIXED' if any_success else 'ALL FAILED'}"
         )
 
         print(
@@ -4864,12 +5092,12 @@ def main():
 
         print(
             f"Transactions         : "
-            f"{aggregate['total_transactions']} / 10"
+            f"{aggregate['total_transactions']} / {evaluation_transaction_count}"
         )
 
         print(
             f"PPO predictions      : "
-            f"{len(evaluation_results)} / 10"
+            f"{len(evaluation_results)} / {evaluation_transaction_count}"
         )
 
         print(
@@ -5001,6 +5229,18 @@ def main():
 
         return {
 
+            "execution_completed":
+                True,
+
+            "routing_outcome":
+                (
+                    "all_success"
+                    if all_success
+                    else "mixed"
+                    if any_success
+                    else "all_failed"
+                ),
+
             "success":
                 all_success,
 
@@ -5054,6 +5294,18 @@ def main():
                 aggregate[
                     "average_delay"
                 ],
+
+            "p90_delay_success":
+                aggregate["p90_delay_success"],
+
+            "p95_delay_success":
+                aggregate["p95_delay_success"],
+
+            "p90_delay_routed":
+                aggregate["p90_delay_routed"],
+
+            "p95_delay_routed":
+                aggregate["p95_delay_routed"],
 
             "average_carbon":
                 aggregate[
@@ -5123,11 +5375,42 @@ def main():
 
         }
 
+    except KeyboardInterrupt as exc:
+
+        write_runtime_error(
+            exc,
+            report,
+            run_status="INTERRUPTED",
+        )
+
+        print(
+            "\n============================================================"
+        )
+
+        print(
+            "END-TO-END EXECUTION INTERRUPTED"
+        )
+
+        print(
+            "Run status: INTERRUPTED"
+        )
+
+        print(
+            f"Stage: {CURRENT_STAGE}"
+        )
+
+        print(
+            f"Partial report saved to: {REPORT_FILE.resolve()}"
+        )
+
+        raise
+
     except Exception as exc:
 
         write_runtime_error(
             exc,
-            report
+            report,
+            run_status="FAILED",
         )
 
         print(
@@ -5136,6 +5419,10 @@ def main():
 
         print(
             "END-TO-END EXECUTION FAILED"
+        )
+
+        print(
+            "Run status: FAILED"
         )
 
         print(

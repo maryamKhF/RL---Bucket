@@ -29,12 +29,17 @@ class LNGraphBuilder:
       and learning modules.
     """
 
-    def __init__(self, carbon_dataset=None):
+    def __init__(self, carbon_dataset=None, default_capacity=None):
         self.carbon_dataset = (
             carbon_dataset
             if carbon_dataset is not None
             else CarbonIntensityDataset()
         )
+        if default_capacity is not None:
+            default_capacity = float(default_capacity)
+            if not np.isfinite(default_capacity) or default_capacity < 0:
+                raise ValueError("default_capacity must be finite and nonnegative.")
+        self.default_capacity = default_capacity
 
     # ==========================================================
     # Load Real LN Snapshot from JSON File
@@ -316,6 +321,9 @@ class LNGraphBuilder:
                 ):
 
                     capacity = None
+
+            if capacity is None and self.default_capacity is not None:
+                capacity = self.default_capacity
 
             # --------------------------------------------------
             # Channel ID

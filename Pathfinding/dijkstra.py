@@ -423,22 +423,16 @@ class Dijkstra:
                         continue
 
                     # ----------------------------------------------
-                    # Liquidity
-                    #
-                    # Liquidity is a hard feasibility constraint.
+                    # Public estimate, when available, is a feasibility hint.
+                    # Unknown balances remain routable: only the simulator
+                    # can test the hidden directional liquidity during payment.
                     # ----------------------------------------------
 
                     liquidity = self._estimated_liquidity(
                         data
                     )
 
-                    if liquidity is None:
-                        raise ValueError(
-                            f"Missing valid liquidity for edge "
-                            f"{u}->{v}, key={key!r}"
-                        )
-
-                    if liquidity < amount:
+                    if liquidity is not None and liquidity < amount:
                         continue
 
                     # ----------------------------------------------
@@ -872,23 +866,17 @@ class Dijkstra:
         Priority:
             estimated_liquidity
             liquidity_uv
-            balance_uv
 
         Invalid values are never silently converted to zero.
         """
 
-        found = False
-
         for field in (
             "estimated_liquidity",
             "liquidity_uv",
-            "balance_uv",
         ):
 
             if field not in data:
                 continue
-
-            found = True
 
             value = data[field]
 
@@ -916,11 +904,6 @@ class Dijkstra:
                 )
 
             return value
-
-        if found:
-            raise ValueError(
-                "Liquidity fields exist but contain no valid value"
-            )
 
         return None
 
@@ -1176,10 +1159,7 @@ class Dijkstra:
             )
 
             if liquidity is None:
-                raise ValueError(
-                    f"Missing liquidity for selected edge "
-                    f"{u}->{v}, key={key!r}"
-                )
+                return None
 
             values.append(
                 liquidity

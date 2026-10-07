@@ -966,7 +966,10 @@ def _run_proposed_method(
         # One environment reset starts at the first transaction.
         # ----------------------------------------------------
 
-        obs, reset_info = env.reset()
+        obs, reset_info = env.reset(
+            seed=seed,
+            options={"transaction_index": 0},
+        )
 
         transaction_index = 0
 

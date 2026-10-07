@@ -49,6 +49,7 @@ from Simulation.backtrack import PartialBacktracker
 # ==========================================================
 
 from RL.state import State
+from RL.liquidity_belief import LiquidityBelief
 
 
 # ==========================================================
@@ -227,6 +228,15 @@ class RoutingEnv(gym.Env):
             dict(config)
             if config is not None
             else {}
+        )
+        channel_cfg = self.cfg.get("channel", {})
+        self.liquidity_belief = LiquidityBelief(
+            self.G,
+            default_capacity=(
+                channel_cfg.get("default_capacity")
+                if isinstance(channel_cfg, dict)
+                else None
+            ),
         )
 
         # --------------------------------------------------
@@ -481,6 +491,11 @@ class RoutingEnv(gym.Env):
                     self.recovery_rate
                 ),
                 seed=self.seed,
+                default_capacity=(
+                    self.cfg.get("channel", {}).get("default_capacity")
+                    if isinstance(self.cfg.get("channel", {}), dict)
+                    else None
+                ),
             )
 
         else:
@@ -551,6 +566,7 @@ class RoutingEnv(gym.Env):
             bucket_info={},
             k=self.state_k,
             radius=self.state_radius,
+            liquidity_beliefs=self.liquidity_belief.bounds,
         )
 
         observation_dimension = int(
@@ -607,6 +623,9 @@ class RoutingEnv(gym.Env):
     ):
         super().reset(seed=seed)
 
+        if options is not None and not isinstance(options, dict):
+            raise TypeError("reset options must be a dictionary or None.")
+
         if seed is not None:
             self.seed = self._validate_seed(seed)
 
@@ -657,12 +676,28 @@ class RoutingEnv(gym.Env):
         # Reset transaction state
         # --------------------------------------------------
 
-        self.tx_index = int(
-            self.np_random.integers(
-                low=0,
-                high=len(self.transactions),
-            )
+        requested_index = (
+            options.get("transaction_index")
+            if options is not None
+            else None
         )
+        if requested_index is None:
+            self.tx_index = int(
+                self.np_random.integers(
+                    low=0,
+                    high=len(self.transactions),
+                )
+            )
+        else:
+            if isinstance(requested_index, bool) or not isinstance(
+                requested_index, (int, np.integer)
+            ):
+                raise TypeError("options.transaction_index must be an integer.")
+            if not 0 <= int(requested_index) < len(self.transactions):
+                raise ValueError(
+                    "options.transaction_index is outside the transaction list."
+                )
+            self.tx_index = int(requested_index)
         self.current_tx = None
         self.current_paths = []
         self.current_bucket = None
@@ -890,6 +925,14 @@ class RoutingEnv(gym.Env):
 
             "bucket_size": self._bucket_size(
                 self.current_bucket
+            ),
+
+            "successful_bucket_rank": result.get(
+                "successful_bucket_rank"
+            ),
+
+            "successful_route_source": result.get(
+                "successful_route_source"
             ),
 
             "success": payment_success,
@@ -1200,6 +1243,8 @@ class RoutingEnv(gym.Env):
 
         final_failure_probability = 1.0
         final_reason = None
+        final_successful_bucket_rank = None
+        successful_route_source = None
 
         # --------------------------------------------------
         # Safety bound.
@@ -1324,6 +1369,7 @@ class RoutingEnv(gym.Env):
             result = self._result_to_dict(
                 payment_result
             )
+            self._learn_liquidity_feedback(result, edges, tx.amount)
 
             success = self._require_bool(
                 result,
@@ -1349,6 +1395,10 @@ class RoutingEnv(gym.Env):
 
                 final_success = True
                 final_path = list(path)
+                final_successful_bucket_rank = (
+                    current_bucket.selected_candidate_rank
+                )
+                successful_route_source = "bucket_candidate"
 
                 final_fee = self._result_float(
                     result,
@@ -1549,6 +1599,9 @@ class RoutingEnv(gym.Env):
                     retry_dict = self._result_to_dict(
                         retry_result
                     )
+                    self._learn_liquidity_feedback(
+                        retry_dict, retry_edges, tx.amount
+                    )
 
                     retry_success = (
                         self._require_bool(
@@ -1564,6 +1617,7 @@ class RoutingEnv(gym.Env):
 
                         final_success = True
                         final_path = list(new_path)
+                        successful_route_source = "partial_backtrack"
 
                         final_fee = self._result_float(
                             retry_dict,
@@ -1729,6 +1783,8 @@ class RoutingEnv(gym.Env):
                 final_failure_probability
             ),
             "reason": final_reason,
+            "successful_bucket_rank": final_successful_bucket_rank,
+            "successful_route_source": successful_route_source,
             "attempt_count": attempt_count,
             "backtrack_count": (
                 partial_backtrack_count
@@ -2713,6 +2769,16 @@ class RoutingEnv(gym.Env):
 
         return result
 
+    def _learn_liquidity_feedback(self, result, edges, amount):
+        """Update only the agent's interval belief from payment outcomes."""
+        if result.get("success") is True:
+            self.liquidity_belief.observe_success(edges, amount)
+            return
+        if result.get("reason") == "liquidity_failure":
+            failed_edge = result.get("failed_edge")
+            if failed_edge is not None:
+                self.liquidity_belief.observe_failure(failed_edge, amount)
+
     # ======================================================
     # ETA
     # ======================================================
@@ -2883,6 +2949,7 @@ class RoutingEnv(gym.Env):
             bucket_info=bucket_info,
             k=self.state_k,
             radius=self.state_radius,
+            liquidity_beliefs=self.liquidity_belief.bounds,
         )
 
         vector = np.asarray(

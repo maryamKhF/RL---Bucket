@@ -73,15 +73,19 @@ simulation:
 rl:
   algorithm: PPO
 
+  eta_min: -1.0
+
+  eta_max: 1.0
+
   device: auto
 
   seed: 42
 
   total_timesteps: 20000
 
-  learning_rate: 0.0003
+  learning_rate: 0.000001
 
-  n_steps: 256
+  n_steps: 2048
 
   batch_size: 64
 
@@ -93,11 +97,11 @@ rl:
 
   clip_range: 0.20
 
-  ent_coef: 0.01
+  ent_coef: 0.0
 
   hidden_layers:
-    - 128
-    - 128
+    - 64
+    - 64
 
 # ======================================================
 # Bucket Routing

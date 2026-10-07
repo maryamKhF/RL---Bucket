@@ -6,6 +6,7 @@ import numpy as np
 
 from .node import Node
 from .channel import Channel
+from .carbon_intensity import CarbonIntensityDataset
 
 
 class LNGraphBuilder:
@@ -16,16 +17,10 @@ class LNGraphBuilder:
         2. In-memory JSON-like data
         3. Synthetic Lightning topology
 
-    Important modeling rules
-    -------------------------
-    - rgb_color is preserved in its original representation.
-    - RGB values are converted to a numeric carbon-intensity proxy
-      using:
-
-          0.299R + 0.587G + 0.114B
-
-    - If rgb_color is missing or invalid, carbon_intensity is set
-      to 0.0.
+    Carbon intensity is loaded from the geographic energy-mix
+    dataset and assigned to each node by country, then continent,
+    then world average. Snapshot RGB metadata is preserved only as
+    visual metadata and is never used to derive carbon intensity.
 
     - Channel capacity is NOT treated as directional liquidity.
     - If directional balance/liquidity is not provided by the input,
@@ -34,190 +29,11 @@ class LNGraphBuilder:
       and learning modules.
     """
 
-    # ==========================================================
-    # RGB / Carbon Utility
-    # ==========================================================
-
-    @staticmethod
-    def _rgb_to_carbon_intensity(rgb_color):
-        """
-        Convert a supported RGB representation into the numeric
-        carbon-intensity proxy used by the routing heuristics.
-
-        Supported representations:
-
-            "3399ff"
-            "#3399ff"
-
-            [51, 153, 255]
-            (51, 153, 255)
-
-            {"r": 51, "g": 153, "b": 255}
-            {"red": 51, "green": 153, "blue": 255}
-
-        Returns
-        -------
-        float or None
-            Numeric RGB luminance/carbon proxy.
-
-            None is returned when the RGB representation is
-            absent or invalid.
-
-        Important
-        ---------
-        The original rgb_color value is NOT modified.
-
-        The graph keeps the original value separately as
-        "rgb_color".
-        """
-
-        # ------------------------------------------------------
-        # Missing RGB
-        # ------------------------------------------------------
-
-        if rgb_color is None:
-            return None
-
-        r = None
-        g = None
-        b = None
-
-        # ------------------------------------------------------
-        # Dictionary representation
-        # ------------------------------------------------------
-
-        if isinstance(rgb_color, dict):
-
-            if all(
-                key in rgb_color
-                for key in ("r", "g", "b")
-            ):
-                r = rgb_color["r"]
-                g = rgb_color["g"]
-                b = rgb_color["b"]
-
-            elif all(
-                key in rgb_color
-                for key in ("red", "green", "blue")
-            ):
-                r = rgb_color["red"]
-                g = rgb_color["green"]
-                b = rgb_color["blue"]
-
-            else:
-                return None
-
-        # ------------------------------------------------------
-        # List / Tuple representation
-        # ------------------------------------------------------
-
-        elif isinstance(
-            rgb_color,
-            (list, tuple)
-        ):
-
-            if len(rgb_color) != 3:
-                return None
-
-            r, g, b = rgb_color
-
-        # ------------------------------------------------------
-        # Hexadecimal string representation
-        # ------------------------------------------------------
-
-        elif isinstance(
-            rgb_color,
-            str
-        ):
-
-            value = rgb_color.strip()
-
-            if value.startswith("#"):
-                value = value[1:]
-
-            if len(value) != 6:
-                return None
-
-            try:
-                r = int(
-                    value[0:2],
-                    16
-                )
-
-                g = int(
-                    value[2:4],
-                    16
-                )
-
-                b = int(
-                    value[4:6],
-                    16
-                )
-
-            except ValueError:
-                return None
-
-        # ------------------------------------------------------
-        # Unsupported representation
-        # ------------------------------------------------------
-
-        else:
-            return None
-
-        # ------------------------------------------------------
-        # Validate RGB components
-        # ------------------------------------------------------
-
-        try:
-            r = float(r)
-            g = float(g)
-            b = float(b)
-
-        except (
-            TypeError,
-            ValueError
-        ):
-            return None
-
-        # ------------------------------------------------------
-        # Validate finite values
-        # ------------------------------------------------------
-
-        if not all(
-            np.isfinite(value)
-            for value in (r, g, b)
-        ):
-            return None
-
-        # ------------------------------------------------------
-        # Validate RGB range
-        # ------------------------------------------------------
-
-        if not all(
-            0.0 <= value <= 255.0
-            for value in (r, g, b)
-        ):
-            return None
-
-        # ------------------------------------------------------
-        # RGB luminance / carbon-intensity proxy
-        #
-        # Formula:
-        #
-        #     0.299R + 0.587G + 0.114B
-        #
-        # ------------------------------------------------------
-
-        carbon_intensity = (
-            0.299 * r
-            +
-            0.587 * g
-            +
-            0.114 * b
-        )
-
-        return float(
-            carbon_intensity
+    def __init__(self, carbon_dataset=None):
+        self.carbon_dataset = (
+            carbon_dataset
+            if carbon_dataset is not None
+            else CarbonIntensityDataset()
         )
 
     # ==========================================================
@@ -256,11 +72,8 @@ class LNGraphBuilder:
         """
         Build a MultiDiGraph from JSON-like data.
 
-        Important:
-        - RGB is preserved.
-        - Missing RGB produces carbon_intensity=0.0.
-        - Capacity is never interpreted as directional liquidity.
-        - Unknown directional liquidity remains None.
+        RGB is preserved as visual metadata only. Carbon intensity
+        comes from the configured geographic dataset.
         """
 
         G = nx.MultiDiGraph()
@@ -305,11 +118,15 @@ class LNGraphBuilder:
             # Geographic information
             # --------------------------------------------------
 
+            geo = n.get("geojson", n.get("locations", {}))
+            if not isinstance(geo, dict):
+                geo = {}
+
             latitude = n.get(
                 "latitude",
                 n.get(
                     "lat",
-                    0.0
+                    geo.get("latitude", 0.0)
                 )
             )
 
@@ -317,107 +134,52 @@ class LNGraphBuilder:
                 "longitude",
                 n.get(
                     "lon",
-                    0.0
+                    geo.get("longitude", 0.0)
                 )
             )
 
-            country = n.get(
-                "country",
-                "US"
+            coordinate_text = geo.get("loc")
+            if coordinate_text and latitude == 0.0 and longitude == 0.0:
+                try:
+                    latitude_text, longitude_text = str(coordinate_text).split(",", 1)
+                    latitude = float(latitude_text)
+                    longitude = float(longitude_text)
+                except (TypeError, ValueError):
+                    pass
+
+            country_code = (
+                n.get("country_code_iso3")
+                or geo.get("country_code_iso3")
+                or n.get("country_code")
+                or geo.get("country")
+                or n.get("country")
+            )
+            country = str(country_code) if country_code else ""
+            continent_code = (
+                n.get("continent_code")
+                or geo.get("continent_code")
             )
 
             # --------------------------------------------------
-            # RGB / Carbon information
-            #
-            # The original RGB representation is preserved.
-            #
-            # Example:
-            #
-            #     "3399ff"
-            #
-            # is NOT converted to float and is NOT discarded.
-            #
-            # Instead:
-            #
-            #     R = 51
-            #     G = 153
-            #     B = 255
-            #
-            # and:
-            #
-            #     carbon =
-            #         0.299R
-            #       + 0.587G
-            #       + 0.114B
-            #
-            # If RGB is missing or invalid:
-            #
-            #     carbon_intensity = 0.0
-            #
-            # --------------------------------------------------
+            # Keep RGB metadata, but never use it as carbon data.
 
             rgb_color = n.get(
                 "rgb_color",
                 None
             )
 
-            rgb_carbon_intensity = (
-                self._rgb_to_carbon_intensity(
-                    rgb_color
+            carbon_intensity, carbon_source, country_iso3 = (
+                self.carbon_dataset.lookup(
+                    country_code=country_code,
+                    continent_code=continent_code,
                 )
             )
-
-            # --------------------------------------------------
-            # Determine carbon intensity
-            # --------------------------------------------------
-            #
-            # Priority:
-            #
-            # 1. Valid RGB
-            # 2. Explicit carbon_intensity
-            # 3. Zero
-            #
-            # The third case is important for real snapshot
-            # nodes that contain no RGB information.
-            #
-            # --------------------------------------------------
-
-            if rgb_carbon_intensity is not None:
-
-                carbon_intensity = (
-                    rgb_carbon_intensity
+            if country_iso3:
+                country = country_iso3
+            if continent_code is None:
+                continent_code = self.carbon_dataset.continent_for(
+                    country_code
                 )
-
-            else:
-
-                carbon_value = n.get(
-                    "carbon_intensity",
-                    None
-                )
-
-                if carbon_value is not None:
-
-                    try:
-
-                        carbon_intensity = float(
-                            carbon_value
-                        )
-
-                        if not np.isfinite(
-                            carbon_intensity
-                        ):
-                            carbon_intensity = 0.0
-
-                    except (
-                        TypeError,
-                        ValueError
-                    ):
-
-                        carbon_intensity = 0.0
-
-                else:
-
-                    carbon_intensity = 0.0
 
             # --------------------------------------------------
             # Online status
@@ -474,7 +236,10 @@ class LNGraphBuilder:
 
             node_attributes = {
                 **node.__dict__,
-                "rgb_color": rgb_color
+                "rgb_color": rgb_color,
+                "country_code_iso3": country_iso3,
+                "continent_code": continent_code,
+                "carbon_intensity_source": carbon_source,
             }
 
             G.add_node(

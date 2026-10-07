@@ -4,21 +4,18 @@ Pathfinding/heuristics.py
 Routing heuristics for Lightning-style payment networks.
 
 Core adaptive-cost model
-------------------------
+-------------------------
 
-    RGB
+    Geographic dataset
       |
       v
-    Carbon Proxy
+    Node carbon intensity
       |
       v
-    raw_h(u,v,eta)
+    h(u,v,eta)
       |
       v
-    normalized adaptive penalty
-      |
-      v
-    C'(u,v) = C_LND(u,v) * (1 + lambda_h * penalty)
+    C'(u,v) = max(C_native(u,v) + h(u,v,eta), 0)
 
 
 Adaptive heuristic
@@ -31,32 +28,12 @@ Adaptive heuristic
         (1 - eta) * (C_v - C_u)
 
 
-Carbon proxy
-------------
+Carbon intensity
+----------------
 
-    C = 0.299R + 0.587G + 0.114B
-
-The RGB luminance is used as a proxy because the Lightning
-GML snapshot does not provide a physical numeric carbon-intensity
-measurement.
-
-Missing RGB
------------
-
-If a node does not contain any RGB/color representation,
-its RGB value is treated as:
-
-    (0, 0, 0)
-
-Therefore:
-
-    C = 0
-
-This rule also applies when an RGB/color field explicitly
-contains None.
-
-If RGB information exists but has an invalid representation,
-the corresponding validation error is preserved.
+Carbon intensity is supplied as the node attribute
+``carbon_intensity`` by the geographic data preparation layer.
+RGB/color metadata is not interpreted as carbon data here.
 
 
 Routing objective
@@ -64,8 +41,7 @@ Routing objective
 
     C_LND = fee + 0.5 * delay + 1
 
-    C_adaptive =
-        C_LND * (1 + lambda_h * penalty)
+    C_adaptive = max(C_native + h, 0)
 
 
 Liquidity
@@ -86,9 +62,8 @@ Scientific-evaluation policy
 This module does not fabricate missing routing or liquidity
 values.
 
-The only explicit missing-data rule is RGB:
-
-    missing RGB -> (0, 0, 0) -> carbon proxy = 0
+Carbon intensity must be present on nodes before adaptive
+routing is used. Missing carbon data raises an error.
 
 For descriptive path evaluation, optional metrics such as
 liquidity and failure probability are used only when explicitly
@@ -171,9 +146,9 @@ def validate_eta(eta):
     """
     Validate PPO-controlled eta.
 
-    Required range:
+    Required range from the paper:
 
-        0 <= eta <= 1
+        -1 <= eta <= 1
 
     No clipping is performed.
     """
@@ -193,10 +168,10 @@ def validate_eta(eta):
             "eta must be finite."
         )
 
-    if not 0.0 <= eta <= 1.0:
+    if not -1.0 <= eta <= 1.0:
 
         raise ValueError(
-            "eta must satisfy 0 <= eta <= 1."
+            "eta must satisfy -1 <= eta <= 1."
         )
 
     return eta
@@ -612,38 +587,10 @@ def node_carbon_intensity(
     node,
 ):
     """
-    Calculate RGB luminance as the carbon-intensity proxy.
+    Read the geographic carbon intensity assigned to a node.
 
-    Formula:
-
-        C = 0.299R + 0.587G + 0.114B
-
-    This is a proxy, not a physical carbon-emission
-    measurement.
-
-    Missing RGB policy
-    ------------------
-
-    If a node has no RGB/color attribute:
-
-        RGB = (0, 0, 0)
-
-    If an RGB/color attribute exists but its value is None:
-
-        RGB = (0, 0, 0)
-
-    Therefore in both cases:
-
-        carbon_intensity = 0.0
-
-    This behavior is required for the historical Lightning
-    snapshot because some nodes contain:
-
-        "rgb_color": None
-
-    If an RGB attribute exists with a non-None but invalid
-    representation, the invalid data is NOT silently replaced
-    with zero.
+    RGB/color attributes are deliberately ignored. The dataset
+    loader is responsible for assigning ``carbon_intensity``.
     """
 
     if node not in G:
@@ -654,89 +601,24 @@ def node_carbon_intensity(
 
     node_data = G.nodes[node]
 
-    # ------------------------------------------------------
-    # RGB lookup
-    # ------------------------------------------------------
-
-    if "rgb_color" in node_data:
-
-        rgb = node_data["rgb_color"]
-
-    elif "rgb" in node_data:
-
-        rgb = node_data["rgb"]
-
-    elif "color" in node_data:
-
-        rgb = node_data["color"]
-
-    elif "fill" in node_data:
-
-        rgb = node_data["fill"]
-
-    else:
-
-        # --------------------------------------------------
-        # No RGB attribute exists.
-        #
-        # Treat the missing RGB as black:
-        #
-        #     R = 0
-        #     G = 0
-        #     B = 0
-        #
-        # Therefore:
-        #
-        #     carbon = 0
-        # --------------------------------------------------
-
-        return 0.0
-
-    # ------------------------------------------------------
-    # RGB field exists but explicitly contains None.
-    #
-    # This occurs in the historical GML snapshot for nodes
-    # that do not have RGB information.
-    #
-    # Treat None exactly like missing RGB.
-    # ------------------------------------------------------
-
-    if rgb is None:
-
-        return 0.0
-
-    # ------------------------------------------------------
-    # Parse valid non-None RGB.
-    #
-    # Invalid non-None RGB remains an error.
-    # ------------------------------------------------------
-
-    r, g, b = _parse_rgb(
-        rgb,
-        node,
-    )
-
-    carbon = (
-        0.299 * r
-        + 0.587 * g
-        + 0.114 * b
-    )
-
-    if not _valid_number(carbon):
-
-        raise ValueError(
-            f"Calculated carbon proxy for node "
-            f"{node!r} is not finite."
+    if "carbon_intensity" not in node_data:
+        raise KeyError(
+            f"Node {node!r} has no geographic 'carbon_intensity'. "
+            "Load and map the carbon dataset before routing."
         )
 
-    if not 0.0 <= carbon <= 255.0:
+    carbon = _to_float(
+        node_data["carbon_intensity"],
+        f"carbon_intensity for node {node!r}",
+    )
 
+    if carbon < 0.0:
         raise ValueError(
-            f"Calculated carbon proxy for node "
-            f"{node!r} is outside [0,255]: {carbon}."
+            f"carbon_intensity for node {node!r} must be >= 0; "
+            f"got {carbon}."
         )
 
-    return float(carbon)
+    return carbon
 
 
 # ==========================================================
@@ -817,24 +699,9 @@ def adaptive_penalty(
     eta,
 ):
     """
-    Convert raw adaptive signal into bounded penalty.
+    Compatibility helper returning the signed paper heuristic.
 
-    Normalization:
-
-        normalized_h = |raw_h| / 255
-
-    Penalty:
-
-        penalty =
-            normalized_h / (1 + normalized_h)
-
-    Therefore:
-
-        0 <= penalty <= 0.5
-
-    The sign of raw_h is intentionally removed because the
-    current adaptive-cost formulation uses a non-negative
-    multiplicative penalty.
+    New routing code should use ``raw_heuristic`` directly.
     """
 
     raw_h = adaptive_heuristic(
@@ -844,33 +711,7 @@ def adaptive_penalty(
         eta,
     )
 
-    normalized_h = (
-        abs(raw_h)
-        / 255.0
-    )
-
-    penalty = (
-        normalized_h
-        /
-        (
-            1.0
-            + normalized_h
-        )
-    )
-
-    if not _valid_number(penalty):
-
-        raise ValueError(
-            "Adaptive penalty is not finite."
-        )
-
-    if not 0.0 <= penalty <= 0.5:
-
-        raise ValueError(
-            f"Adaptive penalty outside [0,0.5]: {penalty}."
-        )
-
-    return float(penalty)
+    return float(raw_h)
 
 
 # ==========================================================
@@ -884,13 +725,11 @@ def modified_cost(
     lambda_h=1.0,
 ):
     """
-    Calculate adaptive routing cost.
+    Add the signed paper heuristic to native routing cost.
 
-    Formula:
-
-        C' =
-            C_LND *
-            (1 + lambda_h * penalty)
+    The non-negative clamp keeps the edge weight valid for
+    Dijkstra while retaining the raw signed heuristic in the
+    diagnostics.
     """
 
     if not _valid_nonnegative(
@@ -901,23 +740,12 @@ def modified_cost(
             "native_cost must be finite and >= 0."
         )
 
-    if not _valid_nonnegative(
-        geo_penalty,
-    ):
-
+    if not _valid_number(geo_penalty):
         raise ValueError(
-            "geo_penalty must be finite and >= 0."
+            "geo_penalty must be finite."
         )
 
-    geo_penalty = float(
-        geo_penalty
-    )
-
-    if geo_penalty > 0.5:
-
-        raise ValueError(
-            "geo_penalty must be normalized to [0,0.5]."
-        )
+    geo_penalty = float(geo_penalty)
 
     if eta is not None:
 
@@ -929,13 +757,9 @@ def modified_cost(
         lambda_h,
     )
 
-    cost = (
-        float(native_cost)
-        *
-        (
-            1.0
-            + lambda_h * geo_penalty
-        )
+    cost = max(
+        float(native_cost) + geo_penalty,
+        0.0,
     )
 
     if not _valid_nonnegative(cost):
@@ -980,9 +804,8 @@ def adaptive_edge_cost(
         eta,
     )
 
-    lambda_h = validate_lambda_h(
-        lambda_h,
-    )
+    # lambda_h is retained in the signature for compatibility.
+    validate_lambda_h(lambda_h)
 
     if heuristic_fn is None:
 
@@ -1030,16 +853,9 @@ def adaptive_edge_cost(
         eta,
     )
 
-    penalty = adaptive_penalty(
-        G,
-        u,
-        v,
-        eta,
-    )
-
     cost = modified_cost(
         native_cost=native_cost,
-        geo_penalty=penalty,
+        geo_penalty=raw_h,
         eta=eta,
         lambda_h=lambda_h,
     )
@@ -1047,7 +863,7 @@ def adaptive_edge_cost(
     return {
         "native_cost": float(native_cost),
         "raw_heuristic": float(raw_h),
-        "adaptive_penalty": float(penalty),
+        "adaptive_penalty": float(max(raw_h, 0.0)),
         "cost": float(cost),
     }
 

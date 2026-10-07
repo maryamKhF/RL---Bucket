@@ -4,36 +4,13 @@ Network topology and channel feature extraction.
 This module provides:
 
     - geographical distance
-    - RGB parsing
-    - RGB luminance / carbon-intensity proxy
+    - dataset-backed node carbon intensity
     - node topology features
     - channel-level routing features
 
-Carbon-intensity proxy
-----------------------
-
-The Lightning GML snapshot does not provide a physical numeric
-carbon-intensity measurement.
-
-Therefore, the RGB color associated with each node is used as a
-proxy based on weighted RGB luminance:
-
-    C = 0.299R + 0.587G + 0.114B
-
-where:
-
-    R, G, B ∈ [0,255]
-
-The same definition is used by Pathfinding/heuristics.py.
-
-Important
----------
-
-This value is a PROXY and must not be interpreted as a real
-physical carbon-emission measurement.
-
-This module intentionally avoids silent fallbacks for missing
-or invalid scientific features.
+Carbon intensity is assigned to nodes from the geographic energy-mix
+dataset by ``LNGraphBuilder``. RGB remains visual snapshot metadata and
+is never used as a carbon value.
 """
 
 
@@ -546,53 +523,40 @@ def node_rgb_color(
 # Node RGB Scalar / Carbon Proxy
 # ==========================================================
 
-def node_rgb_scalar(
+def node_carbon_intensity(
     G,
     node,
 ):
     """
-    Convert node RGB to the project's carbon-intensity proxy.
+    Return validated dataset-backed carbon intensity for a node.
 
-    Exact formula:
-
-        C = 0.299R + 0.587G + 0.114B
-
-    This is weighted RGB luminance.
-
-    It is NOT a physical carbon-intensity measurement.
-    It is a proxy derived from the GML node color.
+    The expected dataset unit is gCO2/kWh. RGB/color attributes
+    are intentionally ignored.
     """
 
-    r, g, b = node_rgb_color(
-        G,
-        node,
-    )
+    if node not in G:
+        raise KeyError(f"Node {node!r} does not exist in graph.")
 
-    carbon_proxy = (
-        0.299 * r
-        +
-        0.587 * g
-        +
-        0.114 * b
-    )
-
-    if not math.isfinite(
-        carbon_proxy
-    ):
+    attrs = G.nodes[node]
+    if "carbon_intensity" not in attrs:
         raise ValueError(
-            f"Carbon proxy for node {node!r} "
-            "is not finite."
+            f"Node {node!r} has no dataset-backed carbon_intensity."
         )
 
-    if not 0.0 <= carbon_proxy <= 255.0:
+    try:
+        intensity = float(attrs["carbon_intensity"])
+    except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"Carbon proxy for node {node!r} "
-            f"is outside [0,255]: {carbon_proxy}."
+            f"carbon_intensity for node {node!r} must be numeric."
+        ) from exc
+
+    if not math.isfinite(intensity) or intensity < 0.0:
+        raise ValueError(
+            f"carbon_intensity for node {node!r} must be finite and >= 0; "
+            f"got {intensity}."
         )
 
-    return float(
-        carbon_proxy
-    )
+    return intensity
 
 
 # ==========================================================
@@ -605,24 +569,18 @@ def geo_features(
     v,
 ):
     """
-    Extract geographic and carbon-proxy features between nodes.
+    Extract geographic and dataset-backed carbon features between nodes.
 
     Returned features:
 
         distance_km
         inter_country
         inter_continent
-        rgb_color_u
-        rgb_color_v
-        rgb_luminance
+        carbon_intensity_u
+        carbon_intensity_v
         carbon_intensity
 
-    Carbon definition:
-
-        C = 0.299R + 0.587G + 0.114B
-
-    For an edge (u,v), rgb_luminance is the mean of the two
-    endpoint carbon proxies:
+    Edge intensity is the mean of its endpoint intensities:
 
         C_uv = (C_u + C_v) / 2
     """
@@ -692,41 +650,31 @@ def geo_features(
     # Continent
     # ------------------------------------------------------
     #
-    # The current repository definition uses distance > 3000
-    # km as a proxy for inter-continent separation.
-    #
-    # This is a heuristic proxy, not actual continent metadata.
+    # Use the dataset-derived continent codes when available.
     # ------------------------------------------------------
 
-    inter_continent = int(
-        distance > 3000.0
-    )
+    continent_u = node_u.get("continent_code")
+    continent_v = node_v.get("continent_code")
+    if continent_u and continent_v:
+        inter_continent = int(continent_u != continent_v)
+    else:
+        inter_continent = int(distance > 3000.0)
 
     # ------------------------------------------------------
-    # RGB / Carbon
+    # Dataset-backed carbon
     # ------------------------------------------------------
 
-    rgb_u = node_rgb_color(
+    carbon_u = node_carbon_intensity(
         G,
         u,
     )
 
-    rgb_v = node_rgb_color(
+    carbon_v = node_carbon_intensity(
         G,
         v,
     )
 
-    carbon_u = node_rgb_scalar(
-        G,
-        u,
-    )
-
-    carbon_v = node_rgb_scalar(
-        G,
-        v,
-    )
-
-    rgb_luminance = (
+    carbon_intensity = (
         carbon_u
         +
         carbon_v
@@ -743,18 +691,14 @@ def geo_features(
         "inter_continent":
             inter_continent,
 
-        "rgb_color_u":
-            rgb_u,
+        "carbon_intensity_u":
+            float(carbon_u),
 
-        "rgb_color_v":
-            rgb_v,
+        "carbon_intensity_v":
+            float(carbon_v),
 
-        "rgb_luminance":
-            float(rgb_luminance),
-
-        # Backward-compatible alias.
         "carbon_intensity":
-            float(rgb_luminance),
+            float(carbon_intensity),
     }
 
 

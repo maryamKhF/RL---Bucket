@@ -791,7 +791,7 @@ graph [
       city "Budapest"
       region "Budapest"
       country "HU"
-      loc "47.4984,19.0404"
+      loc "47.4984,19.0404"ؤ
       org "AS12301 Invitech ICT Services Kft."
       postal "1007"
       timezone "Europe/Budapest"

@@ -28,7 +28,7 @@ from .environment import RoutingEnv
 FAST_TRAINING = (
     os.environ.get(
         "RL_FAST_TRAINING",
-        "1"
+        "0"
     ).strip().lower()
     in {
         "1",

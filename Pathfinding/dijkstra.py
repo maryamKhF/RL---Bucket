@@ -8,17 +8,10 @@ Unified routing objective
 
     C_LND(e)
         |
-        +----------------------+
-        |                      |
-        v                      v
-    native cost          adaptive heuristic
-                               |
-                               v
-                       normalized penalty
-                               |
-                               v
-                  C'(e) = C_LND(e)
-                           * (1 + lambda_h * penalty)
+        + adaptive heuristic h(e, eta)
+        |
+        v
+    C'(e) = max(C_LND(e) + h(e, eta), 0)
 
 The same adaptive edge-cost definition is used by
 Pathfinding.top_k_paths.
@@ -30,7 +23,7 @@ Important design principles
 2. Liquidity is a hard feasibility constraint.
 3. Channel identity is preserved for MultiGraph/MultiDiGraph.
 4. Geographic metrics are obtained from Network.topology.
-5. RGB carbon proxy is defined centrally in Network.topology.
+5. Carbon intensity is read from prepared node attributes.
 6. Adaptive cost is calculated exactly once per edge.
 7. PPO controls eta; k is controlled outside this class.
 8. Optional Boolean state flags must contain real Boolean values.
@@ -474,7 +467,6 @@ class Dijkstra:
                     required_fields = (
                         "native_cost",
                         "raw_heuristic",
-                        "adaptive_penalty",
                         "cost",
                     )
 
@@ -496,10 +488,6 @@ class Dijkstra:
 
                     adaptive_h = edge_info[
                         "raw_heuristic"
-                    ]
-
-                    adaptive_penalty_value = edge_info[
-                        "adaptive_penalty"
                     ]
 
                     edge_cost = edge_info[
@@ -526,15 +514,6 @@ class Dijkstra:
                             f"Invalid adaptive heuristic on edge "
                             f"{u}->{v}, key={key!r}: "
                             f"{adaptive_h!r}"
-                        )
-
-                    if not self._valid_metric(
-                        adaptive_penalty_value
-                    ):
-                        raise ValueError(
-                            f"Invalid adaptive penalty on edge "
-                            f"{u}->{v}, key={key!r}: "
-                            f"{adaptive_penalty_value!r}"
                         )
 
                     if not self._valid_cost(

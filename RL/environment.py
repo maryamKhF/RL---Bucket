@@ -304,7 +304,7 @@ class RoutingEnv(gym.Env):
         self.eta_min = self._validate_finite_float(
             rl_cfg.get(
                 "eta_min",
-                0.0,
+                -1.0,
             ),
             "rl.eta_min",
         )
@@ -317,9 +317,9 @@ class RoutingEnv(gym.Env):
             "rl.eta_max",
         )
 
-        if self.eta_min < 0.0:
+        if self.eta_min < -1.0:
             raise ValueError(
-                "rl.eta_min must be >= 0."
+                "rl.eta_min must be >= -1."
             )
 
         if self.eta_max > 1.0:
@@ -657,7 +657,12 @@ class RoutingEnv(gym.Env):
         # Reset transaction state
         # --------------------------------------------------
 
-        self.tx_index = 0
+        self.tx_index = int(
+            self.np_random.integers(
+                low=0,
+                high=len(self.transactions),
+            )
+        )
         self.current_tx = None
         self.current_paths = []
         self.current_bucket = None
@@ -798,6 +803,13 @@ class RoutingEnv(gym.Env):
         final_carbon = float(
             result["carbon"]
         )
+
+        if payment_success:
+            route_carbon = self._average_path_carbon(
+                result.get("path", [])
+            )
+            if route_carbon is not None:
+                final_carbon = route_carbon
 
         backtrack_count = int(
             result["backtrack_count"]
@@ -2733,19 +2745,6 @@ class RoutingEnv(gym.Env):
         full_reroute_count,
         attempt_count,
     ):
-        reward_cfg = self.cfg.get(
-            "reward",
-            {},
-        )
-
-        if not isinstance(
-            reward_cfg,
-            dict,
-        ):
-            raise TypeError(
-                "config['reward'] must be a dictionary."
-            )
-
         reward = calculate_reward(
             success=bool(success),
             path_length=int(path_length),
@@ -2763,31 +2762,6 @@ class RoutingEnv(gym.Env):
             attempt_count=int(
                 attempt_count
             ),
-            scale=self._reward_float(
-                reward_cfg,
-                "scale",
-                100.0,
-            ),
-            fee_reference=self._reward_float(
-                reward_cfg,
-                "fee_reference",
-                1000.0,
-            ),
-            delay_reference=self._reward_float(
-                reward_cfg,
-                "delay_reference",
-                10.0,
-            ),
-            carbon_reference=self._reward_float(
-                reward_cfg,
-                "carbon_reference",
-                100.0,
-            ),
-            path_reference=self._reward_float(
-                reward_cfg,
-                "path_reference",
-                10.0,
-            ),
         )
 
         reward = float(
@@ -2800,6 +2774,31 @@ class RoutingEnv(gym.Env):
             )
 
         return reward
+
+    def _average_path_carbon(self, path):
+        """Average dataset-derived carbon intensity over route nodes."""
+
+        if not path:
+            return None
+
+        values = []
+        for node in path:
+            attributes = self.G.nodes[node]
+            value = attributes.get("carbon_intensity")
+            if value is None:
+                # Older/synthetic graphs can lack the dataset field. The
+                # payment simulator's route estimate remains a fallback.
+                return None
+            value = float(value)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"Invalid carbon intensity for route node {node!r}: {value!r}."
+                )
+            values.append(value)
+
+        if not values:
+            return None
+        return float(sum(values) / len(values))
 
     # ======================================================
     # NETWORK DYNAMICS
@@ -3040,42 +3039,12 @@ class RoutingEnv(gym.Env):
     # ======================================================
 
     def _advance_transaction(self):
-
-        self.tx_index += 1
-
-        # --------------------------------------------------
-        # Terminal
-        #
-        # Preserve actual Bucket.
-        # --------------------------------------------------
-
-        if self.tx_index >= len(
-            self.transactions
-        ):
-
-            self.current_tx = None
-            self.current_paths = []
-
-            return True
-
-        # --------------------------------------------------
-        # Non-terminal
-        # --------------------------------------------------
-
-        self.current_tx = (
-            self._get_current_transaction()
-        )
-
+        # The reference implementation treats one sampled payment as one
+        # episode. This prevents PPO returns from coupling unrelated
+        # transactions in the supplied batch.
+        self.current_tx = None
         self.current_paths = []
-        self.current_bucket = None
-
-        self.backtracker.bucket = None
-
-        self.last_failure_probability = 0.0
-        self.last_average_delay = 0.0
-        self.last_backtrack_count = 0
-
-        return False
+        return True
 
     # ======================================================
     # RENDER / CLOSE
@@ -3255,9 +3224,9 @@ class RoutingEnv(gym.Env):
             "eta",
         )
 
-        if eta < 0.0 or eta > 1.0:
+        if eta < -1.0 or eta > 1.0:
             raise ValueError(
-                "eta must be in [0, 1]."
+                "eta must be in [-1, 1]."
             )
 
         return eta

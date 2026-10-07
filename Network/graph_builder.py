@@ -740,11 +740,16 @@ class LNGraphBuilder:
 
         for node_id in G.nodes:
 
-            rgb_color = float(
-                rng.uniform(
-                    100,
-                    700
+            country_code = str(
+                rng.choice(countries)
+            )
+            carbon_intensity, carbon_source, country_iso3 = (
+                self.carbon_dataset.lookup(
+                    country_code=country_code,
                 )
+            )
+            continent_code = self.carbon_dataset.continent_for(
+                country_code
             )
 
             node = Node(
@@ -753,11 +758,7 @@ class LNGraphBuilder:
                     node_id
                 ),
 
-                country=str(
-                    rng.choice(
-                        countries
-                    )
-                ),
+                country=str(country_iso3 or country_code),
 
                 latitude=float(
                     rng.uniform(
@@ -773,7 +774,7 @@ class LNGraphBuilder:
                     )
                 ),
 
-                carbon_intensity=rgb_color,
+                carbon_intensity=float(carbon_intensity),
 
                 online=True
 
@@ -793,7 +794,10 @@ class LNGraphBuilder:
                 node_id
             ][
                 "rgb_color"
-            ] = rgb_color
+            ] = None
+            G.nodes[node_id]["country_code_iso3"] = country_iso3
+            G.nodes[node_id]["continent_code"] = continent_code
+            G.nodes[node_id]["carbon_intensity_source"] = carbon_source
 
         # ------------------------------------------------------
         # Add Channel Attributes

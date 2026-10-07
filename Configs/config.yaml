@@ -121,7 +121,7 @@ bucket:
 # ======================================================
 
 evaluation:
-  repetitions: 10
+  repetitions: 5
 
   confidence_interval: 0.95
 

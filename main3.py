@@ -55,7 +55,7 @@ HEARTBEAT_STOP_EVENT = threading.Event()
 FAST_VALIDATION = (
     os.environ.get(
         "RL_FAST_VALIDATION",
-        "1"
+        "0"
     ).strip().lower()
     in {
         "1",
@@ -74,8 +74,7 @@ MODEL_NAME = "end_to_end"
 
 # IMPORTANT:
 #
-# Every execution retains EXACTLY 10 distinct randomized payment
-# results. Targeted outcome searches may run additional routing trials.
+# Every execution evaluates exactly 10 fixed held-out transactions.
 # PPO is loaded/trained once; each routing trial uses one inference.
 EVAL_TRANSACTION_COUNT = 10
 
@@ -1588,7 +1587,8 @@ def generate_evaluation_transactions(
     G,
     cfg,
     seed,
-    count
+    count,
+    source_transactions=None,
 ):
 
     # --------------------------------------------------------
@@ -1607,19 +1607,24 @@ def generate_evaluation_transactions(
 
     max_amount = cfg["simulation"]["max_amount"]
 
-    transactions = generate_transactions(
-
-        G,
-
-        count,
-
-        seed,
-
-        min_amount,
-
-        max_amount
-
-    )
+    if source_transactions is None:
+        transactions = generate_transactions(
+            G,
+            count,
+            seed,
+            min_amount,
+            max_amount,
+        )
+    else:
+        if len(source_transactions) < count:
+            raise RuntimeError(
+                "The held-out transaction split has fewer than "
+                f"{count} transactions."
+            )
+        transactions = [
+            copy.deepcopy(transaction)
+            for transaction in source_transactions[:count]
+        ]
 
     if not transactions:
 
@@ -2851,7 +2856,11 @@ def main():
 
         if FAST_VALIDATION:
 
-            training_transaction_count = 1
+            # One training transaction plus the fixed ten-transaction
+            # validation slice keeps the train and evaluation sets disjoint.
+            training_transaction_count = (
+                EVAL_TRANSACTION_COUNT + 1
+            )
 
         else:
 
@@ -2876,6 +2885,17 @@ def main():
         train_ratio = float(
             cfg["train_ratio"]
         )
+        test_ratio = float(
+            cfg["test_ratio"]
+        )
+        if (
+            not 0.0 < train_ratio < 1.0
+            or not 0.0 < test_ratio < 1.0
+            or abs(train_ratio + test_ratio - 1.0) > 1e-9
+        ):
+            raise ValueError(
+                "train_ratio and test_ratio must be positive and sum to 1."
+            )
 
         if FAST_VALIDATION:
 
@@ -2900,6 +2920,10 @@ def main():
                 :train_count
             ]
         )
+
+        test_tx = training_transactions[
+            train_count:
+        ]
 
         report.item(
             "Configured transactions",
@@ -3241,7 +3265,9 @@ def main():
 
                 scenario_seed,
 
-                evaluation_transaction_count
+                evaluation_transaction_count,
+
+                source_transactions=test_tx,
 
             )
         )
@@ -3300,11 +3326,11 @@ def main():
         )
 
         report.add(
-            "Source, destination and amount are generated independently; target search may sample replacements."
+            "Transactions are selected from the fixed held-out portion of the generated dataset."
         )
 
         report.add(
-            "The same trained PPO model is reused; each routing trial gets one prediction, and target search may add trials."
+            "The same trained PPO model is reused; each held-out transaction gets one prediction."
         )
 
         report.add(
@@ -3319,7 +3345,7 @@ def main():
         report.add("")
 
         report.add(
-            "Initial random transaction candidates (target search may replace them):"
+            "Fixed held-out evaluation transactions:"
         )
 
         for index, transaction in enumerate(
@@ -3519,7 +3545,7 @@ def main():
             8,
             "STEP 8 - PPO ROUTING DECISIONS",
             report,
-            "One PPO prediction is made per routing trial; targeted outcomes may need retries..."
+            "One PPO prediction is made for each held-out transaction..."
         )
 
         print(
@@ -3570,7 +3596,7 @@ def main():
         )
 
         report.add(
-            "Each routing trial receives one PPO prediction; target searches may add trials."
+            "Each held-out transaction receives one PPO prediction."
         )
 
         report.add(
@@ -3579,7 +3605,7 @@ def main():
         )
 
         report.add(
-            "The evaluator searches for failure across all five candidates and success at ranks #3, #4, and #5."
+            "Evaluation uses the fixed test transactions without selecting outcomes by Bucket rank."
         )
 
         complete_step(
@@ -3632,11 +3658,7 @@ def main():
         report.add("")
 
         report.add(
-            "Each of the 10 transactions is evaluated independently."
-        )
-
-        report.add(
-            "Each routing trial receives one PPO inference; target searches may add seeded trials."
+            "The same fixed held-out transactions are repeated across failure rates and random seeds."
         )
 
         report.add(
@@ -3653,7 +3675,7 @@ def main():
         )
 
         report.add(
-            "Four outcome targets are searched for; any target not observed is marked in the report."
+            "Normal evaluation uses all configured failure rates and five independent seeds."
         )
 
         report.add(
@@ -3661,274 +3683,121 @@ def main():
             "#3, #4, #5, or no candidate if the Bucket is exhausted."
         )
 
-        # The final report always contains 10 distinct randomized payments.
-        # Four slots search for the requested Bucket outcomes; the remaining
-        # six are ordinary random runs. Targeted slots use a reported higher
-        # failure-rate preset to make their requested rank outcomes observable.
-        # Search trials use new random payments and deterministic seeds.
-        target_by_episode = {
-            1: "all_five_fail",
-            2: 3,
-            3: 4,
-            4: 5,
-        }
-        target_labels = {
-            1: "All five Bucket candidates fail",
-            2: "Success at Bucket candidate #3",
-            3: "Success at Bucket candidate #4",
-            4: "Success at Bucket candidate #5",
-        }
-        # FAST VALIDATION: keep targeted outcome search bounded.
-        # Default is 5 trials per targeted transaction instead of 100.
-        # Override from CMD with RL_MAX_OUTCOME_SEARCH_ATTEMPTS.
-        try:
-            max_outcome_search_attempts = int(
-                os.environ.get(
-                    "RL_MAX_OUTCOME_SEARCH_ATTEMPTS",
-                    "5"
-                )
-            )
-        except (TypeError, ValueError):
-            max_outcome_search_attempts = 5
+        evaluation_cfg = cfg.get("evaluation", {})
+        if not isinstance(evaluation_cfg, dict):
+            raise TypeError("evaluation configuration must be a dictionary.")
+        repetitions = int(evaluation_cfg.get("repetitions", 5))
+        if repetitions <= 0:
+            raise ValueError("evaluation.repetitions must be positive.")
 
-        max_outcome_search_attempts = max(
-            1,
-            min(10, max_outcome_search_attempts)
+        configured_failure_rates = cfg.get(
+            "failure_rates",
+            [payment_failure_rate],
+        )
+        if not isinstance(configured_failure_rates, (list, tuple)) or not configured_failure_rates:
+            raise ValueError("failure_rates must be a non-empty list.")
+        failure_rates = [float(rate) for rate in configured_failure_rates]
+        if any(not 0.0 <= rate <= 1.0 for rate in failure_rates):
+            raise ValueError("Every failure rate must be in [0, 1].")
+
+        if FAST_VALIDATION:
+            repetitions = 1
+            failure_rates = [payment_failure_rate]
+
+        expected_evaluations = (
+            len(evaluation_transactions)
+            * repetitions
+            * len(failure_rates)
         )
         total_routing_trials = 0
-        used_transaction_keys = set()
-        initial_transactions = list(evaluation_transactions)
-        selected_transactions = []
         evaluation_results = []
 
-        def transaction_key(tx):
-            return (
-                str(getattr(tx, "source", "")),
-                str(getattr(tx, "destination", "")),
-                round(safe_float(getattr(tx, "amount", 0.0)), 8),
-            )
-
-        def outcome_matches(result, target):
-            if target == "all_five_fail":
-                return (
-                    not result["success"]
-                    and result["bucket_size"] == 5
-                    and result["attempt_count"] >= 5
-                )
-            if isinstance(target, int):
-                return (
-                    result["success"]
-                    and result["successful_bucket_rank"] == target
-                )
-            return True
-
-        def outcome_score(result, target):
-            if target == "all_five_fail":
-                if result["success"]:
-                    return 1000
-                return (
-                    abs(5 - result["bucket_size"]) * 10
-                    + abs(5 - min(5, result["attempt_count"]))
-                )
-            if isinstance(target, int):
-                rank = result["successful_bucket_rank"]
-                if result["success"] and rank is not None:
-                    return abs(target - rank)
-                return 1000
-            return 0
-
-        for episode_index in range(1, 11):
-            target = target_by_episode.get(episode_index)
-            scenario_label = target_labels.get(
-                episode_index,
-                f"Random outcome {episode_index}",
-            )
-            best_candidate = None
-            best_score = float("inf")
-            accepted_candidate = None
-            scenario_trials = 0
-            scenario_prediction_time = 0.0
-            scenario_pipeline_time = 0.0
-
-            if target == "all_five_fail":
-                scenario_failure_rate = float(
-                    cfg.get("bucket_all_fail_search_rate", 0.90)
-                )
-            elif isinstance(target, int):
-                scenario_failure_rate = float(
-                    cfg.get("bucket_rank_search_rate", 0.35)
-                )
-            else:
-                scenario_failure_rate = payment_failure_rate
-
-            scenario_failure_rate = max(
-                0.0,
-                min(1.0, scenario_failure_rate),
-            )
-
-            for sample_index in range(1, max_outcome_search_attempts + 1):
-
-                if target is not None:
-                    print(
-                        f"[TARGET SEARCH] TX #{episode_index:02d}/10 "
-                        f"trial {sample_index}/{max_outcome_search_attempts} "
-                        f"target={scenario_label}"
+        for rate_index, scenario_failure_rate in enumerate(failure_rates):
+            for repetition in range(1, repetitions + 1):
+                for episode_index, transaction in enumerate(
+                    evaluation_transactions,
+                    start=1,
+                ):
+                    evaluation_seed = (
+                        seed
+                        + 1001
+                        + episode_index
+                        + repetition * 1000033
+                        + rate_index * 100000007
                     )
-                if sample_index == 1 and episode_index <= len(initial_transactions):
-                    transaction = copy.deepcopy(initial_transactions[episode_index - 1])
-                else:
-                    transaction_seed = (
-                        scenario_seed
-                        + 500000
-                        + episode_index * 10000
-                        + sample_index * 37
-                    )
-                    generated = generate_transactions(
+                    result = run_evaluation_trial(
                         G,
-                        1,
-                        transaction_seed,
-                        cfg["simulation"]["min_amount"],
-                        cfg["simulation"]["max_amount"],
+                        cfg,
+                        model,
+                        transaction,
+                        episode_index,
+                        evaluation_seed,
+                        scenario_failure_rate,
                     )
-                    if not generated:
-                        continue
-                    transaction = copy.deepcopy(generated[0])
-
-                try:
-                    transaction.tx_id = episode_index
-                except Exception:
-                    pass
-
-                tx_key = transaction_key(transaction)
-                if tx_key in used_transaction_keys:
-                    continue
-
-                evaluation_seed = (
-                    seed
-                    + 1001
-                    + episode_index
-                    + sample_index * 1000033
-                )
-                result = run_evaluation_trial(
-                    G,
-                    cfg,
-                    model,
-                    transaction,
-                    episode_index,
-                    evaluation_seed,
-                    scenario_failure_rate,
-                )
-                result["failure_rate_used"] = scenario_failure_rate
-
-                total_routing_trials += 1
-                scenario_trials += 1
-                scenario_prediction_time += result["prediction_time"]
-                scenario_pipeline_time += result["pipeline_time"]
-                prediction_time_total += result["prediction_time"]
-                execution_time_total += result["pipeline_time"]
-
-                reached = outcome_matches(result, target)
-                result["requested_outcome"] = scenario_label
-                result["target_outcome_reached"] = reached
-                result["search_attempts"] = sample_index
-
-                if target is None or reached:
-                    accepted_candidate = (result, transaction, tx_key)
-                    break
-
-                score = outcome_score(result, target)
-                if score < best_score:
-                    best_candidate = (result, transaction, tx_key)
-                    best_score = score
-
-            if accepted_candidate is None:
-                if best_candidate is None:
-                    raise RuntimeError(
-                        "Could not generate a unique payment transaction "
-                        f"for scenario #{episode_index}."
+                    result["failure_rate_used"] = scenario_failure_rate
+                    result["repetition"] = repetition
+                    result["failure_rate_index"] = rate_index
+                    result["requested_outcome"] = (
+                        f"Held-out test transaction {episode_index}"
                     )
-                accepted_candidate = best_candidate
+                    result["target_outcome_reached"] = True
+                    result["search_attempts"] = 1
+                    result["scenario_routing_trials"] = 1
+                    result["scenario_prediction_time"] = result["prediction_time"]
+                    result["scenario_pipeline_time"] = result["pipeline_time"]
 
-            result, transaction, tx_key = accepted_candidate
-            used_transaction_keys.add(tx_key)
-            selected_transactions.append(transaction)
-            result["scenario_routing_trials"] = scenario_trials
-            result["search_attempts"] = sample_index
-            result["scenario_prediction_time"] = scenario_prediction_time
-            result["scenario_pipeline_time"] = scenario_pipeline_time
-            evaluation_results.append(result)
+                    total_routing_trials += 1
+                    prediction_time_total += result["prediction_time"]
+                    execution_time_total += result["pipeline_time"]
+                    evaluation_results.append(result)
 
-            route_rank = (
-                f"#{result['successful_bucket_rank']}"
-                if result["successful_bucket_rank"] is not None
-                else ("UNKNOWN" if result["success"] else "NONE")
-            )
-            print(
-                f"TX #{episode_index:02d}/10 | "
-                f"{result['source']} -> {result['destination']} | "
-                f"amount={result['amount']} | "
-                f"status={'SUCCESS' if result['success'] else 'FAILED'} | "
-                f"Bucket={route_rank} | "
-                f"fee={result['fee'] if result['success'] else 'N/A'} | "
-                f"routing={result['routing_time']:.6f}s | "
-                f"target={'REACHED' if result['target_outcome_reached'] else 'NOT REACHED'}"
-            )
+                    route_rank = (
+                        f"#{result['successful_bucket_rank']}"
+                        if result["successful_bucket_rank"] is not None
+                        else ("UNKNOWN" if result["success"] else "NONE")
+                    )
+                    print(
+                        f"RATE={scenario_failure_rate:.0%} "
+                        f"RUN={repetition}/{repetitions} "
+                        f"TX={episode_index:02d}/{len(evaluation_transactions)} | "
+                        f"{result['source']} -> {result['destination']} | "
+                        f"status={'SUCCESS' if result['success'] else 'FAILED'} | "
+                        f"Bucket={route_rank} | "
+                        f"routing={result['routing_time']:.6f}s"
+                    )
 
-            report.section(f"EVALUATION TRANSACTION {episode_index}/10")
-            report.item("Transaction ID", result["transaction_id"])
-            report.item("Source", result["source"])
-            report.item("Destination", result["destination"])
-            report.item("Payment amount", result["amount"])
-            report.item("Requested outcome", scenario_label)
-            report.item(
-                "Requested outcome reached",
-                "YES" if result["target_outcome_reached"] else "NO - closest observed result",
-            )
-            report.item("Transaction samples tried", result["search_attempts"])
-            report.item("Routing trials executed", scenario_trials)
-            report.item("Evaluation seed", result["evaluation_seed"])
-            report.item("Configured edge failure rate", result["failure_rate_used"])
-            report.item("PPO eta", result["eta"])
-            report.item("Top-K", result["top_k"])
-            report.item("Generated candidates", result["candidate_count"])
-            report.item("Usable candidates", result["usable_candidate_count"])
-            report.item("Bucket size", result["bucket_size"])
-            report.item("Payment status", "SUCCESS" if result["success"] else "FAILED")
-            report.item("Attempts within Bucket", result["attempt_count"])
-            report.item("Successful Bucket route", route_rank)
-            report.item(
-                "Fee for successful route",
-                result["fee"] if result["success"] else "N/A - payment failed",
-            )
-            report.item("Delay", result["delay"])
-            report.item("Carbon", result["carbon"])
-            report.item("Reward", result["reward"])
-            report.item("Reason", result["reason"] or "N/A")
-            report.item("Hops", result["hops"])
-            report.item(
-                "Pathfinding / Bucket time (seconds)",
-                f"{result['routing_time']:.6f}",
-            )
-            report.item(
-                "PPO prediction time (seconds)",
-                f"{result['prediction_time']:.6f}",
-            )
-            report.item(
-                "Search routing time total (seconds)",
-                f"{scenario_pipeline_time:.6f}",
-            )
-            report.item(
-                "Search prediction time total (seconds)",
-                f"{scenario_prediction_time:.6f}",
-            )
-            report.item(
-                "Successful path",
-                " -> ".join(str(node) for node in result["path"])
-                if result["path"]
-                else "NONE",
-            )
-
-        evaluation_transactions = selected_transactions
+                    report.section(
+                        f"EVALUATION RATE {scenario_failure_rate:.0%} "
+                        f"RUN {repetition} TX {episode_index}/"
+                        f"{len(evaluation_transactions)}"
+                    )
+                    report.item("Transaction ID", result["transaction_id"])
+                    report.item("Source", result["source"])
+                    report.item("Destination", result["destination"])
+                    report.item("Payment amount", result["amount"])
+                    report.item("Repetition", repetition)
+                    report.item("Evaluation seed", result["evaluation_seed"])
+                    report.item("Configured edge failure rate", scenario_failure_rate)
+                    report.item("PPO eta", result["eta"])
+                    report.item("Top-K", result["top_k"])
+                    report.item("Generated candidates", result["candidate_count"])
+                    report.item("Usable candidates", result["usable_candidate_count"])
+                    report.item("Bucket size", result["bucket_size"])
+                    report.item("Payment status", "SUCCESS" if result["success"] else "FAILED")
+                    report.item("Attempts within Bucket", result["attempt_count"])
+                    report.item("Successful Bucket route", route_rank)
+                    report.item(
+                        "Fee for successful route",
+                        result["fee"] if result["success"] else "N/A - payment failed",
+                    )
+                    report.item("Delay", result["delay"])
+                    report.item("Carbon", result["carbon"])
+                    report.item("Reward", result["reward"])
+                    report.item("Reason", result["reason"] or "N/A")
+                    report.item("Hops", result["hops"])
+                    report.item("Pathfinding / Bucket time (seconds)", f"{result['routing_time']:.6f}")
+                    report.item("PPO prediction time (seconds)", f"{result['prediction_time']:.6f}")
+                    report.item("Successful path", " -> ".join(str(node) for node in result["path"]) if result["path"] else "NONE")
 
         # ====================================================
         # Aggregate evaluation
@@ -3936,22 +3805,40 @@ def main():
 
         # ----------------------------------------------------
         # Hard validation:
-        # there MUST be exactly 10 results.
+        # result count must match the configured repetition protocol.
         # ----------------------------------------------------
 
-        if len(evaluation_results) != 10:
+        if len(evaluation_results) != expected_evaluations:
 
             raise RuntimeError(
 
                 "Evaluation completed with "
                 f"{len(evaluation_results)} results instead of "
-                "the required 10."
+                f"the expected {expected_evaluations}."
 
             )
 
         aggregate = aggregate_evaluation_results(
             evaluation_results
         )
+
+        evaluation_rate_summaries = {}
+        for rate in failure_rates:
+            rate_results = [
+                result
+                for result in evaluation_results
+                if result["failure_rate_used"] == rate
+            ]
+            rate_aggregate = aggregate_evaluation_results(rate_results)
+            evaluation_rate_summaries[rate] = {
+                "success_rate": rate_aggregate["success_rate"],
+                "successful_transactions": rate_aggregate[
+                    "successful_transactions"
+                ],
+                "total_transactions": rate_aggregate[
+                    "total_transactions"
+                ],
+            }
 
         print_evaluation_summary(
             aggregate
@@ -3971,8 +3858,19 @@ def main():
         )
 
         report.item(
-            "Expected transactions",
-            "10"
+            "Unique held-out transactions",
+            len(evaluation_transactions)
+        )
+
+        report.item(
+            "Expected evaluation trials",
+            expected_evaluations
+        )
+
+        report.item("Evaluation repetitions", repetitions)
+        report.item(
+            "Failure rates evaluated",
+            ", ".join(f"{rate:.0%}" for rate in failure_rates),
         )
 
         report.item(
@@ -3989,6 +3887,16 @@ def main():
             "Success rate",
             f"{aggregate['success_rate']:.2f}%"
         )
+
+        report.add("")
+        report.add("Success rate by configured failure probability:")
+        for rate, rate_summary in evaluation_rate_summaries.items():
+            report.item(
+                f"Failure rate {rate:.0%}",
+                f"{rate_summary['success_rate']:.2f}% "
+                f"({rate_summary['successful_transactions']}/"
+                f"{rate_summary['total_transactions']})",
+            )
 
         report.item(
             "Failure rate",
@@ -4164,11 +4072,11 @@ def main():
         report.add("")
 
         report.add(
-            "Exactly 10 distinct transaction results are retained; additional search trials are counted separately."
+            "The fixed evaluation transactions come from the held-out 30% split."
         )
 
         report.add(
-            "Each retained transaction has one accepted PPO prediction; outcome search may add routing trials."
+            "Each held-out transaction is repeated across all configured failure rates and seeds."
         )
 
         report.add(
@@ -4180,7 +4088,7 @@ def main():
         )
 
         report.add(
-            "The evaluator searches for a full five-candidate failure and successful ranks #3, #4, and #5; targets are not fabricated."
+            "Evaluation results are not filtered by success or Bucket rank."
         )
 
         report.add(
@@ -4192,7 +4100,7 @@ def main():
             9,
             "STEP 9 - EXECUTE MULTI-TRANSACTION ROUTING",
             report,
-            "10-TRANSACTION ROUTING COMPLETED"
+            f"{expected_evaluations}-TRIAL PAPER-STRUCTURE EVALUATION COMPLETED"
         )
 
         # ====================================================
@@ -4389,7 +4297,9 @@ def main():
             report.item(
                 (
                     f"TX #{result['episode_index']} "
-                    f"(id={result['transaction_id']})"
+                    f"(rate={result['failure_rate_used']:.0%}, "
+                    f"run={result['repetition']}, "
+                    f"id={result['transaction_id']})"
                 ),
                 (
                     f"{'SUCCESS' if result['success'] else 'FAILED'} | "
@@ -4460,11 +4370,11 @@ def main():
         )
 
         report.add(
-            "Exactly 10 distinct payment results are retained in this report; search trials are counted separately."
+            "The fixed evaluation transactions come from the held-out 30% split."
         )
 
         report.add(
-            "Each retained transaction has one accepted PPO prediction; outcome search may add routing trials."
+            "Each held-out transaction is repeated across all configured failure rates and seeds."
         )
 
         report.add(
@@ -4472,7 +4382,7 @@ def main():
         )
 
         report.add(
-            "The report marks whether the requested rank #3, #4, and #5 outcomes were observed."
+            "Evaluation does not select or resample transactions based on Bucket rank."
         )
 
         report.add(
@@ -4504,16 +4414,16 @@ def main():
 
         report.item(
             "Evaluation transactions",
-            "10"
+            len(evaluation_transactions)
         )
 
         report.item(
             "Final transaction records",
-            "10"
+            expected_evaluations
         )
 
         report.item(
-            "Actual PPO predictions including search",
+            "Actual PPO predictions",
             total_routing_trials
         )
 
@@ -4598,7 +4508,7 @@ def main():
         )
 
         report.item(
-            "PPO routing trials including search",
+            "PPO routing trials",
             total_routing_trials
         )
 
@@ -4625,7 +4535,7 @@ def main():
             progress=100.0,
             step=10,
             step_name="RUN COMPLETED",
-            message="10-TRANSACTION END-TO-END EVALUATION COMPLETED"
+            message="PAPER-STRUCTURE EVALUATION COMPLETED"
         )
 
         print(
@@ -4633,7 +4543,7 @@ def main():
         )
 
         print(
-            "10-TRANSACTION END-TO-END EVALUATION FINISHED"
+            "PAPER-STRUCTURE END-TO-END EVALUATION FINISHED"
         )
 
         print(
@@ -4651,13 +4561,18 @@ def main():
         )
 
         print(
-            f"Transactions         : "
-            f"{aggregate['total_transactions']} / 10"
+            f"Unique test payments : "
+            f"{len(evaluation_transactions)}"
+        )
+
+        print(
+            f"Evaluation trials    : "
+            f"{aggregate['total_transactions']} / {expected_evaluations}"
         )
 
         print(
             f"PPO routing trials   : "
-            f"{total_routing_trials} (includes outcome search)"
+            f"{total_routing_trials}"
         )
 
         print(
@@ -4886,14 +4801,19 @@ def main():
             "evaluation_results":
                 evaluation_results,
 
+            "success_rate_by_failure_rate":
+                evaluation_rate_summaries,
+
+            "evaluation_repetitions":
+                repetitions,
+
+            "unique_test_transactions":
+                len(evaluation_transactions),
+
             "routing_trials_including_search":
                 total_routing_trials,
 
-            "requested_outcomes_reached":
-                all(
-                    result["target_outcome_reached"]
-                    for result in evaluation_results[:4]
-                ),
+            "requested_outcomes_reached": None,
 
             "report_file":
                 str(

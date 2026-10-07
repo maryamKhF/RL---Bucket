@@ -886,7 +886,6 @@ def channel_features(
         fee_base / fee_base_msat
         fee_rate / fee_proportional_millionths
         delay / cltv_expiry_delta
-        failure_probability
         available
         balance_uv
 
@@ -1030,34 +1029,6 @@ def channel_features(
         )
 
     # ------------------------------------------------------
-    # Failure probability
-    # ------------------------------------------------------
-
-    if "failure_probability" not in channel:
-        raise KeyError(
-            f"Missing failure_probability for channel "
-            f"({u!r}, {v!r}, {key!r})."
-        )
-
-    failure_probability = float(
-        channel[
-            "failure_probability"
-        ]
-    )
-
-    if not math.isfinite(
-        failure_probability
-    ):
-        raise ValueError(
-            "failure_probability must be finite."
-        )
-
-    if not 0.0 <= failure_probability <= 1.0:
-        raise ValueError(
-            "failure_probability must be in [0,1]."
-        )
-
-    # ------------------------------------------------------
     # Availability
     # ------------------------------------------------------
 
@@ -1160,9 +1131,6 @@ def channel_features(
 
         "delay":
             float(delay),
-
-        "failure_probability":
-            float(failure_probability),
 
         "available":
             int(available_int),

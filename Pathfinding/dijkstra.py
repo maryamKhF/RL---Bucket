@@ -1002,10 +1002,9 @@ class Dijkstra:
 
             p = failure / (failure + success)
 
-        If both counts are zero, an explicit
-        failure_probability must be available.
-
-        Otherwise, an explicit failure_probability is required.
+        If both counts are zero, return a neutral estimate.
+        The simulator's latent failure probability is not used
+        by route selection.
 
         No arbitrary default probability is introduced.
         """
@@ -1061,20 +1060,10 @@ class Dijkstra:
                     1.0,
                 )
 
-        if "failure_probability" not in data:
-            raise ValueError(
-                "Missing failure_probability and "
-                "no valid success/failure history"
-            )
-
-        probability = (
-            Dijkstra._strict_probability(
-                data["failure_probability"],
-                "failure_probability",
-            )
-        )
-
-        return probability
+        # The simulator's latent failure distribution must not
+        # influence pathfinding. With no empirical observations,
+        # assume neutral reliability for ranking purposes.
+        return 0.0
 
     # ======================================================
     # Geographic Metrics

@@ -65,7 +65,7 @@ FAST_VALIDATION = (
     }
 )
 
-MODEL_NAME = "end_to_end"
+MODEL_NAME = "end_to_end_hidden_failure_blind"
 
 
 # ============================================================

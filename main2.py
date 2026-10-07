@@ -162,7 +162,7 @@ PPO_TRAINING_FPS = 0.0
 
 FAST_TRAINING = True
 
-MODEL_NAME = "fast_end_to_end_30_routes_50_ppo"
+MODEL_NAME = "fast_end_to_end_30_routes_50_ppo_hidden_failure_blind"
 
 EVAL_TRANSACTION_COUNT = 5
 

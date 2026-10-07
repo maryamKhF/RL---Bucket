@@ -1277,14 +1277,14 @@ def main():
     )
 
     probabilities_1 = [
-        G1[u][v][key]["failure_probability"]
+        G1[u][v][key]["simulator_failure_probability"]
         for u, v, key in G1.edges(
             keys=True
         )
     ]
 
     probabilities_2 = [
-        G2[u][v][key]["failure_probability"]
+        G2[u][v][key]["simulator_failure_probability"]
         for u, v, key in G2.edges(
             keys=True
         )
@@ -1301,6 +1301,14 @@ def main():
             math.isfinite(value)
             and 0.0 <= value <= 0.95
             for value in probabilities_1
+        ),
+    )
+
+    check(
+        "latent probability is not exposed as routing feature",
+        all(
+            "failure_probability" not in G1[u][v][key]
+            for u, v, key in G1.edges(keys=True)
         ),
     )
 
@@ -1548,8 +1556,8 @@ def main():
     )
 
     check(
-        "successful payment has reason=None",
-        result["reason"] is None,
+        "successful payment has reason='success'",
+        result["reason"] == "success",
     )
 
     check(

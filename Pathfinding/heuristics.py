@@ -922,11 +922,10 @@ def enhanced_cost(
         +
         0.5 * delay
         +
-        failure_probability
-        +
         1
 
-    This is NOT the PPO-controlled objective.
+    Simulator-only failure probabilities are excluded. This is
+    NOT the PPO-controlled objective.
     """
 
     del G
@@ -948,27 +947,9 @@ def enhanced_cost(
         data,
     )
 
-    if "failure_probability" not in data:
-
-        raise KeyError(
-            "Missing 'failure_probability' for enhanced_cost()."
-        )
-
-    failure_probability = _to_float(
-        data["failure_probability"],
-        "failure_probability",
-    )
-
-    if not 0.0 <= failure_probability <= 1.0:
-
-        raise ValueError(
-            "failure_probability must be in [0,1]."
-        )
-
     cost = (
         fee
         + 0.5 * delay
-        + failure_probability
         + 1.0
     )
 
@@ -1352,14 +1333,8 @@ def _optional_failure_probability(
     """
     Resolve failure probability when available.
 
-    Supported forms:
-
-        failure_probability
-
-    or:
-
-        success_count
-        failure_count
+    Only observed success/failure history is considered. The
+    simulator's latent failure probability is never read here.
 
     Returns:
 
@@ -1412,23 +1387,9 @@ def _optional_failure_probability(
                 failure / total
             )
 
-        elif "failure_probability" in edge_data:
-
-            probability = _to_float(
-                edge_data["failure_probability"],
-                f"failure_probability[{edge_description}]",
-            )
-
         else:
 
             return None
-
-    elif "failure_probability" in edge_data:
-
-        probability = _to_float(
-            edge_data["failure_probability"],
-            f"failure_probability[{edge_description}]",
-        )
 
     else:
 

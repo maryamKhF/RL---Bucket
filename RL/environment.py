@@ -2381,7 +2381,7 @@ class RoutingEnv(gym.Env):
         ):
             return None
 
-        if len(edge) >= 3:
+        if len(edge) == 3:
 
             return (
                 edge[0],
@@ -2841,9 +2841,6 @@ class RoutingEnv(gym.Env):
             )
 
         simulation_info = {
-            "failure_probability": (
-                self.last_failure_probability
-            ),
             "average_delay": (
                 self.last_average_delay
             ),

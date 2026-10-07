@@ -172,6 +172,7 @@ def _add_node(
         longitude=longitude,
         country=country,
         continent=continent,
+        carbon_intensity=100.0,
         available=available,
     )
 
@@ -837,7 +838,7 @@ def test_missing_liquidity():
 # 18. MISSING FAILURE PROBABILITY
 # ============================================================================
 
-def test_missing_failure_probability():
+def test_hidden_failure_probability_is_ignored():
 
     graph = _make_basic_graph()
 
@@ -845,13 +846,20 @@ def test_missing_failure_probability():
 
     router = Dijkstra(graph)
 
-    _expect_exception(
-        ValueError,
-        router.shortest_path,
+    graph["A"]["B"]["simulator_failure_probability"] = 0.99
+
+    result = router.shortest_path(
         "A",
         "D",
         amount=1000,
         lambda_h=0.0,
+    )
+
+    _assert(result["success"] is True, "latent probability must not block routing")
+    _assert_close(
+        result["failure_probability"],
+        0.0,
+        message="Unknown reliability should use neutral estimate",
     )
 
 
@@ -900,7 +908,7 @@ def test_failure_probability_from_history():
 # 20. ZERO HISTORY
 # ============================================================================
 
-def test_zero_history():
+def test_zero_history_uses_neutral_reliability():
 
     graph = _make_basic_graph()
 
@@ -916,13 +924,18 @@ def test_zero_history():
 
     router = Dijkstra(graph)
 
-    _expect_exception(
-        ValueError,
-        router.shortest_path,
+    result = router.shortest_path(
         "A",
         "D",
         amount=1000,
         lambda_h=0.0,
+    )
+
+    _assert(result["success"] is True, "zero history is unknown, not invalid")
+    _assert_close(
+        result["failure_probability"],
+        0.0,
+        message="Unknown reliability should use neutral estimate",
     )
 
 
@@ -990,7 +1003,7 @@ def test_lambda_zero_invariant():
         "A",
         "D",
         amount=1000,
-        eta=0.2,
+        eta=0.9,
         lambda_h=0.0,
     )
 
@@ -999,7 +1012,7 @@ def test_lambda_zero_invariant():
         "D",
         amount=1000,
         eta=0.9,
-        lambda_h=0.0,
+        lambda_h=2.0,
     )
 
     _assert(
@@ -1014,14 +1027,14 @@ def test_lambda_zero_invariant():
 
     _assert(
         native["path"] == adaptive["path"],
-        "lambda_h=0 must preserve route",
+        "legacy lambda_h must preserve route",
     )
 
     _assert_close(
         native["cost"],
         adaptive["cost"],
         message=(
-            "lambda_h=0 must remove adaptive penalty"
+            "legacy lambda_h must preserve cost"
         ),
     )
 
@@ -1510,9 +1523,9 @@ TESTS = [
     ("liquidity hard constraint", test_liquidity_hard_constraint),
     ("no feasible path", test_no_feasible_path),
     ("missing liquidity", test_missing_liquidity),
-    ("missing failure probability", test_missing_failure_probability),
+    ("hidden failure probability ignored", test_hidden_failure_probability_is_ignored),
     ("failure probability from history", test_failure_probability_from_history),
-    ("zero history", test_zero_history),
+    ("zero history uses neutral reliability", test_zero_history_uses_neutral_reliability),
     ("max_hops blocks long route", test_max_hops_blocks_long_route),
     ("max_hops exact route", test_max_hops_exact_route),
     ("lambda_h zero invariant", test_lambda_zero_invariant),

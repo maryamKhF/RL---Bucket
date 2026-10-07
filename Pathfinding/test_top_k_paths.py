@@ -20,7 +20,7 @@ Validated invariants
 12. Invalid edge Boolean
 13. Missing liquidity
 14. Insufficient liquidity
-15. Missing failure probability/history
+15. Reliability history is observed; simulator probability is hidden
 16. Failure probability from history
 17. Basic Top-K generation
 18. Candidate result schema
@@ -140,6 +140,7 @@ def _node(
         "longitude": float(longitude),
         "country": country,
         "continent": continent,
+        "carbon_intensity": 100.0,
 
         # Provide all common RGB aliases used by the
         # routing / topology / heuristic modules.
@@ -660,16 +661,8 @@ def test_missing_liquidity():
 
     del G["A"]["B"]["AB-1"]["estimated_liquidity"]
 
-    _expect_exception(
-        lambda: top_k_paths(
-            G,
-            "A",
-            "D",
-            AMOUNT,
-        ),
-        ValueError,
-        "missing liquidity",
-    )
+    result = top_k_paths(G, "A", "D", AMOUNT)
+    _assert(result, "unknown liquidity should be allowed")
 
 
 # ==========================================================
@@ -706,25 +699,29 @@ def test_insufficient_liquidity():
 
 
 # ==========================================================
-# 17 - Missing Reliability
+# 17 - Hidden Simulator Reliability
 # ==========================================================
 
-def test_missing_reliability():
+def test_hidden_failure_probability_is_ignored():
     G = _build_graph()
 
     edge = G["A"]["B"]["AB-1"]
 
     del edge["failure_probability"]
 
-    _expect_exception(
-        lambda: top_k_paths(
-            G,
-            "A",
-            "D",
-            AMOUNT,
-        ),
-        ValueError,
-        "missing reliability",
+    edge["simulator_failure_probability"] = 0.99
+    result = top_k_paths(
+        G,
+        "A",
+        "D",
+        AMOUNT,
+    )
+
+    _assert(result, "unknown reliability should not block route generation")
+    _assert_close(
+        result[0]["reliability"],
+        1.0,
+        "latent failure probability is not used for route ranking",
     )
 
 
@@ -757,7 +754,7 @@ def test_reliability_from_history():
 
         _assert_close(
             candidate["reliability"],
-            0.9 * 0.9,
+            0.9,
             "path reliability",
         )
 
@@ -914,43 +911,43 @@ def test_max_hops_exact_route():
 def test_lambda_zero_invariant():
     G = _build_graph()
 
-    result_eta_0 = top_k_paths(
+    result_lambda_0 = top_k_paths(
         G,
         "A",
         "D",
         AMOUNT,
-        eta=0.0,
+        eta=0.8,
         lambda_h=0.0,
     )
 
-    result_eta_1 = top_k_paths(
+    result_lambda_1 = top_k_paths(
         G,
         "A",
         "D",
         AMOUNT,
-        eta=1.0,
-        lambda_h=0.0,
+        eta=0.8,
+        lambda_h=2.0,
     )
 
     _assert(
-        len(result_eta_0) == len(result_eta_1),
-        "lambda_h=0 must preserve candidate count",
+        len(result_lambda_0) == len(result_lambda_1),
+        "legacy lambda_h must preserve candidate count",
     )
 
     for a, b in zip(
-        result_eta_0,
-        result_eta_1,
+        result_lambda_0,
+        result_lambda_1,
     ):
 
         _assert(
             a["path"] == b["path"],
-            "lambda_h=0 must preserve path",
+            "legacy lambda_h must preserve path",
         )
 
         _assert_close(
             a["cost"],
             b["cost"],
-            "lambda_h=0 cost invariant",
+            "legacy lambda_h cost invariant",
         )
 
 
@@ -1536,12 +1533,9 @@ def test_reliability():
                 edge["channel_key"]
             ]
 
-            reliability = (
-                1.0
-                - float(
-                    data["failure_probability"]
-                )
-            )
+            # Simulator probabilities are hidden; without history,
+            # route ranking uses neutral reliability.
+            reliability = 1.0
 
             expected *= reliability
 
@@ -1708,8 +1702,8 @@ TESTS = [
         test_insufficient_liquidity,
     ),
     (
-        "missing reliability",
-        test_missing_reliability,
+        "hidden failure probability ignored",
+        test_hidden_failure_probability_is_ignored,
     ),
     (
         "reliability from history",

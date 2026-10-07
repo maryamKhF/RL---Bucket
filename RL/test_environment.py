@@ -35,6 +35,7 @@ import numpy as np
 from Bucket.bucket import Bucket
 from RL import environment as environment_module
 from RL.environment import RoutingEnv
+from RL.state import FEATURE_DIM, FEATURE_NAMES, State
 
 
 # ============================================================
@@ -62,6 +63,7 @@ def make_graph():
             node,
             available=True,
             is_online=True,
+            carbon_intensity=100.0,
         )
 
     edges = [
@@ -287,6 +289,7 @@ class FakeBacktracker:
     def backtrack(
         self,
         route,
+        route_edges,
         failed_edge,
         failure_index,
         amount,
@@ -296,6 +299,7 @@ class FakeBacktracker:
         self.calls.append(
             {
                 "route": list(route),
+                "route_edges": list(route_edges),
                 "failed_edge": failed_edge,
                 "failure_index": failure_index,
                 "amount": amount,
@@ -366,7 +370,7 @@ class RoutingEnvironmentValidation(unittest.TestCase):
     def test_05_eta_default_bounds(self):
         self.assertEqual(
             self.env.eta_min,
-            0.0,
+            -1.0,
         )
 
         self.assertEqual(
@@ -562,13 +566,36 @@ class RoutingEnvironmentValidation(unittest.TestCase):
             )
         )
 
-    def test_22_reset_sets_first_transaction(self):
+    def test_state_does_not_expose_simulator_failure_probability(self):
+        self.assertNotIn("failure_probability", FEATURE_NAMES)
+        self.assertEqual(FEATURE_DIM, 10)
+
+        tx = self.transactions[0]
+        state_before = State(
+            G=self.G,
+            source=tx.source,
+            destination=tx.destination,
+            transaction=tx,
+        ).vector()
+
+        for _, _, _, data in self.G.edges(keys=True, data=True):
+            data["failure_probability"] = 0.01
+            data["simulator_failure_probability"] = 0.99
+
+        state_after = State(
+            G=self.G,
+            source=tx.source,
+            destination=tx.destination,
+            transaction=tx,
+        ).vector()
+
+        self.assertEqual(state_before.shape, (165,))
+        np.testing.assert_array_equal(state_after, state_before)
+
+    def test_22_reset_sets_sampled_transaction(self):
         self.env.reset()
 
-        self.assertIs(
-            self.env.current_tx,
-            self.transactions[0],
-        )
+        self.assertIn(self.env.current_tx, self.transactions)
 
     def test_23_reset_clears_current_bucket(self):
         self.env.current_bucket = make_bucket()
@@ -1909,18 +1936,17 @@ class RoutingEnvironmentValidation(unittest.TestCase):
             self.env._transaction_id()
         )
 
-    def test_80_advance_transaction_moves_to_next(self):
+    def test_80_advance_transaction_ends_one_payment_episode(self):
         self.env.reset()
 
         terminated = self.env._advance_transaction()
 
-        self.assertFalse(
+        self.assertTrue(
             terminated
         )
 
-        self.assertIs(
+        self.assertIsNone(
             self.env.current_tx,
-            self.transactions[1],
         )
 
     def test_81_advance_transaction_terminates_at_end(self):

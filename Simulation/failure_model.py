@@ -70,7 +70,7 @@ def assign_failure_probabilities(
 
     Static channel attributes
     -------------------------
-    failure_probability
+    simulator_failure_probability
 
     Runtime channel attributes
     --------------------------
@@ -131,7 +131,8 @@ def assign_failure_probabilities(
                 rng=rng,
             )
 
-            data["failure_probability"] = (
+            data.pop("failure_probability", None)
+            data["simulator_failure_probability"] = (
                 probability
             )
 
@@ -156,7 +157,8 @@ def assign_failure_probabilities(
                 rng=rng,
             )
 
-            data["failure_probability"] = (
+            data.pop("failure_probability", None)
+            data["simulator_failure_probability"] = (
                 probability
             )
 
@@ -919,7 +921,7 @@ class FailureModel:
         """
         Reset temporary runtime graph state.
 
-        Static failure_probability attributes are preserved.
+        Static simulator_failure_probability attributes are preserved.
         """
 
         if G is None:
@@ -1121,16 +1123,22 @@ class FailureModel:
 
             return True
 
-        if "failure_probability" not in edge:
+        probability_field = (
+            "simulator_failure_probability"
+            if "simulator_failure_probability" in edge
+            else "failure_probability"
+        )
+
+        if probability_field not in edge:
 
             raise ValueError(
                 "Channel is missing required "
-                "'failure_probability' attribute."
+                "simulator failure-probability attribute."
             )
 
         probability = _validate_probability(
-            edge["failure_probability"],
-            "failure_probability",
+            edge[probability_field],
+            probability_field,
         )
 
         failed = (

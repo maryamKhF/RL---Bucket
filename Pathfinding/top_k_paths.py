@@ -252,10 +252,12 @@ def _channel_reliability(data):
             failure_count /
             (success_count + failure_count)
 
-    Otherwise an explicit failure_probability field is
-    required.
+    If no empirical history exists, reliability is unknown and
+    receives a neutral value. Simulator-only probabilities are
+    deliberately not read by pathfinding.
 
-    No arbitrary default probability is introduced.
+    No probability is inferred from the simulator's latent
+    distribution. No history means neutral reliability.
     """
 
     has_success = "success_count" in data
@@ -279,18 +281,7 @@ def _channel_reliability(data):
             failure_probability = failure / total
             return 1.0 - failure_probability
 
-    if "failure_probability" not in data:
-        raise ValueError(
-            "Missing failure_probability and no valid "
-            "success/failure history"
-        )
-
-    failure_probability = _strict_probability(
-        data["failure_probability"],
-        "failure_probability",
-    )
-
-    return 1.0 - failure_probability
+    return 1.0
 
 
 # ==========================================================
@@ -771,7 +762,14 @@ def _process_edge(
     channel_attributes = {
         "channel_key": key,
         "scid": scid,
-        "channel_data": dict(data),
+        "channel_data": {
+            name: value
+            for name, value in data.items()
+            if name not in {
+                "failure_probability",
+                "simulator_failure_probability",
+            }
+        },
         "fee": float(fee),
         "delay": float(delay),
         "reliability": float(reliability),
@@ -821,7 +819,7 @@ def _process_edge(
         scid=scid,
         source=u,
         target=v,
-        channel_data=dict(data),
+        channel_data=channel_attributes["channel_data"],
     )
 
     # ------------------------------------------------------

@@ -178,8 +178,8 @@ def build_test_graph():
     """
     Build a small deterministic MultiDiGraph.
 
-    Node RGB values are chosen so that the carbon proxy values
-    are easy to verify analytically.
+    Geographic carbon intensities are set explicitly. RGB values
+    are retained as unrelated snapshot metadata.
 
     A:
         RGB = (100, 100, 100)
@@ -203,6 +203,7 @@ def build_test_graph():
     G.add_node(
         "A",
         rgb_color=[100, 100, 100],
+        carbon_intensity=100.0,
         latitude=0.0,
         longitude=0.0,
     )
@@ -210,6 +211,7 @@ def build_test_graph():
     G.add_node(
         "B",
         rgb_color=[200, 100, 100],
+        carbon_intensity=129.9,
         latitude=0.0,
         longitude=1.0,
     )
@@ -217,6 +219,7 @@ def build_test_graph():
     G.add_node(
         "C",
         rgb_color=[100, 200, 100],
+        carbon_intensity=158.7,
         latitude=1.0,
         longitude=1.0,
     )
@@ -224,6 +227,7 @@ def build_test_graph():
     G.add_node(
         "D",
         rgb_color=[100, 100, 200],
+        carbon_intensity=111.4,
         latitude=1.0,
         longitude=2.0,
     )
@@ -333,8 +337,7 @@ def test_eta_validation():
     )
 
     for invalid_eta in [
-        -0.000001,
-        -1.0,
+        -1.000001,
         1.000001,
         2.0,
         float("nan"),
@@ -344,7 +347,7 @@ def test_eta_validation():
         None,
     ]:
         assert_raises(
-            (ValueError, TypeError),
+            ValueError,
             lambda value=invalid_eta: validate_eta(value),
             f"invalid eta={invalid_eta!r}",
         )
@@ -383,7 +386,7 @@ def test_lambda_validation():
         None,
     ]:
         assert_raises(
-            (ValueError, TypeError),
+            ValueError,
             lambda value=invalid_lambda:
                 validate_lambda_h(value),
             f"invalid lambda_h={invalid_lambda!r}",
@@ -475,21 +478,13 @@ def test_rgb_parsing():
 def test_carbon_proxy():
     G = build_test_graph()
 
-    expected = (
-        0.299 * 100
-        +
-        0.587 * 100
-        +
-        0.114 * 100
-    )
-
     assert_close(
         node_carbon_intensity(
             G,
             "A",
         ),
-        expected,
-        "carbon proxy for A",
+        100.0,
+        "geographic carbon intensity for A",
     )
 
     assert_close(
@@ -497,14 +492,8 @@ def test_carbon_proxy():
             G,
             "B",
         ),
-        (
-            0.299 * 200
-            +
-            0.587 * 100
-            +
-            0.114 * 100
-        ),
-        "carbon proxy for B",
+        129.9,
+        "geographic carbon intensity for B",
     )
 
     assert_close(
@@ -512,14 +501,8 @@ def test_carbon_proxy():
             G,
             "C",
         ),
-        (
-            0.299 * 100
-            +
-            0.587 * 200
-            +
-            0.114 * 100
-        ),
-        "carbon proxy for C",
+        158.7,
+        "geographic carbon intensity for C",
     )
 
     assert_close(
@@ -527,14 +510,8 @@ def test_carbon_proxy():
             G,
             "D",
         ),
-        (
-            0.299 * 100
-            +
-            0.587 * 100
-            +
-            0.114 * 200
-        ),
-        "carbon proxy for D",
+        111.4,
+        "geographic carbon intensity for D",
     )
 
 
@@ -545,7 +522,7 @@ def test_carbon_proxy():
 def test_missing_carbon_data():
     G = build_test_graph()
 
-    G.nodes["A"].pop("rgb_color")
+    G.nodes["A"].pop("carbon_intensity")
 
     assert_raises(
         KeyError,
@@ -553,7 +530,7 @@ def test_missing_carbon_data():
             G,
             "A",
         ),
-        "missing RGB data",
+        "missing geographic carbon intensity",
     )
 
 
@@ -911,16 +888,6 @@ def test_adaptive_penalty():
             eta,
         )
 
-        normalized_h = (
-            abs(raw_h) / 255.0
-        )
-
-        expected = (
-            normalized_h
-            /
-            (1.0 + normalized_h)
-        )
-
         actual = adaptive_penalty(
             G,
             "A",
@@ -930,13 +897,13 @@ def test_adaptive_penalty():
 
         assert_close(
             actual,
-            expected,
+            raw_h,
             f"adaptive penalty eta={eta}",
         )
 
         assert_true(
-            0.0 <= actual <= 0.5,
-            f"penalty range eta={eta}",
+            actual == raw_h,
+            f"signed heuristic preservation eta={eta}",
         )
 
 
@@ -984,11 +951,13 @@ def test_zero_directional_component():
     G.add_node(
         "A",
         rgb_color=[100, 100, 100],
+        carbon_intensity=100.0,
     )
 
     G.add_node(
         "B",
         rgb_color=[100, 100, 100],
+        carbon_intensity=100.0,
     )
 
     data = {
@@ -1084,31 +1053,13 @@ def test_zero_directional_component():
             f"equal-carbon heuristic eta={eta}",
         )
 
-        normalized_h = (
-            abs(expected) / 255.0
-        )
-
-        expected_penalty = (
-            normalized_h
-            /
-            (1.0 + normalized_h)
-        )
-
         assert_close(
             penalty,
-            expected_penalty,
-            f"equal-carbon penalty eta={eta}",
+            expected,
+            f"signed heuristic eta={eta}",
         )
 
-        expected_adaptive_cost = (
-            native
-            *
-            (
-                1.0
-                +
-                expected_penalty
-            )
-        )
+        expected_adaptive_cost = max(native + expected, 0.0)
 
         assert_close(
             adaptive,
@@ -1118,9 +1069,8 @@ def test_zero_directional_component():
 
     # Important boundary invariant:
     #
-    # At eta=0, only the directional component is active.
-    # Since C_v - C_u = 0, the adaptive penalty is zero and
-    # adaptive cost must equal native cost.
+    # At eta=0 the directional component is zero, so cost equals
+    # native cost for equal-carbon endpoints.
     eta_zero_adaptive = adaptive_lnd_cost(
         G=G,
         u="A",
@@ -1155,15 +1105,7 @@ def test_modified_cost():
     penalty = 0.25
     lambda_h = 2.0
 
-    expected = (
-        native
-        *
-        (
-            1.0
-            +
-            lambda_h * penalty
-        )
-    )
+    expected = native + penalty
 
     actual = modified_cost(
         native_cost=native,
@@ -1180,7 +1122,7 @@ def test_modified_cost():
 
 
 # ==========================================================
-# 17. Lambda=0 Invariant
+# 17. Legacy lambda_h Compatibility
 # ==========================================================
 
 def test_lambda_zero_invariant():
@@ -1198,13 +1140,7 @@ def test_lambda_zero_invariant():
         amount,
     )
 
-    for eta in [
-        0.0,
-        0.25,
-        0.5,
-        0.75,
-        1.0,
-    ]:
+    for eta in [0.0, 0.25, 0.5, 0.75, 1.0]:
         result = adaptive_edge_cost(
             G=G,
             u="A",
@@ -1214,11 +1150,20 @@ def test_lambda_zero_invariant():
             eta=eta,
             lambda_h=0.0,
         )
+        legacy_default = adaptive_edge_cost(
+            G=G,
+            u="A",
+            v="B",
+            data=data,
+            amount=amount,
+            eta=eta,
+            lambda_h=1.0,
+        )
 
         assert_close(
             result["cost"],
-            native,
-            f"lambda=0 invariant eta={eta}",
+            legacy_default["cost"],
+            f"lambda_h compatibility invariant eta={eta}",
         )
 
 
@@ -1311,15 +1256,7 @@ def test_adaptive_edge_cost():
         eta,
     )
 
-    expected_cost = (
-        native
-        *
-        (
-            1.0
-            +
-            lambda_h * penalty
-        )
-    )
+    expected_cost = max(native + raw_h, 0.0)
 
     result = adaptive_edge_cost(
         G=G,
@@ -1506,20 +1443,20 @@ def test_missing_required_data():
         "missing delay data",
     )
 
-    # Missing RGB
-    G_missing_rgb = build_test_graph()
+    # Missing geographic carbon value, regardless of snapshot RGB.
+    G_missing_carbon = build_test_graph()
 
-    del G_missing_rgb.nodes["A"]["rgb_color"]
+    del G_missing_carbon.nodes["A"]["carbon_intensity"]
 
     assert_raises(
         KeyError,
         lambda: adaptive_heuristic(
-            G_missing_rgb,
+            G_missing_carbon,
             "A",
             "B",
             0.5,
         ),
-        "missing RGB data",
+        "missing geographic carbon intensity",
     )
 
 
@@ -1543,15 +1480,7 @@ def test_enhanced_cost():
         data,
     )
 
-    expected = (
-        fee
-        +
-        0.5 * delay
-        +
-        0.10
-        +
-        1.0
-    )
+    expected = fee + 0.5 * delay + 1.0
 
     actual = enhanced_cost(
         G,
@@ -1572,7 +1501,7 @@ def test_enhanced_cost():
 # 25. Enhanced Cost Missing Reliability
 # ==========================================================
 
-def test_enhanced_cost_missing_reliability():
+def test_enhanced_cost_without_observed_reliability():
     G = build_test_graph()
 
     data = {
@@ -1581,16 +1510,11 @@ def test_enhanced_cost_missing_reliability():
         "cltv_expiry_delta": 40,
     }
 
-    assert_raises(
-        KeyError,
-        lambda: enhanced_cost(
-            G,
-            "A",
-            "B",
-            data,
-            50_000,
-        ),
-        "enhanced cost missing reliability",
+    expected = channel_fee(data, 50_000) + 0.5 * channel_delay(data) + 1.0
+    assert_close(
+        enhanced_cost(G, "A", "B", data, 50_000),
+        expected,
+        "unknown reliability uses no synthetic penalty",
     )
 
 
@@ -1921,7 +1845,7 @@ TESTS = [
         test_rgb_parsing,
     ),
     (
-        "carbon proxy",
+        "geographic carbon dataset lookup",
         test_carbon_proxy,
     ),
     (
@@ -1973,7 +1897,7 @@ TESTS = [
         test_modified_cost,
     ),
     (
-        "lambda=0 invariant",
+        "legacy lambda_h compatibility",
         test_lambda_zero_invariant,
     ),
     (
@@ -2006,7 +1930,7 @@ TESTS = [
     ),
     (
         "enhanced cost missing reliability",
-        test_enhanced_cost_missing_reliability,
+        test_enhanced_cost_without_observed_reliability,
     ),
     (
         "MultiDiGraph exact channel resolution",

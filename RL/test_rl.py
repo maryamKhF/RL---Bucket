@@ -10,7 +10,7 @@ import networkx as nx
 from .environment import RoutingEnv
 from .ppo_agent import build_ppo
 from .reward import calculate_reward
-from .state import State
+from .state import FEATURE_DIM, State
 
 from Pathfinding.heuristics import lnd_cost
 
@@ -73,7 +73,7 @@ CONFIG = {
         # PPO controls ETA only.
         # --------------------------------------------------
 
-        "eta_min": 0.0,
+        "eta_min": -1.0,
 
         "eta_max": 1.0,
 
@@ -992,7 +992,7 @@ def test_state(
 
         CONFIG["graph"]["neighborhood_k"]
         *
-        11
+        FEATURE_DIM
         +
         CONFIG["graph"]["neighborhood_k"]
     )

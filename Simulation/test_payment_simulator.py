@@ -714,7 +714,7 @@ def test_17_looped_route_rejected():
     assert result.reason == "route_contains_loop"
 
 
-def test_18_invalid_edge_format():
+def test_18_dictionary_edge_format_is_supported():
 
     simulator = PaymentSimulator(
         make_graph(),
@@ -725,14 +725,14 @@ def test_18_invalid_edge_format():
     result = simulator.simulate_payment(
         path=["A", "B", "C"],
         edges=[
-            {"source": "A", "target": "B"},
-            ("B", "C", 20)
+            {"source": "A", "target": "B", "channel_key": 10},
+            {"source": "B", "target": "C", "channel_key": 20}
         ],
         amount=1000
     )
 
-    assert result.success is False
-    assert result.reason == "invalid_edge"
+    assert result.success is True
+    assert result.reason == "success"
 
 
 def test_19_missing_channel():
@@ -1738,8 +1738,8 @@ TESTS = [
         test_17_looped_route_rejected
     ),
     (
-        "invalid edge format",
-        test_18_invalid_edge_format
+        "dictionary edge format",
+        test_18_dictionary_edge_format_is_supported
     ),
     (
         "missing channel",

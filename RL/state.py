@@ -41,17 +41,16 @@ M = 5
 # 1   fee_rate
 # 2   capacity
 # 3   delay
-# 4   failure_probability
-# 5   availability
-# 6   liquidity
-# 7   geographic_distance
-# 8   inter_country
-# 9   inter_continent
-# 10  carbon_intensity
+# 4   availability
+# 5   liquidity
+# 6   geographic_distance
+# 7   inter_country
+# 8   inter_continent
+# 9   carbon_intensity
 #
 # Therefore:
 #
-#     D = 11
+#     D = 10
 #
 # State matrix:
 #
@@ -65,7 +64,7 @@ M = 5
 #
 #     K × D + K
 #
-#     15 × 11 + 15 = 180
+#     15 × 10 + 15 = 165
 # ==========================================================
 
 FEATURE_NAMES = (
@@ -73,7 +72,6 @@ FEATURE_NAMES = (
     "fee_rate",
     "capacity",
     "delay",
-    "failure_probability",
     "availability",
     "liquidity",
     "geographic_distance",
@@ -739,16 +737,6 @@ class State:
             )
         )
 
-        failure_probability = self._safe_float(
-            extracted.get(
-                "failure_probability",
-                data.get(
-                    "failure_probability",
-                    0.0
-                )
-            )
-        )
-
         availability = self._safe_float(
             extracted.get(
                 "available",
@@ -885,9 +873,6 @@ class State:
 
             "delay":
                 delay,
-
-            "failure_probability":
-                failure_probability,
 
             "availability":
                 availability,
@@ -1292,16 +1277,6 @@ def fit_normalization_stats(
                 )
             )
 
-            failure_probability = State._safe_float(
-                cf.get(
-                    "failure_probability",
-                    data.get(
-                        "failure_probability",
-                        0.0
-                    )
-                )
-            )
-
             if "liquidity_uv" in cf:
 
                 liquidity = State._safe_float(
@@ -1369,9 +1344,6 @@ def fit_normalization_stats(
 
                 "delay":
                     delay,
-
-                "failure_probability":
-                    failure_probability,
 
                 "liquidity":
                     liquidity,

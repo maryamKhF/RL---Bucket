@@ -71,6 +71,21 @@ simulation:
 
   carbon_epsilon: 0.001
 
+# Reward formula ablation settings used by main5.py. Carbon-equivalent
+# denominator terms are lambda * (metric / metric_reference) * carbon_reference.
+# The amount factor is normalized by amount_reference to keep PPO rewards
+# numerically stable while preserving its ordering by payment size.
+reward:
+  formula: paper_base
+  amount_reference: 1000000.0
+  carbon_reference: 100.0
+  fee_reference: 1000.0
+  delay_reference: 10.0
+  path_reference: 10.0
+  lambda_fee: 1.0
+  lambda_delay: 1.0
+  lambda_hops: 1.0
+
 # ======================================================
 # Reinforcement Learning
 # ======================================================

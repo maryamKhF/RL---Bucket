@@ -29,6 +29,24 @@ For every end-to-end run, training and evaluation are split from one seeded tran
 
 When `RL_FAST_VALIDATION=1` (the default), the end-to-end runner first tries the research checkpoint. If it is missing or incompatible, it trains a 16-step PPO model under `models/fast_validation_exact_70_30/` using the 70% training partition, then continues the smoke run. Set `RL_QUICK_TIMESTEPS`, `RL_QUICK_N_STEPS`, and `RL_QUICK_BATCH_SIZE` to adjust this quick run. The model is kept separate from the research checkpoint, and the report marks the resulting metrics as smoke-validation output rather than scientific evidence.
 
+For the article-sized RL experiment, run the separate entry point:
+
+```powershell
+python main4.py
+```
+
+`main4.py` ignores fast-validation settings and enforces the configured article protocol: one 10,000-row transaction pool, a fixed 7,000/3,000 train/test split, five PPO training seeds, and evaluation of the same 3,000 held-out transactions for every seed and each configured failure rate. It writes a transaction split manifest, per-trial CSV, per-seed/per-rate summaries, and a report into a timestamped directory under `results/main4_paper_protocol/`. The full run is intentionally compute-intensive; do not use it as the laptop smoke test.
+
+`main5.py` compares the paper carbon reward with six one-factor variants (payment amount, belief-based liquidity margin, empirically observed route persistence, fee, delay, and hop count). Every arm is trained five times and evaluated on the same 3,000 held-out transactions, all configured failure rates, and the full snapshot graph. Thus the configured run trains 35 PPO models and performs 630,000 evaluation trials for six failure rates. The paper appendix says the random seed is fixed but does not give its numeric value; main5 uses the project's configured base seed (42) and seeds 42–46 for the five repetitions. For r1, the payment amount is divided by the configured fixed reference amount to avoid arbitrary PPO reward-scale inflation. For r2, liquidity margin comes only from the midpoint of agent-visible learned bounds (never the hidden ledger), normalized and capped at 100% excess. For r3, persistence is a Laplace-smoothed empirical route-channel success rate and never reads simulator failure probabilities. Fee, delay, and hops are converted to carbon-equivalent denominator units using the `reward` configuration references and lambdas. Results and paired metric differences against `paper_base` are written under `theResult/`. This full run is intentionally not a laptop smoke test.
+
+Before a server run, check the real-snapshot integration without starting PPO training:
+
+```powershell
+python -m unittest Simulation.test_main5_smoke -v
+```
+
+This loads the full snapshot, generates a transaction, resets the real routing environment, creates a PPO model and predicts an action for each of the seven reward arms, then checks reward dispatch. It does not run a route search or payment, train PPO, or evaluate 3,000 transactions.
+
 Run a small smoke evaluation with:
 
 ```powershell

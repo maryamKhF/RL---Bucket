@@ -81,6 +81,7 @@ QUICK_BATCH_SIZE = int(
 # or environment:
 #
 #     RL_CHECKPOINT_FREQUENCY=128
+#     RL_PROGRESS_INTERVAL_SECONDS=60
 #
 # The environment variable has priority.
 
@@ -107,7 +108,8 @@ class PPOProgressCallback(BaseCallback):
     def __init__(
         self,
         total_timesteps,
-        print_interval_percent=1.0,
+        print_interval_seconds=60.0,
+        progress_context=None,
         verbose=0
     ):
         super().__init__(
@@ -119,14 +121,15 @@ class PPOProgressCallback(BaseCallback):
             int(total_timesteps)
         )
 
-        self.print_interval_percent = max(
-            0.1,
-            float(print_interval_percent)
+        self.print_interval_seconds = max(
+            1.0,
+            float(print_interval_seconds)
         )
 
         self.start_time = None
-
-        self.last_printed_percent = -1.0
+        self.last_print_time = None
+        self.progress_context = dict(progress_context or {})
+        self.current_agent_state = "PPO is initializing"
 
     # --------------------------------------------------------
     # Initialization
@@ -135,8 +138,7 @@ class PPOProgressCallback(BaseCallback):
     def _on_training_start(self):
 
         self.start_time = time.time()
-
-        self.last_printed_percent = -1.0
+        self.last_print_time = self.start_time
 
         print(
             "\n============================================================"
@@ -154,12 +156,34 @@ class PPOProgressCallback(BaseCallback):
             f"Target timesteps : "
             f"{self.total_timesteps_target}"
         )
+        if self.progress_context:
+            print("Experiment stage  : FULL-SNAPSHOT PPO TRAINING")
+            for key, value in self.progress_context.items():
+                print(f"{key:<18}: {value}")
+
+    # --------------------------------------------------------
+    # PPO rollout lifecycle
+    # --------------------------------------------------------
+
+    def _on_rollout_start(self):
+        self.current_agent_state = (
+            "collecting rollout transitions from the training environment"
+        )
+
+    def _on_rollout_end(self):
+        self.current_agent_state = (
+            "rollout collected; PPO is about to optimize policy parameters"
+        )
 
     # --------------------------------------------------------
     # Every environment step
     # --------------------------------------------------------
 
     def _on_step(self):
+
+        self.current_agent_state = (
+            "collecting rollout transitions from the training environment"
+        )
 
         current_timestep = int(
             self.num_timesteps
@@ -183,18 +207,13 @@ class PPOProgressCallback(BaseCallback):
             progress
         )
 
+        now = time.time()
         if (
-            progress
-            >=
-            self.last_printed_percent
-            +
-            self.print_interval_percent
+            now - self.last_print_time >= self.print_interval_seconds
         ) or current_timestep >= total:
 
             elapsed = (
-                time.time()
-                -
-                self.start_time
+                now - self.start_time
             )
 
             if elapsed > 0:
@@ -227,43 +246,22 @@ class PPOProgressCallback(BaseCallback):
                 eta_seconds = 0.0
 
             print(
-                "\n[PPO PROGRESS]"
+                "\n[PPO PROGRESS — ACTIVE]"
+                "\n------------------------------------------------------------"
+                f"\nTimestep   : {current_timestep} / {total}"
+                f"\nProgress   : {progress:6.2f}%"
+                f"\nElapsed    : {format_seconds(elapsed)}"
+                f"\nRemaining  : {format_seconds(eta_seconds)} (estimated)"
+                f"\nSpeed      : {fps:.3f} timesteps/sec"
+                "\nStage      : PPO TRAINING — ROLLOUT COLLECTION"
+                f"\nAgent state: {self.current_agent_state}"
+                "\nNext       : PPO updates policy parameters after rollout collection"
+                "\nProcess    : ACTIVE; a new environment timestep was completed"
+                "\n------------------------------------------------------------",
+                flush=True,
             )
 
-            print(
-                "------------------------------------------------------------"
-            )
-
-            print(
-                f"Timestep : "
-                f"{current_timestep} / {total}"
-            )
-
-            print(
-                f"Progress : "
-                f"{progress:6.2f}%"
-            )
-
-            print(
-                f"Elapsed  : "
-                f"{format_seconds(elapsed)}"
-            )
-
-            print(
-                f"FPS      : "
-                f"{fps:.3f}"
-            )
-
-            print(
-                f"ETA      : "
-                f"{format_seconds(eta_seconds)}"
-            )
-
-            print(
-                "------------------------------------------------------------"
-            )
-
-            self.last_printed_percent = progress
+            self.last_print_time = now
 
         return True
 
@@ -272,6 +270,8 @@ class PPOProgressCallback(BaseCallback):
     # --------------------------------------------------------
 
     def _on_training_end(self):
+
+        self.current_agent_state = "PPO training finished"
 
         elapsed = (
             time.time()
@@ -906,7 +906,11 @@ def train_agent(
 
         total_timesteps=total_timesteps,
 
-        print_interval_percent=1.0,
+        print_interval_seconds=float(
+            os.environ.get("RL_PROGRESS_INTERVAL_SECONDS", "60")
+        ),
+
+        progress_context=cfg.get("_progress_context"),
 
         verbose=0
 

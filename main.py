@@ -29,7 +29,9 @@ import stable_baselines3.common.base_class as sb3_base_class
 # Global Runtime State
 # ============================================================
 
-REPORT_FILE = Path("report.txt")
+REPORT_FILE = Path(
+    os.environ.get("RL_REPORT_FILE", "report.txt")
+)
 
 CURRENT_STAGE = "Program startup"
 

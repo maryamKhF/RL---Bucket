@@ -229,6 +229,13 @@ class RoutingEnv(gym.Env):
             if config is not None
             else {}
         )
+        reward_cfg = self.cfg.get("reward", {})
+        if not isinstance(reward_cfg, dict):
+            raise TypeError("config['reward'] must be a dictionary.")
+        self.reward_cfg = dict(reward_cfg)
+        # Empirical outcomes only. Simulator failure probabilities and its
+        # hidden liquidity ledger are deliberately excluded from reward P.
+        self._observed_channel_outcomes = {}
         channel_cfg = self.cfg.get("channel", {})
         self.liquidity_belief = LiquidityBelief(
             self.G,
@@ -839,6 +846,13 @@ class RoutingEnv(gym.Env):
             result["carbon"]
         )
 
+        final_liquidity_margin = float(
+            result.get("liquidity_margin", 1.0)
+        )
+        final_persistence = float(
+            result.get("persistence", 0.5)
+        )
+
         if payment_success:
             route_carbon = self._average_path_carbon(
                 result.get("path", [])
@@ -890,6 +904,9 @@ class RoutingEnv(gym.Env):
                 full_reroute_count
             ),
             attempt_count=attempt_count,
+            payment_amount=float(tx.amount),
+            liquidity_margin=final_liquidity_margin,
+            persistence=final_persistence,
         )
 
         # --------------------------------------------------
@@ -944,6 +961,8 @@ class RoutingEnv(gym.Env):
             "fee": final_fee,
             "delay": final_delay,
             "carbon": final_carbon,
+            "liquidity_margin": final_liquidity_margin,
+            "persistence": final_persistence,
 
             "failure_probability": (
                 self.last_failure_probability
@@ -1236,6 +1255,9 @@ class RoutingEnv(gym.Env):
 
         final_success = False
         final_path = []
+        final_edges = []
+        final_liquidity_margin = 1.0
+        final_persistence = 0.5
 
         final_fee = 0.0
         final_delay = 0.0
@@ -1357,6 +1379,9 @@ class RoutingEnv(gym.Env):
 
             attempt_count += 1
 
+            observed_margin = self._route_liquidity_margin(edges, tx.amount)
+            observed_persistence = self._route_persistence(edges)
+
             payment_result = (
                 self.payment_simulator.simulate_payment(
                     path=path,
@@ -1370,6 +1395,7 @@ class RoutingEnv(gym.Env):
                 payment_result
             )
             self._learn_liquidity_feedback(result, edges, tx.amount)
+            self._observe_channel_outcomes(result, edges)
 
             success = self._require_bool(
                 result,
@@ -1395,6 +1421,9 @@ class RoutingEnv(gym.Env):
 
                 final_success = True
                 final_path = list(path)
+                final_edges = list(edges)
+                final_liquidity_margin = observed_margin
+                final_persistence = observed_persistence
                 final_successful_bucket_rank = (
                     current_bucket.selected_candidate_rank
                 )
@@ -1563,6 +1592,11 @@ class RoutingEnv(gym.Env):
 
                     attempt_count += 1
 
+                    retry_margin = self._route_liquidity_margin(
+                        retry_edges, tx.amount
+                    )
+                    retry_persistence = self._route_persistence(retry_edges)
+
                     branch_index = backtrack_result.get(
                         "branch_index"
                     )
@@ -1602,6 +1636,7 @@ class RoutingEnv(gym.Env):
                     self._learn_liquidity_feedback(
                         retry_dict, retry_edges, tx.amount
                     )
+                    self._observe_channel_outcomes(retry_dict, retry_edges)
 
                     retry_success = (
                         self._require_bool(
@@ -1617,6 +1652,9 @@ class RoutingEnv(gym.Env):
 
                         final_success = True
                         final_path = list(new_path)
+                        final_edges = list(retry_edges)
+                        final_liquidity_margin = retry_margin
+                        final_persistence = retry_persistence
                         successful_route_source = "partial_backtrack"
 
                         final_fee = self._result_float(
@@ -1775,7 +1813,10 @@ class RoutingEnv(gym.Env):
         return {
             "success": final_success,
             "path": final_path,
+            "edges": final_edges,
             "path_length": path_length,
+            "liquidity_margin": final_liquidity_margin,
+            "persistence": final_persistence,
             "fee": final_fee,
             "delay": final_delay,
             "carbon": final_carbon,
@@ -2834,6 +2875,9 @@ class RoutingEnv(gym.Env):
         partial_backtrack_count,
         full_reroute_count,
         attempt_count,
+        payment_amount=0.0,
+        liquidity_margin=1.0,
+        persistence=1.0,
     ):
         reward = calculate_reward(
             success=bool(success),
@@ -2852,6 +2896,18 @@ class RoutingEnv(gym.Env):
             attempt_count=int(
                 attempt_count
             ),
+            formula=self.reward_cfg.get("formula", "paper_base"),
+            payment_amount=float(payment_amount),
+            liquidity_margin=float(liquidity_margin),
+            persistence=float(persistence),
+            lambda_fee=self.reward_cfg.get("lambda_fee", 1.0),
+            lambda_delay=self.reward_cfg.get("lambda_delay", 1.0),
+            lambda_hops=self.reward_cfg.get("lambda_hops", 1.0),
+            fee_reference=self.reward_cfg.get("fee_reference", 1000.0),
+            delay_reference=self.reward_cfg.get("delay_reference", 10.0),
+            path_reference=self.reward_cfg.get("path_reference", 10.0),
+            carbon_reference=self.reward_cfg.get("carbon_reference", 100.0),
+            amount_reference=self.reward_cfg.get("amount_reference", 1_000_000.0),
         )
 
         reward = float(
@@ -2864,6 +2920,59 @@ class RoutingEnv(gym.Env):
             )
 
         return reward
+
+    @staticmethod
+    def _reward_edge_identity(edge):
+        if isinstance(edge, dict):
+            return (edge.get("source"), edge.get("target"), edge.get("channel_key"))
+        if isinstance(edge, (tuple, list)) and len(edge) == 3:
+            return tuple(edge)
+        return (repr(edge),)
+
+    def _route_liquidity_margin(self, edges, amount):
+        """Return 1 + the least relative margin from the agent's interval midpoint."""
+        amount = max(float(amount), 1.0)
+        estimates = []
+        for edge in edges:
+            identity = self._reward_edge_identity(edge)
+            capacity = self.liquidity_belief.capacities.get(identity)
+            lower, upper = self.liquidity_belief.interval(edge, capacity)
+            estimates.append((lower + upper) / 2.0)
+        if not estimates:
+            return 1.0
+        relative_margin = min(1.0, max(0.0, min(estimates) / amount - 1.0))
+        return 1.0 + relative_margin
+
+    def _route_persistence(self, edges):
+        """Laplace-smoothed success rate from outcomes observed by this env."""
+        if not edges:
+            return 0.5
+        values = []
+        for edge in edges:
+            successes, failures = self._observed_channel_outcomes.get(
+                self._reward_edge_identity(edge), (0, 0)
+            )
+            values.append((successes + 1.0) / (successes + failures + 2.0))
+        return float(sum(values) / len(values))
+
+    def _observe_channel_outcomes(self, result, edges):
+        """Update empirical persistence without reading hidden probabilities."""
+        if result.get("success") is True:
+            for edge in edges:
+                key = self._reward_edge_identity(edge)
+                counts = self._observed_channel_outcomes.setdefault(key, [0, 0])
+                counts[0] += 1
+            return
+        failed_edge = result.get("failed_edge")
+        if failed_edge is None:
+            return
+        failed_key = self._reward_edge_identity(failed_edge)
+        # Match equivalent dictionary/tuple edge encodings from the simulator.
+        for edge in edges:
+            if self._reward_edge_identity(edge) == failed_key:
+                counts = self._observed_channel_outcomes.setdefault(failed_key, [0, 0])
+                counts[1] += 1
+                break
 
     def _average_path_carbon(self, path):
         """Average dataset-derived carbon intensity over route nodes."""

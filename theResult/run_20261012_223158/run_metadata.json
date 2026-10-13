@@ -1,0 +1,18 @@
+{
+  "snapshot_sha256": "1f1d8423c999e86befdcb0ace7f3e05b5fa2b79b99dc9157149922c8fe57e3e6",
+  "config_sha256": "946f82e0f78483e9301641bb31215c51602946183866a4d7420241b23c0589fd",
+  "base_seed": 42,
+  "failure_rates": [
+    0.01,
+    0.02,
+    0.03,
+    0.04,
+    0.05,
+    0.06
+  ],
+  "total_transactions": 10000,
+  "training_transactions": 7000,
+  "held_out_transactions": 3000,
+  "repetitions": 5,
+  "reward_formula": "paper_base"
+}

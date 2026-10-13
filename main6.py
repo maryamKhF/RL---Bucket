@@ -40,6 +40,17 @@ def _parse_args(argv=None):
         help="Root directory for this baseline run's reports, models, and CSV.",
     )
     parser.add_argument(
+        "--report-file",
+        type=Path,
+        default=paper_protocol.FINAL_REPORT_PATH,
+        help="Final text report path (can be placed on persistent Google Drive).",
+    )
+    parser.add_argument(
+        "--resume-run",
+        type=Path,
+        help="Resume an interrupted run from this exact run directory.",
+    )
+    parser.add_argument(
         "--failure-rates",
         type=float,
         nargs="+",
@@ -58,7 +69,11 @@ def main6(argv=None):
         str(args.config),
         "--output-dir",
         str(args.output_dir),
+        "--report-file",
+        str(args.report_file),
     ]
+    if args.resume_run:
+        delegated_args.extend(["--resume-run", str(args.resume_run)])
     if args.failure_rates is not None:
         delegated_args.append("--failure-rates")
         delegated_args.extend(str(rate) for rate in args.failure_rates)

@@ -12,6 +12,7 @@ from stable_baselines3.common.callbacks import (
     CheckpointCallback
 )
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3 import PPO
 
 from .ppo_agent import build_ppo
 from .environment import RoutingEnv
@@ -128,6 +129,7 @@ class PPOProgressCallback(BaseCallback):
 
         self.start_time = None
         self.last_print_time = None
+        self.initial_timestep = 0
         self.progress_context = dict(progress_context or {})
         self.current_agent_state = "PPO is initializing"
 
@@ -139,6 +141,7 @@ class PPOProgressCallback(BaseCallback):
 
         self.start_time = time.time()
         self.last_print_time = self.start_time
+        self.initial_timestep = int(self.model.num_timesteps)
 
         print(
             "\n============================================================"
@@ -219,7 +222,7 @@ class PPOProgressCallback(BaseCallback):
             if elapsed > 0:
 
                 fps = (
-                    current_timestep
+                    max(0, current_timestep - self.initial_timestep)
                     /
                     elapsed
                 )
@@ -288,7 +291,7 @@ class PPOProgressCallback(BaseCallback):
         if elapsed > 0:
 
             fps = (
-                final_timestep
+                max(0, final_timestep - self.initial_timestep)
                 /
                 elapsed
             )
@@ -595,6 +598,7 @@ def train_agent(
     seed=42,
     eval_env=None,
     fast_training=None,
+    extra_callbacks=None,
 ):
     """
     Train the PPO routing agent.
@@ -882,15 +886,34 @@ def train_agent(
         "rl"
     ] = effective_rl_cfg
 
-    model = build_ppo(
-
-        env=train_env,
-
-        cfg=effective_cfg,
-
-        seed=seed
-
-    )
+    resume_checkpoint = rl_cfg.get("resume_checkpoint")
+    if resume_checkpoint:
+        resume_path = Path(resume_checkpoint)
+        if not resume_path.is_file():
+            train_env.close()
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        model = PPO.load(
+            str(resume_path),
+            env=train_env,
+            device=rl_cfg.get("device", "auto"),
+        )
+        if int(model.num_timesteps) > total_timesteps:
+            train_env.close()
+            raise ValueError(
+                f"Checkpoint has {model.num_timesteps} timesteps, exceeding "
+                f"the configured target {total_timesteps}."
+            )
+        print(
+            f"Resuming PPO from {resume_path} at timestep "
+            f"{model.num_timesteps:,}/{total_timesteps:,}.",
+            flush=True,
+        )
+    else:
+        model = build_ppo(
+            env=train_env,
+            cfg=effective_cfg,
+            seed=seed,
+        )
 
     # ========================================================
     # CALLBACKS
@@ -967,6 +990,9 @@ def train_agent(
     callbacks.append(
         checkpoint_callback
     )
+
+    if extra_callbacks:
+        callbacks.extend(list(extra_callbacks))
 
     print(
         "\nCheckpointing : ENABLED"
@@ -1105,15 +1131,15 @@ def train_agent(
 
     try:
 
-        model.learn(
-
-            total_timesteps=total_timesteps,
-
-            callback=callbacks,
-
-            reset_num_timesteps=True
-
-        )
+        remaining_timesteps = max(0, total_timesteps - int(model.num_timesteps))
+        if remaining_timesteps:
+            model.learn(
+                total_timesteps=remaining_timesteps,
+                callback=callbacks,
+                reset_num_timesteps=not bool(resume_checkpoint),
+            )
+        else:
+            print("Checkpoint already reached the configured training target.", flush=True)
 
     except Exception:
 

@@ -16,11 +16,15 @@ Independent training/evaluation repetitions: 5
 Failure rates                   : 1%, 2%, 3%, 4%, 5%, 6%
 Expected evaluation trials      : 90000
 Fast validation environment flags: IGNORED; full training forced
-Run output directory            : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261010_171222
+Run output directory            : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261012_223158
 Final text report               : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\result.txt
 Graph nodes                     : 4143
 Graph directed channels         : 66390
 Training transactions generated once: 7000
 Held-out transactions generated once: 3000
-Transaction manifest            : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261010_171222\transaction_split.csv
+Transaction manifest            : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261012_223158\transaction_split.csv
 The same held-out transaction IDs, sources, destinations, and amounts are reused for all five repetitions and every configured failure rate.
+Learning curve probes           : 50 train + 50 held-out test transactions
+Learning curve sampling         : Fixed probe samples; measured at initialization and every 4,000 PPO timesteps
+Learning curve outputs          : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261012_223158\learning_curves
+Learning curve purpose          : Diagnostic only; repeated test-probe measurements do not control training or select a model

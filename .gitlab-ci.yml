@@ -1,0 +1,267 @@
+stages:
+  - train
+
+.cpu:
+  variables:
+    CPU: '30'
+    MEMORY: '30Gi'
+    KUBERNETES_CPU_REQUEST: '${CPU}'
+    KUBERNETES_CPU_LIMIT: '${CPU}'
+    KUBERNETES_MEMORY_REQUEST: '${MEMORY}'
+    KUBERNETES_MEMORY_LIMIT: '${MEMORY}'
+
+# ============================================================
+# GPU CONFIGURATION
+# One GPU per server is currently supported
+# ============================================================
+
+.gpu:
+  extends: .cpu
+  variables:
+    GPU_COUNT: '1'
+    KUBERNETES_POD_ANNOTATIONS_GPU: 'gpu.cse-sbu.ir/count=${GPU_COUNT}'
+
+# ============================================================
+# SHARED CONFIGURATION (hidden; not a runnable job)
+# ============================================================
+
+.round-one-base:
+  stage: train
+  when: manual
+
+  image: harbor.cse-sbu.ir/docker-hub/pytorch/pytorch:2.14.0-cuda12.6-cudnn9-runtime
+
+  extends: .gpu
+
+  variables:
+    CPU: '30'
+    MEMORY: '30Gi'
+    PIP_BREAK_SYSTEM_PACKAGES: '1'
+    PYTHONUNBUFFERED: '1'
+    PYTHONDONTWRITEBYTECODE: '1'
+
+    RL_ENV_WORKERS: '30'
+    OMP_NUM_THREADS: '1'
+    MKL_NUM_THREADS: '1'
+    OPENBLAS_NUM_THREADS: '1'
+    NUMEXPR_NUM_THREADS: '1'
+
+    CUDA_DEVICE_ORDER: 'PCI_BUS_ID'
+    PIP_CACHE_DIR: '$CI_PROJECT_DIR/.cache/pip'
+
+  cache:
+    key:
+      files:
+        - requirements.txt
+    paths:
+      - .cache/pip/
+
+# Preserved round-one templates; hidden from runnable pipeline jobs.
+.run-main1-5:
+  extends: .round-one-base
+  interruptible: false
+  dependencies: []
+  variables:
+    RL_ENV_WORKERS: '30'
+    MPLBACKEND: 'Agg'
+    # Native artifacts are uploaded once by Runner after the phase exits.
+    MAIN1_5_REMOTE_BACKUP: '0'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - python -u main1_5.py --snapshot 20230716.gml.geo
+  after_script:
+    - python -u main1_5.py --package-only
+  artifacts:
+    name: 'main1-5-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main1_5_*.zip'
+      - 'theResult/main1_5_*.zip.sha256'
+
+# Testing only. Default to the completed training job; override for another run.
+.run-main1-5-resume:
+  extends: .run-main1-5
+  variables:
+    MAIN1_5_RESUME_JOB_ID: '56583'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - 'test -n "$MAIN1_5_RESUME_JOB_ID" || { echo "Set MAIN1_5_RESUME_JOB_ID to the completed training job ID."; exit 1; }'
+    - python -u main1_5_resume.py --resume-job "$MAIN1_5_RESUME_JOB_ID"
+
+# Continue the same round-one PPO policy/optimizer for one additional budget.
+.run-main2-5:
+  extends: .round-one-base
+  interruptible: false
+  dependencies: []
+  variables:
+    MAIN2_5_PREVIOUS_JOB_ID: '56583'
+    MAIN2_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - python -u main2_5.py --previous-job "$MAIN2_5_PREVIOUS_JOB_ID"
+  after_script:
+    - python -u main2_5.py --package-only
+  artifacts:
+    name: 'main2-5-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main2_5_*.zip'
+      - 'theResult/main2_5_*.zip.sha256'
+
+# Preserved stage-two evaluation template; hidden while stage three is active.
+.run-main2-5-resume:
+  extends: .round-one-base
+  interruptible: false
+  variables:
+    MAIN2_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - python -u main2_5_resume.py
+  after_script:
+    - python -u main2_5.py --package-only
+  artifacts:
+    name: 'main2-5-evaluation-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main2_5_*.zip'
+      - 'theResult/main2_5_*.zip.sha256'
+
+# Continue the same agent trained in both previous stages.
+.run-main3-5:
+  extends: .round-one-base
+  interruptible: false
+  dependencies: []
+  variables:
+    MAIN3_5_PREVIOUS_JOB_ID: '56595'
+    MAIN3_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - python -u main3_5.py --previous-job "$MAIN3_5_PREVIOUS_JOB_ID"
+  after_script:
+    - python -u main3_5.py --package-only
+  artifacts:
+    name: 'main3-5-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main3_5_*.zip'
+      - 'theResult/main3_5_*.zip.sha256'
+
+# Testing only, with the training artifact from this same pipeline.
+.run-main3-5-resume:
+  extends: .round-one-base
+  interruptible: false
+  dependencies: []
+  variables:
+    MAIN3_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - python -u main3_5_resume.py
+  after_script:
+    - python -u main3_5.py --package-only
+  artifacts:
+    name: 'main3-5-evaluation-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main3_5_*.zip'
+      - 'theResult/main3_5_*.zip.sha256'
+
+# Preserved fourth-stage templates; stage five is the runnable pair below.
+.run-main4-5:
+  extends: .round-one-base
+  interruptible: false
+  dependencies: []
+  variables:
+    MAIN4_5_PREVIOUS_JOB_ID: '56650'
+    MAIN4_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - python -u main4_5.py --previous-job "$MAIN4_5_PREVIOUS_JOB_ID"
+  after_script:
+    - python -u main4_5.py --package-only
+  artifacts:
+    name: 'main4-5-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main4_5_*.zip'
+      - 'theResult/main4_5_*.zip.sha256'
+
+.run-main4-5-resume:
+  extends: .round-one-base
+  interruptible: false
+  # Read the selected successful job directly. A canceled training retry must
+  # not block evaluation or replace the previously completed policy.
+  needs: []
+  dependencies: []
+  variables:
+    MAIN4_5_RESUME_JOB_ID: '56651'
+    MAIN4_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -m pip install -r requirements.txt tensorboard
+    - python -u main4_5_resume.py
+  after_script:
+    - python -u main4_5.py --package-only
+  artifacts:
+    name: 'main4-5-evaluation-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main4_5_*.zip'
+      - 'theResult/main4_5_*.zip.sha256'
+
+# Final stage: retain the entire learned agent from completed fourth-stage job.
+run-main5-5:
+  extends: .round-one-base
+  interruptible: false
+  dependencies: []
+  variables:
+    MAIN5_5_PREVIOUS_JOB_ID: '56651'
+    MAIN5_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -u Runtime/install_dependencies.py
+    - python -u main5_5.py --previous-job "$MAIN5_5_PREVIOUS_JOB_ID"
+  after_script:
+    - python -u main5_5.py --package-only
+  artifacts:
+    name: 'main5-5-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main5_5_*.zip'
+      - 'theResult/main5_5_*.zip.sha256'
+
+run-main5-5-resume:
+  extends: .round-one-base
+  interruptible: false
+  # Training already completed. Read that saved policy directly, independently
+  # of subsequent retries or newly created pipelines.
+  needs: []
+  dependencies: []
+  variables:
+    MAIN5_5_RESUME_JOB_ID: '56791'
+    MAIN5_5_REMOTE_BACKUP: '0'
+    MPLBACKEND: 'Agg'
+  script:
+    - python -u Runtime/install_dependencies.py
+    - python -u main5_5_resume.py
+  after_script:
+    - python -u main5_5.py --package-only
+  artifacts:
+    name: 'main5-5-evaluation-${CI_PIPELINE_ID}'
+    when: always
+    expire_in: 1 month
+    paths:
+      - 'theResult/main5_5_*.zip'
+      - 'theResult/main5_5_*.zip.sha256'

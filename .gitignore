@@ -1,0 +1,15 @@
+# Python and package caches.
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+
+# Disposable development and execution files.
+/tmp/
+/logs/
+/checkpoints/
+/models/
+.chart-data-*/
+theResult/*/logs/
+theResult/*/models/*/checkpoints/
+artifacts*.zip

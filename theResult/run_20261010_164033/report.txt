@@ -1,0 +1,26 @@
+
+================================================================
+MAIN5 - REWARD FORMULA ABLATION
+================================================================
+Status                          : RUNNING
+Snapshot path                   : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\20190501.gml.geo
+Snapshot scope                  : FULL SNAPSHOT GRAPH; no node or channel subsampling
+Graph protocol                  : same complete graph for all seven reward arms
+Article seed disclosure         : paper states seed is fixed but does not publish its numeric value
+Project base seed used          : 42
+Five repetition seeds per formula: 42, 43, 44, 45, 46
+Reward formula arms             : paper_base, amount, liquidity_margin, persistence, fee, delay, hops
+Training/test transaction split : 7,000 / 3,000 from one 10,000-row pool
+Failure rates                   : 1%, 2%, 3%, 4%, 5%, 6%
+PPO training sessions           : 35
+Expected evaluation trials      : 630000
+Fast modes                      : FORCED OFF
+Output directory                : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261010_164033
+The fixed numeric base seed 42 comes from this project's configuration; the paper appendix only says the seed is fixed. Repetitions use base_seed + 0..4.
+A, M and P are operationalized as amount/reference, 1 + relative margin (capped at 100%) from the midpoint of agent-visible liquidity bounds, and Laplace-smoothed empirical route-channel success. P never reads simulator failure probabilities.
+Fee, delay, and hop additions are converted to carbon-equivalent units by the reward configuration's references and lambda coefficients.
+Graph nodes loaded              : 4143
+Directed channels loaded        : 66390
+Training pool rows              : 7000
+Unique held-out rows            : 3000
+Shared transaction manifest     : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261010_164033\transaction_split.csv

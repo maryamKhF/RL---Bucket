@@ -1,0 +1,44 @@
+{
+    "model": "end_to_end_hidden_failure_blind",
+    "seed": 42,
+    "training_mode": "FAST TRAINING",
+    "fast_training": false,
+    "timesteps": 16,
+    "training_time_seconds": 95.44432544708252,
+    "checkpointing_enabled": true,
+    "checkpoint_frequency": 16,
+    "checkpoint_directory": "C:\\Users\\ASUS\\Desktop\\PythonCodes\\RL + Bucket\\models\\fast_validation_exact_70_30\\checkpoints",
+    "n_steps": 8,
+    "batch_size": 8,
+    "observation_shape": [
+        180
+    ],
+    "action_shape": [
+        1
+    ],
+    "observation_dimension": 180,
+    "action_dimension": 1,
+    "action_low": [
+        -1.0
+    ],
+    "action_high": [
+        1.0
+    ],
+    "neighborhood_k": 15,
+    "neighborhood_m": 5,
+    "top_k": 5,
+    "max_hops": 12,
+    "hidden_layers": [
+        64,
+        64
+    ],
+    "learning_rate": 1e-06,
+    "configured_n_steps": 2048,
+    "configured_batch_size": 64,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.0,
+    "timestamp": "2026-10-07 22:35:55"
+}

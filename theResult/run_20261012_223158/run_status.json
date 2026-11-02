@@ -1,0 +1,7 @@
+{
+  "status": "RUNNING",
+  "stage": "INITIALIZING",
+  "completed_trials": 0,
+  "expected_trials": 90000,
+  "run_directory": "C:\\Users\\ASUS\\Desktop\\PythonCodes\\RL + Bucket\\theResult\\run_20261012_223158"
+}

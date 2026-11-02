@@ -1,0 +1,25 @@
+
+================================================================
+MAIN4 - ARTICLE-SIZED RL EXPERIMENT
+================================================================
+Run status                      : RUNNING
+Execution mode                  : FULL PAPER PROTOCOL; FAST MODE DISABLED
+Reward formula                  : paper_base (locked to article baseline)
+Snapshot                        : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\20190501.gml.geo
+Config                          : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\Configs\config.yaml
+Base seed                       : 42
+Generated transaction pool      : 10000
+Training transactions per repetition: 7000
+Unique held-out transactions    : 3000
+Training/evaluation split       : 70% / 30%
+Independent training/evaluation repetitions: 5
+Failure rates                   : 1%, 2%, 3%, 4%, 5%, 6%
+Expected evaluation trials      : 90000
+Fast validation environment flags: IGNORED; full training forced
+Run output directory            : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261010_165804
+Graph nodes                     : 4143
+Graph directed channels         : 66390
+Training transactions generated once: 7000
+Held-out transactions generated once: 3000
+Transaction manifest            : C:\Users\ASUS\Desktop\PythonCodes\RL + Bucket\theResult\run_20261010_165804\transaction_split.csv
+The same held-out transaction IDs, sources, destinations, and amounts are reused for all five repetitions and every configured failure rate.
